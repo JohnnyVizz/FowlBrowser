@@ -82,7 +82,7 @@ export class Activity {
 }
 
 const inputs = new Map(); // "chrome:52" -> Activity of the relay's Input.* commands for that tab
-const records = new Map(); // "chrome:52" -> { kind: 'takeover'|'handoff', at, how?, reason?, gone? } of parked tabs
+const records = new Map(); // "chrome:52" -> { kind: 'takeover'|'handoff', at, tabId, how?, reason?, gone? } of parked tabs
 const unseen = new Set(); // takeovers no result has told the agent about yet
 const ending = new Map(); // "chrome:52" -> when this session started closing or releasing it
 const selfNavigated = new Map(); // "chrome:52" -> when the page last asked for a navigation itself
@@ -190,13 +190,23 @@ export function refuseParked(tab, call = currentCall()) {
   if (parked) throw new Error(parked);
 }
 
-// Chrome swapped the tab for another id (prerender, back/forward cache): a parked one stays parked under it.
-function moveRecord(from, to) {
-  if (!records.has(from)) return;
-  records.set(to, records.get(from));
+// Chrome swapped the tab for another id (prerender, back/forward cache): a parked one stays parked under it, and a
+// park still under way parks the new id (record.tabId), which nothing attaches meanwhile (heldBack).
+function moveRecord(from, to, toId) {
+  const record = records.get(from);
+  if (!record) return;
+  records.set(to, record);
   records.delete(from);
+  record.tabId = toId;
   if (unseen.delete(from)) unseen.add(to);
+  if (parking.has(from)) {
+    parking.set(to, parking.get(from));
+    parking.delete(from);
+  }
 }
+
+// The extension announcing a tab whose park is still under way (a swapped one): the relay must not attach it.
+export const heldBack = (browser, tabId) => parking.has(keyOf(browser, tabId));
 
 // Control ended (released, closed, resumed): the tab's parked state and notice go.
 export function forget(key) {
@@ -216,7 +226,7 @@ export function markEnding(key) {
 export async function takeOver(browser, tabId, how, { tab = browser.tabs.get(tabId), detached = false, gone = false } = {}) {
   const key = keyOf(browser, tabId);
   if (records.has(key)) return;
-  const record = { kind: 'takeover', at: Date.now(), how, gone };
+  const record = { kind: 'takeover', at: Date.now(), tabId, how, gone };
   records.set(key, record);
   unseen.add(key);
   debug('takeover', key, how);
@@ -228,8 +238,9 @@ export async function takeOver(browser, tabId, how, { tab = browser.tabs.get(tab
         await uninstallPopups(tab); // the user's own popups open natively again (after a detach they do from the next page on)
         await clearViewport(tab, 'takeover').catch(() => {});
       }
-      if (records.get(key) !== record) return; // released or closed meanwhile: no longer ours to park
-      await browser.host.request('tabs.park', { tabId, kind: 'takeover' });
+      // Released or closed meanwhile: no longer ours to park. Swapped meanwhile: the new id is parked.
+      if (records.get(keyOf(browser, record.tabId)) !== record) return;
+      await browser.host.request('tabs.park', { tabId: record.tabId, kind: 'takeover' });
     }).catch((error) => debug('park failed', key, error.message));
   }
   tabEvent('takeover', key, url, { how });
@@ -238,17 +249,19 @@ export async function takeOver(browser, tabId, how, { tab = browser.tabs.get(tab
 // tab_handoff: the cursor fades, a viewport override goes, then the tab is parked for the user. Runs in the tab's queue.
 export async function handOff(tab, reason) {
   const key = tab.id;
-  const record = { kind: 'handoff', at: Date.now(), reason };
+  const record = { kind: 'handoff', at: Date.now(), tabId: tab.tabId, reason };
   records.set(key, record);
   try {
     await park(key, async () => {
       await cursor.remove(tab, { wait: true });
       await uninstallPopups(tab);
       await clearViewport(tab, 'handoff').catch(() => {});
-      await tab.browser.host.request('tabs.park', { tabId: tab.tabId, kind: 'handoff' });
+      await tab.browser.host.request('tabs.park', { tabId: record.tabId, kind: 'handoff' });
     });
   } catch (error) {
-    if (records.get(key) === record) records.delete(key);
+    // A park can fail after it took effect (an ungroup refused while the user drags a tab): then the record stays.
+    const now = (await tab.browser.host.request('tabs.listAll', {}).catch(() => [])).find((t) => t.id === record.tabId);
+    if (!now?.parked && records.get(key) === record) records.delete(key);
     throw error;
   }
   tabEvent('handoff', key, tab.page.url(), { reason });
@@ -256,7 +269,7 @@ export async function handOff(tab, reason) {
 
 // Runs a tab's way to being parked, which a resume waits for (settled).
 function park(key, work) {
-  const done = work().finally(() => { if (parking.get(key) === done) parking.delete(key); });
+  const done = work().finally(() => { for (const [k, p] of parking) if (p === done) parking.delete(k); });
   parking.set(key, done);
   return done;
 }
@@ -332,7 +345,7 @@ async function onRemoved(browser, tabId, removeInfo) {
   const known = !!tab || browser.relay.model.hasTab(tabId);
   histories.delete(key);
   inputs.delete(key);
-  if (removeInfo?.replacedBy !== undefined) return moveRecord(key, keyOf(browser, removeInfo.replacedBy));
+  if (removeInfo?.replacedBy !== undefined) return moveRecord(key, keyOf(browser, removeInfo.replacedBy), removeInfo.replacedBy);
   if (records.get(key)?.kind === 'handoff') return forget(key); // the user closed what they were handed
   if (!known || records.has(key) || recently(ending, key, ENDING_MS)) return;
   if (Date.now() - (tab?.closedByPageAt ?? -Infinity) <= CLOSED_BY_PAGE_MS) return; // the page closed itself

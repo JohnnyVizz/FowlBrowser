@@ -119,7 +119,7 @@ test('tab_close refuses a claimed tab of the user\'s unless they asked for it', 
   assert.ok(!seen.some((m) => m.method === 'chrome.tabs.remove'), 'nothing was closed');
   const closed = await call('tab_close', { tab: 'helium:8', confirm_close_users_tab: true });
   assert.match(closed, /Closed\./);
-  assert.deepEqual(seen.find((m) => m.method === 'chrome.tabs.remove').params, [8]);
+  assert.deepEqual(seen.find((m) => m.method === 'chrome.tabs.remove').params, [8, { usersTab: true }]);
 });
 
 test("tab_close closes the user's unclaimed tab without claiming it, only when confirmed", async () => {

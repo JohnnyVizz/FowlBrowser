@@ -10,7 +10,7 @@ import { debug } from './debug.mjs';
 import { HostClient, listSockets } from './hostClient.mjs';
 import { installPopups } from './popups.mjs';
 import { downloadDone, record } from './record.mjs';
-import { Activity, currentCall, refuseParked, watchTakeovers, watchUserInput } from './takeover.mjs';
+import { Activity, currentCall, heldBack, refuseParked, watchTakeovers, watchUserInput } from './takeover.mjs';
 import { CDPRelay } from './vendor/cdpRelay.mjs';
 
 export const LABEL = process.env.FOWLBROWSER_LABEL || 'Claude';
@@ -135,6 +135,8 @@ export class Browser {
     this.relay = new CDPRelay((method, params) => host.request(method, params), hello.extension?.userAgent);
     watchTakeovers(this); // first: it reads which tabs the relay knows before the relay handles the event
     host.on('event', (method, params) => {
+      // A swapped tab whose takeover is still parking it: it attaches only if it is resumed.
+      if (method === 'chrome.tabs.onCreated' && heldBack(this, params?.[0]?.id)) return;
       this.relay.handleExtensionEvent(method, params);
       if (method === 'chrome.debugger.onEvent') this._onDebuggerEvent(params);
       else if (method === 'extension.hello') this._identity(params);
@@ -144,6 +146,7 @@ export class Browser {
     this._pw = null;
     this._pages = new WeakMap(); // Playwright page -> Promise<Tab | null>
     this._waiters = new Map(); // chrome tab id -> resolve functions of waitForTab calls
+    this.adopting = new Map(); // chrome tab id -> its _adopt still setting up (settles once it is done)
   }
 
   // The extension's identity (user agent) can come after host.hello; keep the real one for Browser.getVersion.
@@ -218,12 +221,17 @@ export class Browser {
       const { tabId } = await session.send('FowlBrowser.getTabId');
       session.detach().catch(() => {});
       tab = new Tab(this, tabId, page);
-      // The attachShadow hook goes only into agent tabs; the user's claimed tabs get a scan per document instead.
+      // keep and release wait for this (adopting) to take out the popup scripts it installs; it sees one that came first.
+      let adopted;
+      this.adopting.set(tabId, new Promise((resolve) => { adopted = resolve; }));
       const info = (await this.host.request('tabs.listAll', {}).catch(() => [])).find((t) => t.id === tabId);
-      await watchClosedShadow(tab, info?.origin === 'agent').catch(() => {});
       // Popups open in the background only from the agent's own tabs, never from tabs that are (or went back to) the user's.
       if (info?.origin === 'agent' && !info.handedOver && !info.kept && !info.parked) await installPopups(tab).catch((e) => debug('popups: install failed', e.message));
+      // The attachShadow hook goes only into agent tabs; the user's claimed tabs get a scan per document instead.
+      await watchClosedShadow(tab, info?.origin === 'agent').catch(() => {});
       await watchUserInput(tab).catch(() => {});
+      this.adopting.delete(tabId);
+      adopted(page.isClosed() ? null : tab);
       if (page.isClosed()) return null;
       this.relay.viewports.delete(tabId); // a new Tab has no viewport override (a detach ended any earlier one)
       this.tabs.set(tabId, tab);
