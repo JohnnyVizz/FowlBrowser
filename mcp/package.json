@@ -17,8 +17,12 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
+    "@paulirish/trace_engine": "0.0.65",
     "playwright-core": "^1.64.0",
     "ws": "^8.22.0",
     "zod": "^4.6.5"
+  },
+  "optionalDependencies": {
+    "lighthouse": "^13.5.0"
   }
 }

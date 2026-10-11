@@ -10,6 +10,12 @@ Version 2.0. The files keep their original license headers; the full license tex
 them in `mcp/src/vendor/LICENSE` and `mcp/src/vendor/NOTICE`. The MCP server also depends on the `playwright-core`
 package under the same license.
 
+## Lighthouse and the DevTools trace engine
+
+The MCP server depends on the `lighthouse` package (Copyright Google LLC, Apache License 2.0) for the `lighthouse` tool
+and on `@paulirish/trace_engine` (the Chrome DevTools trace engine and insights, Copyright The Chromium Authors,
+BSD-3-Clause) for the trace tools. Both are used unmodified through npm; their license texts ship inside the packages.
+
 ## Cua
 
 The agent cursor's travel in `mcp/src/cursor/overlay.js` (a curved, Fitts-timed path with a small follow-through) is

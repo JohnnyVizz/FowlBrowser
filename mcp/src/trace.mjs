@@ -1,0 +1,440 @@
+// Performance traces: trace_start, trace_stop, trace_insight. Recorded on the tab's own debugger session (Tracing, IO),
+// parsed with DevTools' trace engine, which also computes the insights of DevTools' Performance panel.
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { promisify } from 'node:util';
+import zlib from 'node:zlib';
+import { z } from 'zod';
+import { cdp, cdpEvent, fileTab, isUsersTab, outputDir, stamp, tracingSlot } from './perf.mjs';
+import { cap } from './snapshots.mjs';
+
+const INSIGHT_MAX_CHARS = 20_000;
+const gzip = promisify(zlib.gzip);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// DevTools' default timeline categories plus JS sampling and screenshots (what DevTools and chrome-devtools-mcp record).
+const CATEGORIES = ['-*', 'blink.console', 'blink.user_timing', 'loading', 'devtools.timeline', 'disabled-by-default-devtools.target-rundown',
+  'disabled-by-default-devtools.timeline.frame', 'disabled-by-default-devtools.timeline.stack', 'disabled-by-default-devtools.timeline',
+  'disabled-by-default-devtools.v8-source-rundown-sources', 'disabled-by-default-devtools.v8-source-rundown', 'disabled-by-default-layout_shift.debug',
+  'disabled-by-default-v8.inspector', 'disabled-by-default-v8.cpu_profiler.hires', 'disabled-by-default-lighthouse', 'v8.execute', 'v8', 'cppgc',
+  'navigation', 'rail', 'disabled-by-default-v8.cpu_profiler', 'disabled-by-default-devtools.screenshot'];
+
+// --- Parsing ---
+
+let engine;
+async function traceEngine() {
+  if (!engine) {
+    // The engine measures layout shift rects with DOMRect, which Node lacks.
+    globalThis.DOMRect ??= class DOMRect {
+      constructor(x = 0, y = 0, width = 0, height = 0) { Object.assign(this, { x, y, width, height }); }
+      get left() { return Math.min(this.x, this.x + this.width); }
+      get right() { return Math.max(this.x, this.x + this.width); }
+      get top() { return Math.min(this.y, this.y + this.height); }
+      get bottom() { return Math.max(this.y, this.y + this.height); }
+    };
+    engine = await import('@paulirish/trace_engine');
+  }
+  return engine;
+}
+
+// A new model per trace: a model keeps every trace it parsed. The engine's handlers and its active synthetic events
+// manager are module state, so two parses at once would corrupt each other; they never overlap because every caller
+// holds the process-wide tracingSlot (trace_stop parses before it releases, Lighthouse runs inside it). After the parse,
+// the resets drop that module state (the last trace's raw events): the handlers reassign their maps on reset, so the
+// parsed data kept per tab stays intact.
+export async function parseTrace(json) {
+  const Trace = await traceEngine();
+  const model = Trace.TraceModel.Model.createWithAllHandlers();
+  try {
+    await model.parse(json.traceEvents ?? json);
+    return model.parsedTrace();
+  } finally {
+    model.resetProcessor();
+    Trace.Helpers.SyntheticEvents.SyntheticEventsManager.reset();
+  }
+}
+
+// Drops the engine's module state after someone else parsed with it (Lighthouse does, in-process).
+export async function resetEngine() {
+  const Trace = await traceEngine();
+  Trace.TraceModel.Model.createWithAllHandlers().resetProcessor();
+  Trace.Helpers.SyntheticEvents.SyntheticEventsManager.reset();
+}
+
+// --- Formatting ---
+
+const ms = (micro) => `${Math.round(micro / 1000).toLocaleString('en-US')} ms`;
+const msOf = (milli) => `${Math.round(milli).toLocaleString('en-US')} ms`;
+function bytes(n) {
+  if (!(n >= 0)) return '?';
+  if (n < 1024) return `${Math.round(n)} B`;
+  if (n < 1024 ** 2) return `${Math.round(n / 1024)} KB`;
+  return `${(n / 1024 ** 2).toFixed(1)} MB`;
+}
+const url = (u) => (u?.startsWith('data:') && u.length > 80 ? `${u.slice(0, 80)}…` : u);
+const reqUrl = (req) => url(req.args.data.url);
+
+// The engine's labels are i18n objects ({i18nId: 'Server responds quickly (observed {PH1})', values}).
+function label(l) {
+  if (typeof l === 'string') return l;
+  return String(l?.i18nId ?? '').replace(/\{(\w+)\}/g, (_, key) => {
+    const v = l.values?.[key];
+    if (v?.__i18nMillis != null) return msOf(v.__i18nMillis);
+    if (v?.__i18nBytes != null) return bytes(v.__i18nBytes);
+    return v ?? '';
+  });
+}
+
+function savings(insight, prefix = '') {
+  const parts = [];
+  for (const [metric, v] of Object.entries(insight.metricSavings ?? {})) {
+    if (v > 0) parts.push(`${prefix}${metric} -${metric === 'CLS' ? v.toFixed(2) : msOf(v)}`);
+  }
+  if (insight.wastedBytes > 0) parts.push(`wasted ${bytes(insight.wastedBytes)}`);
+  return parts;
+}
+
+const checklist = (list) => Object.values(list ?? {}).map((item) => `- [${item.value ? 'pass' : 'FAIL'}] ${label(item.label)}`);
+
+function lcpElement(lcp) {
+  const data = lcp.lcpEvent?.args?.data;
+  const node = data?.nodeName ? `${data.nodeName} (node ${data.nodeId})` : data?.nodeId != null ? `node ${data.nodeId}` : 'unknown';
+  return lcp.lcpRequest ? `${node} · image ${reqUrl(lcp.lcpRequest)}` : `${node} · text`;
+}
+
+const SUBPARTS = { ttfb: 'TTFB', loadDelay: 'load delay', loadDuration: 'load duration', renderDelay: 'render delay' };
+
+function lcpLine(lcp) {
+  if (!lcp?.lcpMs) return 'LCP: n/a (no LCP in this trace: it holds no page load)';
+  const parts = Object.entries(lcp.subparts ?? {}).map(([key, s]) => `${SUBPARTS[key] ?? key} ${ms(s.range)}`);
+  return `LCP: ${msOf(lcp.lcpMs)}${parts.length ? ` (${parts.join(' · ')})` : ''} · element: ${lcpElement(lcp)}`;
+}
+
+function inpLine(event) {
+  if (!event) return 'INP: n/a (no interactions)';
+  return `INP: ${ms(event.dur)} (${event.type}: input delay ${ms(event.inputDelay)} · processing ${ms(event.mainThreadHandling)} · presentation delay ${ms(event.presentationDelay)})`;
+}
+
+// Main-thread tasks over 50 ms inside the bounds, from every renderer process of the main frame.
+function longTasks(parsed, bounds) {
+  const tasks = [];
+  for (const proc of parsed.data.Renderer.processes.values()) {
+    if (!proc.isOnMainFrame) continue;
+    for (const thread of proc.threads.values()) {
+      if (thread.name !== 'CrRendererMain') continue;
+      for (const e of thread.entries) if (e.name === 'RunTask' && e.dur > 50_000 && e.ts >= bounds.min && e.ts <= bounds.max) tasks.push(e);
+    }
+  }
+  if (!tasks.length) return 'Long tasks: none over 50 ms';
+  return `Long tasks: ${tasks.length} over 50 ms, longest ${ms(Math.max(...tasks.map((e) => e.dur)))}`;
+}
+
+// DuplicatedJavaScript reads the scripts' source maps, which are not fetched, so it always "passes": not shown as passed.
+const NEEDS_SOURCE_MAPS = 'DuplicatedJavaScript';
+const short = (error) => String(error?.message ?? error).split('\n')[0].slice(0, 120);
+
+export function summaryText(parsed, { file, dataLoss }) {
+  const { traceBounds, mainFrameURL } = parsed.data.Meta;
+  const lines = [
+    `Trace: ${mainFrameURL || '(no main frame URL)'} · ${(traceBounds.range / 1e6).toFixed(1)} s · ${parsed.traceEvents.length.toLocaleString('en-US')} events` +
+      (dataLoss ? ' · some events were lost (buffer full)' : ''),
+    `File: ${file} (loads in DevTools' Performance panel)`,
+    'Throttling: CPU none · network none',
+  ];
+  for (const [id, set] of parsed.insights) {
+    const start = set.bounds.min - traceBounds.min;
+    lines.push('', `${id}: ${set.url?.href ?? set.url ?? ''} · ${ms(start)} to ${ms(start + set.bounds.range)} of the trace`);
+    lines.push(lcpLine(set.model.LCPBreakdown));
+    lines.push(inpLine(set.model.INPBreakdown?.longestInteractionEvent));
+    lines.push(`CLS: ${(set.model.CLSCulprits?.worstCluster?.clusterCumulativeScore ?? 0).toFixed(2)}`);
+    lines.push(longTasks(parsed, set.bounds));
+    const insights = Object.entries(set.model).filter(([name]) => name !== NEEDS_SOURCE_MAPS);
+    const flagged = [...insights.filter(([, m]) => m.state === 'fail'), ...insights.filter(([, m]) => m.state === 'informative')];
+    if (flagged.length) lines.push('Insights:');
+    for (const [name, m] of flagged) lines.push(`- ${name} (${m.state}): ${m.strings.title}${savings(m, 'est. ').map((s) => ` · ${s}`).join('')}`);
+    const passed = insights.filter(([, m]) => m.state === 'pass').map(([name]) => name);
+    if (passed.length) lines.push(`Passed: ${passed.join(', ')}`);
+    if (NEEDS_SOURCE_MAPS in set.model) lines.push(`Not computed (needs source maps, which are not fetched): ${NEEDS_SOURCE_MAPS}`);
+    const failed = Object.entries(set.modelErrors ?? {}).map(([name, error]) => `${name} (${short(error)})`);
+    if (failed.length) lines.push(`Could not compute: ${failed.join(', ')}`);
+  }
+  lines.push('', `Details: trace_insight {tab, name${parsed.insights.size > 1 ? ', set' : ''}}`);
+  return lines.join('\n');
+}
+
+// --- Insight details ---
+
+const IMAGE_FIX = {
+  ADJUST_COMPRESSION: 'compress more',
+  MODERN_FORMAT_OR_COMPRESSION: 'use WebP or AVIF',
+  VIDEO_FORMAT: 'use a video instead of an animated GIF',
+  RESPONSIVE_SIZE: 'serve it closer to its displayed size',
+};
+const CULPRIT = ['web font', 'injected iframe', 'non-composited animation', 'unsized image'];
+
+function frameText(frame) {
+  if (!frame) return '(unattributed)';
+  const where = frame.url ? `${url(frame.url)}:${frame.lineNumber + 1}:${frame.columnNumber + 1}` : 'unknown location';
+  return `${frame.functionName || '(anonymous)'} @ ${where}`;
+}
+
+const DETAILS = {
+  LCPBreakdown(m) {
+    if (!m.lcpMs) return ['No LCP in this trace.'];
+    return [`LCP: ${msOf(m.lcpMs)} · element: ${lcpElement(m)}`,
+      ...Object.entries(m.subparts ?? {}).map(([key, s]) => `- ${SUBPARTS[key] ?? key}: ${ms(s.range)} (${Math.round(s.range / 10 / m.lcpMs)}%)`)];
+  },
+  LCPDiscovery(m) {
+    if (!m.checklist || !m.lcpRequest) return [m.lcpEvent ? 'The LCP element is not an image: nothing to discover.' : 'No LCP in this trace.'];
+    return [`LCP image: ${reqUrl(m.lcpRequest)}`, ...checklist(m.checklist)];
+  },
+  RenderBlocking(m) {
+    if (!m.renderBlockingRequests.length) return ['No render-blocking requests.'];
+    return m.renderBlockingRequests.map((r) => {
+      const wasted = m.requestIdToWastedMs?.get(r.args.data.requestId);
+      return `- ${reqUrl(r)} · ${ms(r.dur)} · ${bytes(r.args.data.encodedDataLength)}${wasted ? ` · est. ${msOf(wasted)} saved without it` : ''}`;
+    });
+  },
+  DocumentLatency(m) {
+    if (!m.data) return ['No document request in this trace.'];
+    const d = m.data;
+    return [`Document: ${d.documentRequest ? reqUrl(d.documentRequest) : '?'}`,
+      `Server response ${msOf(d.serverResponseTime)} · redirects ${msOf(d.redirectDuration)} · compression would save ${bytes(d.uncompressedResponseBytes)}`,
+      ...checklist(d.checklist)];
+  },
+  ImageDelivery(m) {
+    if (!m.optimizableImages.length) return ['No images to optimize.'];
+    return m.optimizableImages.map((img) => `- ${reqUrl(img.request)} · ${bytes(img.request.args.data.encodedDataLength)} · wasted ${bytes(img.byteSavings)} · ` +
+      img.optimizations.map((o) => `${IMAGE_FIX[o.type] ?? o.type}${o.type === 'RESPONSIVE_SIZE'
+        ? ` (file ${o.fileDimensions.width}x${o.fileDimensions.height}, shown ${o.displayDimensions.width}x${o.displayDimensions.height})` : ''} ${bytes(o.byteSavings)}`).join(', '));
+  },
+  INPBreakdown(m) {
+    const e = m.longestInteractionEvent;
+    if (!e) return ['No interactions in this trace.'];
+    return [`Longest interaction: ${e.type}, ${ms(e.dur)}`, `- input delay: ${ms(e.inputDelay)}`, `- processing: ${ms(e.mainThreadHandling)}`,
+      `- presentation delay: ${ms(e.presentationDelay)}`];
+  },
+  CLSCulprits(m, parsed) {
+    const worst = m.worstCluster;
+    if (!worst) return ['No layout shifts.'];
+    const base = parsed.data.Meta.traceBounds.min;
+    const lines = [`Worst cluster: score ${worst.clusterCumulativeScore.toFixed(3)} · ${ms(worst.ts - base)} to ${ms(worst.ts + worst.dur - base)} of the trace`];
+    for (const item of m.topCulpritsByCluster.get(worst) ?? []) lines.push(`- culprit: ${label(item.description)}${item.url ? ` ${url(item.url)}` : ''}`);
+    worst.events.forEach((shift, i) => {
+      const nodes = (shift.rawSourceEvent?.args?.data?.impacted_nodes ?? []).map((n) => n.debug_name).filter(Boolean);
+      lines.push(`Shift ${i + 1}: at ${ms(shift.ts - base)}, score ${shift.args.data?.weighted_score_delta?.toFixed(3)}${nodes.length ? ` · moved: ${nodes.join(', ')}` : ''}`);
+      const causes = m.shifts.get(shift);
+      for (const f of causes?.iframes ?? []) lines.push(`  - injected iframe ${url(f.url) ?? f.frame}`);
+      for (const r of causes?.webFonts ?? []) lines.push(`  - web font ${reqUrl(r)}`);
+      for (const a of causes?.nonCompositedAnimations ?? []) lines.push(`  - non-composited animation ${a.name ?? '(unnamed)'}: ${a.failureReasons.join(', ')}`);
+      for (const img of causes?.unsizedImages ?? []) lines.push(`  - unsized image ${img.paintImageEvent.args.data.nodeName ?? ''} ${url(img.paintImageEvent.args.data.url) ?? `node ${img.backendNodeId}`}`);
+    });
+    for (const a of m.animationFailures ?? []) lines.push(`Non-composited animation ${a.name ?? '(unnamed)'}: ${a.failureReasons.join(', ')}`);
+    return lines;
+  },
+  ThirdParties(m) {
+    const others = m.entitySummaries.filter((s) => s.entity !== m.firstPartyEntity).sort((a, b) => b.transferSize - a.transferSize);
+    if (!others.length) return ['No third parties.'];
+    return [`First party: ${m.firstPartyEntity?.name ?? '?'}`, ...others.map((s) => `- ${s.entity.name} · ${bytes(s.transferSize)} transferred · ${msOf(s.mainThreadTime)} main thread`)];
+  },
+  DOMSize(m) {
+    const lines = [];
+    const stats = m.maxDOMStats?.args.data;
+    if (stats) {
+      lines.push(`Elements: ${stats.totalElements}`);
+      if (stats.maxDepth) lines.push(`Deepest: ${stats.maxDepth.depth} levels, at ${stats.maxDepth.nodeName} (node ${stats.maxDepth.nodeId})`);
+      if (stats.maxChildren) lines.push(`Most children: ${stats.maxChildren.numChildren}, under ${stats.maxChildren.nodeName} (node ${stats.maxChildren.nodeId})`);
+    }
+    for (const u of m.largeUpdates) lines.push(`- ${label(u.label)} · ${msOf(u.duration)}`);
+    return lines.length ? lines : ['No DOM statistics in this trace.'];
+  },
+  ForcedReflow(m) {
+    const lines = [];
+    const top = m.topLevelFunctionCallData;
+    if (top) lines.push(`Top caller: ${frameText(top.topLevelFunctionCall)} · ${ms(top.totalReflowTime)} of forced reflow`);
+    for (const d of m.aggregatedBottomUpData.slice(0, 15)) lines.push(`- ${ms(d.totalTime)} in ${frameText(d.bottomUpData)}`);
+    return lines.length ? lines : ['No forced reflows.'];
+  },
+  NetworkDependencyTree(m) {
+    const lines = [];
+    if (m.rootNodes.length) {
+      lines.push(`Longest chain (${ms(m.maxTime)}):`);
+      for (let node = m.rootNodes.find((n) => n.isLongest) ?? m.rootNodes[0]; node; node = node.children.find((c) => c.isLongest)) {
+        lines.push(`- ${reqUrl(node.request)} · at ${ms(node.timeFromInitialRequest)}`);
+      }
+    } else lines.push('No chained critical requests.');
+    for (const o of m.preconnectedOrigins ?? []) {
+      lines.push(`Preconnected: ${o.url || '(empty href)'} (${o.source === 'DOM' ? 'link tag' : 'Link header'})${o.unused ? ' · unused' : ''}${o.crossorigin ? ' · crossorigin mismatch' : ''}`);
+    }
+    for (const c of m.preconnectCandidates ?? []) lines.push(`Preconnect candidate: ${c.origin} · est. ${msOf(c.wastedMs)} saved`);
+    return lines;
+  },
+  LegacyJavaScript(m) {
+    if (!m.legacyJavaScriptResults.size) return ['No legacy JavaScript.'];
+    return [...m.legacyJavaScriptResults].map(([script, r]) => `- ${url(script.url ?? script.request?.args.data.url ?? script.scriptId)} · ${bytes(r.estimatedByteSavings)} · ` +
+      [...new Set(r.matches.map((x) => x.name))].join(', '));
+  },
+  FontDisplay(m) {
+    if (!m.fonts.length) return ['No web fonts with a blocking font-display.'];
+    return m.fonts.map((f) => `- ${f.name ?? reqUrl(f.request).split('/').pop()} · ${reqUrl(f.request)} · font-display: ${f.display} · wasted ${msOf(f.wastedTime)}`);
+  },
+  Viewport(m) {
+    const content = m.viewportEvent?.args?.data?.content;
+    return [`Mobile optimized: ${m.mobileOptimized == null ? 'unknown' : m.mobileOptimized ? 'yes' : 'no'}`, content ? `Viewport meta: ${content}` : 'No viewport meta tag.'];
+  },
+  Cache(m) {
+    if (!m.requests.length) return ['Every static resource has an efficient cache lifetime.'];
+    return m.requests.map((r) => `- ${reqUrl(r.request)} · TTL ${r.ttl ? `${r.ttl} s` : 'none'} · wasted ${bytes(r.wastedBytes)}`);
+  },
+  SlowCSSSelector(m) {
+    if (!m.topSelectorElapsedMs && !m.topSelectorMatchAttempts) return ['No selector statistics in this trace (DevTools records them only with "Enable CSS selector stats").'];
+    const lines = [`Total: ${msOf(m.totalElapsedMs)} · ${m.totalMatchAttempts} match attempts · ${m.totalMatchCount} matches`];
+    if (m.topSelectorElapsedMs) lines.push(`Slowest: ${m.topSelectorElapsedMs.selector} · ${ms(m.topSelectorElapsedMs['elapsed (us)'])}`);
+    if (m.topSelectorMatchAttempts) lines.push(`Most attempts: ${m.topSelectorMatchAttempts.selector} · ${m.topSelectorMatchAttempts.match_attempts}`);
+    return lines;
+  },
+  ModernHTTP(m) {
+    if (!m.http1Requests.length) return ['No requests over HTTP/1.'];
+    return m.http1Requests.map((r) => `- ${reqUrl(r)} · ${r.args.data.protocol}`);
+  },
+  CharacterSet(m) {
+    if (!m.data) return ['No document request in this trace.'];
+    return [`HTTP charset: ${m.data.hasHttpCharset ? 'yes' : 'no'} · meta charset: ${m.data.metaCharsetDisposition ?? 'unknown'}`, ...checklist(m.data.checklist)];
+  },
+};
+
+export function insightText(parsed, name, setId) {
+  const sets = [...parsed.insights.keys()];
+  const set = parsed.insights.get(setId ?? sets[0]);
+  if (!set) throw new Error(`No insight set "${setId}". Sets of the last trace: ${sets.join(', ')}`);
+  const error = set.modelErrors?.[name];
+  if (error) throw new Error(`The trace engine failed to compute ${name}: ${short(error)}`);
+  const m = set.model[name];
+  if (!m) throw new Error(`No insight "${name}". Insights of the last trace: ${Object.keys(set.model).join(', ')}`);
+  if (name === NEEDS_SOURCE_MAPS) {
+    return `${name}: not computed. It needs the scripts' source maps, which are not fetched, so the engine has nothing to compare and always reports it as passed.`;
+  }
+  const lines = [`${name} (${m.state}): ${m.strings.title}`, m.strings.description, `Estimated savings: ${savings(m).join(' · ') || 'none'}`, ''];
+  lines.push(...(DETAILS[name]?.(m, parsed) ?? ['No details for this insight.']));
+  return cap(lines.join('\n'), INSIGHT_MAX_CHARS, 'The trace file has everything: load it in DevTools\' Performance panel');
+}
+
+// --- Recording ---
+
+async function stopRecording(tab) {
+  const waiting = new AbortController();
+  const complete = cdpEvent(tab, 'Tracing.tracingComplete', { timeoutMs: 60_000, signal: waiting.signal });
+  try {
+    await cdp(tab, 'Tracing.end');
+  } catch (error) {
+    waiting.abort();
+    complete.catch(() => {});
+    throw error;
+  }
+  const { stream, dataLossOccurred } = await complete;
+  const chunks = [];
+  try {
+    for (let eof = false; !eof;) {
+      const r = await cdp(tab, 'IO.read', { handle: stream, size: 1 << 20 });
+      chunks.push(Buffer.from(r.data, r.base64Encoded ? 'base64' : 'utf8'));
+      eof = r.eof;
+    }
+  } finally {
+    await cdp(tab, 'IO.close', { handle: stream }).catch(() => {});
+  }
+  return { data: Buffer.concat(chunks), dataLoss: dataLossOccurred };
+}
+
+async function stop(tab, header, text) {
+  if (!tab.trace?.startedAt) throw new Error('No trace is recording in this tab. Call trace_start first.');
+  // A tab closing from here on ends the recording through this stop (endRecording releases): never mid-parse.
+  tab.page.off('close', tab.trace.release);
+  try {
+    const { data, dataLoss } = await stopRecording(tab);
+    const file = path.join(outputDir('traces'), `trace-${stamp()}-${fileTab(tab)}.json.gz`);
+    await fs.writeFile(file, await gzip(data));
+    const parsed = await parseTrace(JSON.parse(data.toString('utf8')));
+    tab.trace.last = { parsed, file };
+    return text(`${await header(tab)}\n${summaryText(parsed, { file, dataLoss })}`);
+  } finally {
+    endRecording(tab);
+  }
+}
+
+function endRecording(tab) {
+  tab.trace.startedAt = null;
+  if (tab.trace.release) tab.page.off('close', tab.trace.release);
+  tab.trace.release?.();
+  tab.trace.release = null;
+}
+
+export function registerTrace(tool, manager, { withTab, header, text, tabArg }) {
+  tool('trace_start',
+    'Record a performance trace of a tab, as DevTools\' Performance panel does (timeline, JS samples, screenshots), and analyze it with DevTools\' own insights: ' +
+    'LCP with its subparts, INP, CLS, long tasks, and what fails (render-blocking requests, image delivery, caching, DOM size, third parties, layout shift culprits...). ' +
+    'By default it reloads the page and stops 5 s after the load (a page-load trace). For an interaction, pass reload false and auto_stop false, do the clicks or typing ' +
+    'with the other tools, then call trace_stop. The trace is saved to a .json.gz file that loads in DevTools.',
+    {
+      tab: tabArg,
+      reload: z.boolean().optional().describe('Reload the page while recording (default true). false: record the page as it is, e.g. to trace interactions.'),
+      auto_stop: z.boolean().optional().describe('Stop on its own after `seconds` and return the analysis (default true). false: keep recording until trace_stop.'),
+      seconds: z.number().min(1).max(60).optional().describe('With auto_stop: how long to record after the load (or the start), 1-60 (default 5).'),
+    },
+    withTab(async (tab, { reload = true, auto_stop: autoStop = true, seconds = 5 }) => {
+      if (tab.trace?.startedAt) throw new Error('A trace is already recording in this tab. Call trace_stop to end it.');
+      const url = tab.page.url();
+      if (reload && await isUsersTab(tab)) {
+        throw new Error('This is the user\'s own tab, so it was not reloaded. Open the URL in your own tab (tab_open) and trace there, or pass reload false to record the page as it is.');
+      }
+      const release = await tracingSlot();
+      try {
+        if (reload) await tab.page.goto('about:blank', { waitUntil: 'load' });
+        // As puppeteer records (what chrome-devtools-mcp uses): a 1.2 GB buffer, so a busy page's load is not cut short.
+        await cdp(tab, 'Tracing.start', { transferMode: 'ReturnAsStream', traceConfig: {
+          includedCategories: CATEGORIES.filter((c) => !c.startsWith('-')), excludedCategories: ['*'], traceBufferSizeInKb: 1_200_000 } });
+      } catch (error) {
+        release();
+        if (reload) await tab.page.goto(url, { waitUntil: 'load' }).catch(() => {});
+        // Chrome traces one thing at a time across the whole browser (this server's own runs take turns; others don't).
+        if (/already been started/.test(error?.message)) {
+          throw new Error('Chrome records one trace at a time and something else is recording now (a trace or Lighthouse run of another session, or DevTools). Try again when it ends.');
+        }
+        throw error;
+      }
+      tab.trace = { ...tab.trace, startedAt: Date.now(), url, release };
+      tab.page.on('close', release); // a closed tab ends Chrome's recording too; endRecording removes it
+      if (reload) {
+        try {
+          await tab.page.goto(url, { waitUntil: 'load' });
+        } catch (error) {
+          await stopRecording(tab).catch(() => {});
+          endRecording(tab);
+          throw error;
+        }
+      }
+      if (!autoStop) {
+        return text(`${await header(tab)}\nTrace recording${reload ? ' (page reloaded)' : ''}. Do what you want to measure, then call trace_stop.`);
+      }
+      await sleep(seconds * 1000);
+      return stop(tab, header, text);
+    }));
+
+  tool('trace_stop',
+    'Stop the trace recording in a tab (started by trace_start with auto_stop false), save it and return the analysis: LCP with subparts, INP, CLS, long tasks, ' +
+    'failing insights with estimated savings, and the path of the trace file. Then trace_insight gives the details of one insight.',
+    { tab: tabArg },
+    withTab((tab) => stop(tab, header, text)));
+
+  tool('trace_insight',
+    'Details of one insight from the tab\'s last trace (trace_start or trace_stop): what it checks, its state, estimated savings, and its data, ' +
+    'e.g. the LCP subparts, the render-blocking requests with durations, the layout shift culprits, the longest interaction\'s phases, third parties.',
+    {
+      tab: tabArg,
+      name: z.string().describe('Insight name as listed by trace_stop, e.g. "LCPBreakdown", "RenderBlocking", "DocumentLatency", "INPBreakdown", "CLSCulprits".'),
+      set: z.string().optional().describe('Insight set as listed, e.g. "NAVIGATION_1" (default the first).'),
+    },
+    withTab(async (tab, { name, set }) => {
+      if (!tab.trace?.last) throw new Error('No trace of this tab yet. Call trace_start first.');
+      return text(`${await header(tab)}\n${insightText(tab.trace.last.parsed, name, set)}`);
+    }));
+}

@@ -10,8 +10,10 @@ import { isDeepStrictEqual } from 'node:util';
 import { HostClient, SOCKET_DIR } from '../mcp/src/hostClient.mjs';
 
 export const ROOT = fileURLToPath(new URL('..', import.meta.url));
-export const SITE = 'http://127.0.0.1:5411';
-export const CROSS = 'http://localhost:5412';
+// FOWLBROWSER_TEST_PORT moves the test site (and its second origin, one port up) so checkouts can test side by side.
+const PORT = Number(process.env.FOWLBROWSER_TEST_PORT) || 5411;
+export const SITE = `http://127.0.0.1:${PORT}`;
+export const CROSS = `http://localhost:${PORT + 1}`;
 const BROWSERS = ['chrome', 'helium'];
 
 export const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -334,6 +336,6 @@ export async function ensureSite() {
   if (await up()) return () => {};
   const child = spawn(process.execPath, [`${ROOT}test/serve.mjs`], { stdio: 'ignore' });
   for (let i = 0; i < 40 && !(await up()); i++) await sleep(100);
-  if (!(await up())) throw new Error('test site did not start on :5411');
+  if (!(await up())) throw new Error(`test site did not start on :${PORT}`);
   return () => child.kill();
 }
