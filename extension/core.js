@@ -260,10 +260,11 @@ export function createCore({ chrome, send, timers = globalThis }) {
       try {
         if (owner.origin === 'agent' && !owner.kept) await closeAgentTab(tabId);
         else {
-          await chrome.debugger.detach({ tabId }).catch(() => {});
           // Handed over already (tab_keep, forUser): the user may have muted it since; never undo their changes.
+          // Unmuted before the detach: Helium can lose an unmute sent right after one.
           if (owner.origin === 'agent' && !owner.handedOver) await handOver(tabId);
           else if (owner.agentMuted) await endAgentMute(tabId, owner);
+          await chrome.debugger.detach({ tabId }).catch(() => {});
         }
       } catch (error) {
         if (await chrome.tabs.get(tabId).then(() => true, () => false)) {
