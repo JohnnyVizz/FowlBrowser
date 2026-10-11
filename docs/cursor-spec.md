@@ -12,17 +12,17 @@ session's colour with a name label, drawn inside the page. Its curved, Fitts-tim
   |---|---|
   | click, select_option | travels to the element (or x,y), then press and ring |
   | hover | travels there |
-  | type, fill_form (text fields) | travels to the field, "typing" while it types; without ref, at the last point |
+  | type, fill_form (text fields) | travels to the field, "Typing" while it types; without ref, at the last point |
   | fill_form (checks, selects) | travels there, click feedback |
-  | press_key | "pressing keys" (with ref: travels there first) |
-  | scroll | travels to the scrolled point (viewport centre, or the element after it scrolled into view), "scrolling" |
-  | drag | travels to the source, "dragging" on the way to the target |
-  | upload_files | travels to the element, "uploading" |
+  | press_key | "Pressing keys" (with ref: travels there first) |
+  | scroll | travels to the scrolled point (viewport centre, or the element after it scrolled into view), "Scrolling" |
+  | drag | travels to the source, "Dragging" on the way to the target |
+  | upload_files | travels to the element, "Uploading" |
   | download with ref | as click (it clicks the element) |
-  | navigate | "loading" on the new page once it loaded |
-  | snapshot, wait_for, media, export | "reading" at the last point while it runs |
-  | evaluate | "reading" while it runs; clicks the script makes (`el.click()`, untrusted events) are shown as travel to the clicked element and a click |
-  | screenshot | hidden during the capture, "reading" after it |
+  | navigate | "Loading" on the new page once it loaded |
+  | snapshot, wait_for, media, export | "Reading" at the last point while it runs |
+  | evaluate | "Reading" while it runs; clicks the script makes (`el.click()`, untrusted events) are shown as travel to the clicked element and a click |
+  | screenshot | hidden during the capture, "Reading" after it |
 - Only the top frame. Agent-opened and claimed tabs alike, while the session controls the tab.
 - Injected by the MCP server through the tab's debugger session into an isolated world
   (`Page.createIsolatedWorld` on the main frame, world `fowlbrowser-cursor`, then `Runtime.evaluate` of
@@ -55,8 +55,9 @@ session's colour with a name label, drawn inside the page. Its curved, Fitts-tim
 - Label: a flat pill in the same colour, 17 px tall, 10.5 px semibold system font, white text (ink on light fills,
   relative luminance over 0.4), a 1.5 px white ring and a small shadow; 16 px right of and 24 px below the tip, kept
   inside the viewport. Max 200 px with ellipsis.
-- Action words: what the agent is doing follows the name in the label ("Claude · typing"): reading, scrolling,
-  typing, dragging and uploading stay while the action runs (at least 0.6 s); pressing keys and loading show for 1.2 s.
+- Action words: what the agent is doing takes the name's place in the pill ("Claude" becomes "Typing", then "Claude"
+  again): Reading, Scrolling, Typing, Dragging and Uploading stay while the action runs (at least 0.6 s); Pressing keys
+  and Loading show for 1.2 s. An action word is drawn at 60% (ink 50%) with a light sweeping over it.
 
 ## Motion
 - Travel (after Cua's `signature_arc`): a cubic Bezier from the current tip to the target, handles 0.3 of the distance at each
@@ -75,10 +76,19 @@ session's colour with a name label, drawn inside the page. Its curved, Fitts-tim
   0..1) and smoothed with `1 - exp(-22 dt)`; it settles back after the move. The label stays upright.
 - Click: the pointer presses to 0.86 around its tip and springs back (220 ms), and a ring of the session's colour grows
   from the tip 5 -> 22 px over 420 ms (ease-out, stroke 2.4 -> 0.6 px, opacity 0.85 -> 0).
+- Word change (name to action word, one word to the next, back to the name): the word going fades out in place to
+  scale 0.96 and blur 4 px over 200 ms; the next comes in from scale 1.04 and blur 4 px over 280 ms, 40 ms later; the
+  pill glides to the new width over 300 ms (against the viewport's right edge the label glides along, so it stays
+  inside); all `cubic-bezier(0.23, 1, 0.32, 1)`, scale around the text's left edge. A word that goes takes its light's
+  animations with it, and so does the cursor.
+  An interrupted change goes on from where it is. The light on an action word: a soft-edged band (70% of the word's
+  width, at least 24 px) holding a full-strength copy of the word crosses it every 1.5 s (`cubic-bezier(0.45, 0, 0.55,
+  1)`), starting 250 ms after the word arrives; transforms only, so it stays smooth on a busy page.
 - Appear: at the last point, else where the server last had it, else 58% x / 55% y of the viewport; opacity 0 -> 1 and
   scale 0.85 -> 1 around the tip, 220 ms `cubic-bezier(0.23, 1, 0.32, 1)`. Exit: opacity -> 0, scale -> 0.9, 200 ms.
 - rAF runs only while travelling or turning back to rest; everything else is WAAPI.
-- Reduced motion: no travel (120 ms crossfade to the target), no press or ring; action words show as usual.
+- Reduced motion: no travel (120 ms crossfade to the target), no press or ring; words change by a 120 ms crossfade
+  (no blur, scale or glide) and action words show at full strength without the light.
 
 ## Agent timing
 - Pointer actions wait for arrival, capped at 900 ms for the whole cursor path (visibility, target box, travel), then

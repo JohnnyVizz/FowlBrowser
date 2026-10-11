@@ -4,8 +4,8 @@
 //                                           (for a fresh document), w,h the target's box (bigger targets are quicker),
 //                                           until the wall-clock ms by which it must arrive
 //   land(x, y, opts) -> changed             the tip on (x, y) at full opacity at once (travel and appear fade cut short)
-//   cue(kind, opts) / cueEnd()             the action as a word in the label: observe, scroll, text, key, navigate, drag,
-//                                          transfer ("Claude · typing")
+//   cue(kind, opts) / cueEnd()             the action as a word in place of the label: observe, scroll, text, key,
+//                                          navigate, drag, transfer ("Claude" morphs into "Typing" and back)
 //   click()                                press and ring at the current point
 //   follow(on, record)                     while on, travels to and clicks on clicks a script makes (an agent's evaluate);
 //                                          record: also keep them for drainClicks
@@ -33,13 +33,16 @@
   const TIP_ANGLE = -0.63 * Math.PI; // where the tip points at rest (up and a little to the left)
   const LEAN = 0.5; // at most this far (radians) the tip leans into the direction of travel
   const BADGE = { x: 12 * SCALE + 2, y: 18 * SCALE + 2 }; // the label, from the tip
+  const PAD = 7; // the label's text inset
+  const MAX_PILL = 200;
+  const SHIMMER_MS = 1500; // one pass of the light over an action word
   const MIN_CUE_MS = 600; // an action word for a quick action stays long enough to be read
   const ONE_SHOT_MS = 1200; // a key press or a page load: its word shows this long
   const reduced = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-  // Actions shown as a word after the label. Held words stay while the action runs; the others show for a moment.
-  const VERBS = { observe: 'reading', scroll: 'scrolling', text: 'typing', key: 'pressing keys', navigate: 'loading',
-    drag: 'dragging', transfer: 'uploading' };
+  // Actions shown as a word in place of the label. Held words stay while the action runs; the others show for a moment.
+  const VERBS = { observe: 'Reading', scroll: 'Scrolling', text: 'Typing', key: 'Pressing keys', navigate: 'Loading',
+    drag: 'Dragging', transfer: 'Uploading' };
   const HELD = new Set(['observe', 'scroll', 'text', 'drag', 'transfer']);
 
   // Session colours: "Claude" (the default label) is blue, other labels hash into the palette, so parallel agents
@@ -65,11 +68,17 @@
       filter: drop-shadow(0 1px 1.2px rgba(0, 0, 0, 0.32)); }
     .arrow { fill: var(--fill); stroke: #fff; stroke-width: ${1.7 / SCALE}; stroke-linejoin: round; paint-order: stroke; }
     .edge { fill: none; stroke: #131110; stroke-opacity: 0.3; stroke-width: ${0.45 / SCALE}; }
-    .badge { position: absolute; left: 0; top: 0; height: 17px; padding: 0 7px; box-sizing: border-box; border-radius: 8.5px;
-      font: 600 10.5px/17px -apple-system, BlinkMacSystemFont, system-ui, sans-serif; color: var(--text); letter-spacing: 0.01em;
-      max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: var(--fill);
+    .badge { position: absolute; left: 0; top: 0; }
+    .pill { position: relative; height: 17px; border-radius: 8.5px; overflow: hidden; background: var(--fill);
       box-shadow: 0 0 0 1.5px #fff, 0 1px 3px rgba(0, 0, 0, 0.3); }
-    .verb { font-weight: 500; opacity: 0.8; }`;
+    .word, .measure { position: absolute; left: ${PAD}px; top: 0; white-space: nowrap; color: var(--text); letter-spacing: 0.01em;
+      font: 600 10.5px/17px -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+    .word { max-width: ${MAX_PILL - 2 * PAD}px; overflow: hidden; text-overflow: ellipsis; transform-origin: 0 50%; }
+    .word.busy { color: var(--dim); }
+    .measure { left: 0; visibility: hidden; }
+    .glint { position: absolute; left: 0; top: 0; height: 100%; overflow: hidden;
+      -webkit-mask-image: linear-gradient(90deg, transparent, #000, transparent); mask-image: linear-gradient(90deg, transparent, #000, transparent); }
+    .glint span { position: absolute; left: 0; top: 0; color: var(--text); }`;
 
   let host = null; // the <fowlbrowser-cursor> element while shown
   let parts = null;
@@ -78,6 +87,7 @@
   let exiting = null; // Promise while the exit animation runs
   let last = null; // last rendered tip { x, y }, kept after the cursor fades
   let label = '';
+  let action = ''; // the action word shown in place of the label, '' for the label
   let badgeWidth = 0;
   let pos = { x: 0, y: 0 }; // where the tip is drawn
   let rot = 0; // the arrow's turn away from its rest pose, radians
@@ -132,14 +142,15 @@
     ]);
     const press = div('press', [pointer]);
     const art = div('art', [press]);
-    const name = node('span');
-    const verb = node('span', { class: 'verb' });
-    const badge = div('badge', [name, verb]);
+    const pill = div('pill');
+    const badge = div('badge', [pill]);
     const body = div('body', [art, badge]);
     const cursor = div('cursor', [body]);
     const fx = div('fx');
-    root.append(fx, cursor);
-    parts = { root, cursor, body, art, press, name, verb, badge, fx, hiding, captureStyle };
+    // Words are measured outside the cursor, whose zoom and appear scale would skew the box.
+    const measure = node('span', { class: 'measure' });
+    root.append(fx, cursor, measure);
+    parts = { root, cursor, body, art, press, pill, badge, measure, fx, hiding, captureStyle };
     attach();
     setLabel(label, true); // after attaching, so the badge can be measured
   }
@@ -175,8 +186,11 @@
 
   function teardown() {
     observer?.disconnect();
+    // Endless animations (an action word's light) would run on in the timeline after their elements are gone.
+    for (const a of parts?.root.getAnimations() ?? []) a.cancel();
     host?.remove();
     host = parts = observer = cueing = null;
+    action = '';
     // A document leaving (pagehide, bfcache) or a cursor going away stops showing script clicks: a restored page's
     // own clicks must never bring the cursor back.
     if (following) removeEventListener('click', onScriptClick, true);
@@ -193,20 +207,89 @@
     if (!parts) return;
     const fill = fillFor(label);
     const style = parts.cursor.style; // inside the closed root, never on the page-visible host
+    const ink = luminance(fill) > 0.4;
     style.setProperty('--fill', rgb(fill));
-    style.setProperty('--text', luminance(fill) > 0.4 ? '#131110' : '#fff');
+    style.setProperty('--text', ink ? '#131110' : '#fff');
+    style.setProperty('--dim', ink ? 'rgba(19, 17, 16, 0.5)' : 'rgba(255, 255, 255, 0.6)');
     parts.fill = fill;
-    parts.name.textContent = label;
-    parts.badge.style.display = label ? '' : 'none';
-    badgeWidth = parts.badge.offsetWidth;
+    showWord(force);
   }
 
-  // The action word after the label ("Claude · typing"); '' takes it away.
+  // The action word in place of the label ("Claude" -> "Typing"); '' brings the label back.
   function setVerb(text) {
-    if (!parts) return;
-    parts.verb.textContent = text ? ` · ${text}` : '';
-    badgeWidth = parts.badge.offsetWidth;
+    action = text;
+    showWord();
     render();
+  }
+
+  // Where an element is now, its animations stopped: an interrupted change goes on from there.
+  function stopAt(el) {
+    const style = getComputedStyle(el);
+    const at = { opacity: style.opacity, transform: style.transform === 'none' ? 'scale(1)' : style.transform,
+      filter: style.filter === 'none' ? 'blur(0px)' : style.filter };
+    for (const a of el.getAnimations()) a.cancel();
+    return at;
+  }
+
+  // The pill shows the action word while there is one, else the label. A change morphs: the word going blurs away in
+  // place as the next comes into focus, and the pill glides to its width. While an action word shows, a light runs
+  // over it, in transforms only, so a busy page can't stall it.
+  function showWord(instant) {
+    if (!parts) return;
+    const { pill, badge } = parts;
+    const text = action || label;
+    const shown = `${action ? 'action' : 'label'}:${text}`; // a label spelled like an action word is still a label
+    badge.style.display = text ? '' : 'none';
+    if (shown === parts.shown && !instant) return;
+    const morph = !instant && parts.shown !== undefined;
+    const still = reduced();
+    parts.shown = shown;
+    parts.measure.textContent = text;
+    const textWidth = parts.measure.getBoundingClientRect().width;
+    parts.unmeasured = !textWidth && !!text; // hidden for a screenshot: measured again after it
+    const from = morph && !still ? parseFloat(getComputedStyle(pill).width) : NaN;
+    const placed = morph && !still ? getComputedStyle(badge).transform : 'none';
+    badgeWidth = Math.min(Math.ceil(textWidth) + 2 * PAD, MAX_PILL);
+    if (!morph) {
+      for (const a of pill.getAnimations({ subtree: true })) a.cancel();
+      pill.replaceChildren();
+    }
+    for (const old of pill.querySelectorAll('.word:not(.out)')) {
+      old.classList.add('out');
+      const at = stopAt(old);
+      old.animate([at, still ? { ...at, opacity: 0 } : { opacity: 0, transform: 'scale(0.96)', filter: 'blur(4px)' }],
+        { duration: still ? 120 : 200, easing: CURVE, fill: 'forwards' }).finished.then(() => {
+        for (const a of old.getAnimations({ subtree: true })) a.cancel(); // its light, endless otherwise
+        old.remove();
+      }, () => {});
+    }
+    const word = node('span', { class: action && !still ? 'word busy' : 'word' }, [text]);
+    pill.appendChild(word);
+    if (morph) {
+      word.animate(still ? [{ opacity: 0 }, { opacity: 1 }]
+        : [{ opacity: 0, transform: 'scale(1.04)', filter: 'blur(4px)' }, { opacity: 1, transform: 'scale(1)', filter: 'blur(0px)' }],
+      { duration: still ? 120 : 280, delay: still ? 0 : 40, easing: CURVE, fill: 'backwards' });
+    }
+    // The light: a soft-edged window sweeping across the word, holding a full-strength copy that stays in place.
+    if (action && !still) {
+      const band = Math.max(24, Math.round(textWidth * 0.7));
+      const lit = node('span', {}, [text]);
+      const glint = node('span', { class: 'glint' }, [lit]);
+      glint.style.width = `${band}px`;
+      word.appendChild(glint);
+      const pass = { duration: SHIMMER_MS, delay: morph ? 250 : 0, iterations: Infinity, easing: 'cubic-bezier(0.45, 0, 0.55, 1)', fill: 'backwards' };
+      glint.animate([{ transform: `translateX(${-band}px)` }, { transform: `translateX(${textWidth}px)` }], pass);
+      lit.animate([{ transform: `translateX(${band}px)` }, { transform: `translateX(${-textWidth}px)` }], pass);
+    }
+    for (const a of pill.getAnimations()) a.cancel();
+    pill.style.width = `${badgeWidth}px`;
+    if (Math.abs(from - badgeWidth) > 0.5) pill.animate([{ width: `${from}px` }, { width: `${badgeWidth}px` }], { duration: 300, easing: CURVE });
+    // Against the viewport's right edge the label moves as it grows or shrinks: it glides there with the width.
+    for (const a of badge.getAnimations()) a.cancel();
+    badge.style.transform = badgeAt();
+    if (placed !== 'none' && placed !== getComputedStyle(badge).transform) {
+      badge.animate([{ transform: placed }, { transform: badge.style.transform }], { duration: 300, easing: CURVE });
+    }
   }
 
   function viewport() {
@@ -230,11 +313,16 @@
     const k = zoom();
     parts.cursor.style.transform = `translate3d(${pos.x}px, ${pos.y}px, 0)${k === 1 ? '' : ` scale(${k})`}`;
     parts.art.style.transform = rot ? `rotate(${rot}rad)` : '';
-    // The label sits below and to the right of the pointer, kept inside the viewport.
+    parts.badge.style.transform = badgeAt();
+  }
+
+  // The label sits below and to the right of the pointer, kept inside the viewport.
+  function badgeAt() {
+    const k = zoom();
     const { w, h } = viewport();
     const bx = Math.min(BADGE.x, (w - 2 - pos.x) / k - badgeWidth);
     const by = Math.min(BADGE.y, (h - pos.y) / k - 19);
-    parts.badge.style.transform = `translate(${bx}px, ${by}px)`;
+    return `translate(${bx}px, ${by}px)`;
   }
 
   // Current opacity and scale of an element, so a new animation starts where the running one is.
@@ -598,6 +686,10 @@
     const css = on ? ':host { display: none !important; }' : '';
     if (parts?.hiding) parts.hiding.replaceSync(css);
     else if (parts?.captureStyle) parts.captureStyle.textContent = css;
+    if (!on && parts?.unmeasured) {
+      showWord(true);
+      render();
+    }
     return !!parts;
   }
 
