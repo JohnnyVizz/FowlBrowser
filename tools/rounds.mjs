@@ -244,15 +244,51 @@ const sh = (file, args, input) => new Promise((resolve, reject) => {
 });
 const onRemote = (command) => sh('ssh', [...remote.ssh, command]);
 
-// The files the remote test bed must share with this tree (the servers, extension, site and tee run from there).
-const BED_FILES = ['extension/core.js', 'extension/background.js', 'mcp/src/server.mjs', 'mcp/src/tools.mjs', 'test/demo/server.mjs', 'tools/mcp-tee.mjs'];
+// What runs from the remote test bed for a surface (the extension and host the monitor reads, the sites, and the MCP
+// server or the tee): every file under these paths but tests, notes and node_modules (its lockfile stands for those).
+const BED_PATHS = { common: ['extension', 'host/host.mjs', 'host/install.sh', 'test/demo', 'test/forms', 'test/site', 'test/serve.mjs', 'test/package-lock.json'],
+  fowlbrowser: ['mcp/bin', 'mcp/src', 'mcp/package.json', 'mcp/package-lock.json'], codex: ['tools/mcp-tee.mjs'] };
+
+// The bed manifest of a surface: relative path -> md5 of the file in <root>.
+export function bedManifest(surface, root = ROOT) {
+  const files = [];
+  const walk = (rel) => {
+    const file = path.join(root, rel);
+    if (!fs.existsSync(file)) return;
+    if (!fs.statSync(file).isDirectory()) return files.push(rel);
+    for (const name of fs.readdirSync(file).sort()) if (!['node_modules', 'test', 'NOTES.md', '.DS_Store'].includes(name)) walk(path.join(rel, name));
+  };
+  for (const rel of [...BED_PATHS.common, ...BED_PATHS[surface]]) walk(rel);
+  return Object.fromEntries(files.map((f) => [f, crypto.createHash('md5').update(fs.readFileSync(path.join(root, f))).digest('hex')]));
+}
+
+// The files whose md5 on the bed (`md5 -r` output: "<hash> <file>" lines) differs from the manifest or is missing there.
+export function bedDiff(manifest, md5Output) {
+  const there = new Map(md5Output.split('\n').map((l) => l.match(/^([0-9a-f]{32}) (.+)$/)).filter(Boolean).map((m) => [m[2], m[1]]));
+  return Object.keys(manifest).filter((f) => there.get(f) !== manifest[f]);
+}
+
+// The local ports already taken (another round's forwards, a local site): ssh would fail to forward them.
+export async function portsInUse(ports) {
+  const taken = await Promise.all(ports.map((port) => new Promise((resolve) => {
+    const probe = net.createServer().once('error', () => resolve(true)).listen(port, '127.0.0.1', () => probe.close(() => resolve(false)));
+  })));
+  return ports.filter((_, i) => taken[i]);
+}
+
+// This round's own local dir for the ssh control socket, the forwarded sockets and the token: concurrent rounds each
+// get theirs, and only the round that made it removes it.
+export function remoteLocalDir() {
+  return fs.mkdtempSync('/tmp/fb-remote-');
+}
 
 // One ssh connection for the whole round: forwards the remote FowlBrowser sockets to <dir> and the graded ports to the
 // same local ports, then takes the remote GUI lock (held until close) and checks the test bed is this tree.
-async function openRemote(host, { owner, ports, stamp, held }) {
-  const dir = '/tmp/fb-remote';
-  fs.rmSync(dir, { recursive: true, force: true });
-  fs.mkdirSync(dir, { mode: 0o700 });
+async function openRemote(host, { owner, ports, stamp, held, surface }) {
+  const busy = await portsInUse(ports);
+  if (busy.length) throw new Error(`--remote ${host}: local port${busy.length > 1 ? 's' : ''} ${busy.join(', ')} already in use (another round or a local site?)`);
+  const dir = remoteLocalDir();
+  process.on('exit', () => fs.rmSync(dir, { recursive: true, force: true }));
   const ssh = ['-o', 'BatchMode=yes', '-o', `ControlPath=${dir}/cm`, host];
   const home = (await sh('ssh', ['-o', 'BatchMode=yes', host, 'echo $HOME'])).trim();
   const forwards = [...BROWSERS.map((b) => `${dir}/${b}.sock:${home}/.fowlbrowser/${b}.sock`), ...ports.map((p) => `${p}:127.0.0.1:${p}`)].flatMap((f) => ['-L', f]);
@@ -262,7 +298,7 @@ async function openRemote(host, { owner, ports, stamp, held }) {
     if (i === 50 || master.exitCode !== null) throw new Error(`--remote ${host}: the ssh connection did not come up (exit ${master.exitCode})`);
     await sleep(200);
   }
-  remote = { host, ssh, dir, home, bed: `${home}/Projects/FowlBrowser`, runDir: `/tmp/fb-rounds-remote/${stamp}` };
+  remote = { host, ssh, dir, home, bed: `${home}/Projects/FowlBrowser`, runDir: `/tmp/fb-rounds-remote/${stamp}-${path.basename(dir).slice('fb-remote-'.length)}` };
   process.on('exit', () => master.kill());
   if (!held) console.log(`--remote ${host}: waiting for its GUI lock as ${owner}`);
   const lock = held ? null : spawn('ssh', [...ssh, `~/cua-test/bin/guilock ${shq(owner)} sh -c 'echo locked; exec cat >/dev/null'`], { stdio: ['pipe', 'pipe', 'inherit'] });
@@ -273,9 +309,9 @@ async function openRemote(host, { owner, ports, stamp, held }) {
       lock.on('exit', (code) => reject(new Error(`--remote ${host}: guilock exited ${code}`)));
     });
   }
-  const local = crypto.createHash('md5').update(Buffer.concat(BED_FILES.map((f) => fs.readFileSync(path.join(ROOT, f))))).digest('hex');
-  const there = (await onRemote(`cd ${shq(remote.bed)} && cat ${BED_FILES.join(' ')} | md5 -q`)).trim();
-  if (there !== local) throw new Error(`--remote ${host}: its test bed (${remote.bed}) is not this tree; deploy it first (e.g. /tmp/fb-s5/bin/mac2-e2e.sh <tree> <owner> true)`);
+  const manifest = bedManifest(surface);
+  const differ = bedDiff(manifest, await onRemote(`cd ${shq(remote.bed)} && md5 -r ${Object.keys(manifest).map(shq).join(' ')} 2>/dev/null; true`));
+  if (differ.length) throw new Error(`--remote ${host}: its test bed (${remote.bed}) is not this tree (${differ.length} files differ or are missing: ${differ.slice(0, 5).join(', ')}${differ.length > 5 ? ', ...' : ''}); deploy it first (e.g. /tmp/fb-s5/bin/mac2-e2e.sh <tree> <owner> true)`);
   fs.writeFileSync(path.join(dir, 'token'), await onRemote('cat ~/.fowlbrowser/token'), { mode: 0o600 });
   // The remote front app, streamed (an ssh call per monitor tick is too slow): remote.front is the latest. The loop ends
   // when its output can't be written any more (ssh gone); nothing else would stop it there.
@@ -316,6 +352,8 @@ async function loadRemoteCodex(args) {
 // Codex batches many actions into one js call: these method calls in its code count as actions.
 const codexAction = /\.(goto|click|dblclick|double_click|fill|type|typeText|press|pressKey|pressSequentially|keypress|setValue|selectOption|check|uncheck|setChecked|scroll|drag|paste|back|forward|reload|setFiles|set)\(/g;
 // Code asking Codex's browser to show a tab or focus a window.
+// Code that opens a tab (its result names the new tab: "Browser tab: N").
+const codexCreate = /createBrowserTab\(|\.newTab\(|tabs\.new\(/;
 const codexFocus = /visible:\s*true|['"]visibility['"]\)[\s\S]{0,80}\.set\(\s*true|windows\.update\([^)]*focused|bringToFront/;
 const resultText = (content) => (typeof content === 'string' ? content : (content || []).map((c) => c.text ?? '').join('\n'));
 
@@ -323,7 +361,7 @@ const resultText = (content) => (typeof content === 'string' ? content : (conten
 // text}), action count, Codex kernel resets and lost debugger sessions, elicitation lines seen in the stream, calls whose
 // code asks for focus (as journal-like call lines for focusEvents) and the result event.
 export function parseTranscript(lines) {
-  const calls = []; const errors = []; const elicitations = []; const focusCalls = [];
+  const calls = []; const errors = []; const elicitations = []; const focusCalls = []; const namedTabs = [];
   const byId = new Map();
   let servers = null; let result = null; let kernelResets = 0; let unattached = 0;
   for (const e of lines) {
@@ -338,6 +376,9 @@ export function parseTranscript(lines) {
       }
       if (e.type === 'user' && c.type === 'tool_result' && byId.has(c.tool_use_id)) {
         const text = resultText(c.content);
+        const call = byId.get(c.tool_use_id);
+        const ids = [...text.matchAll(/Browser tab: (\d+)/g)].map((m) => Number(m[1]));
+        if (ids.length) namedTabs.push({ from: call.t, t: e.t, ids, creates: codexCreate.test(call.input?.code ?? '') });
         if (/kernel reset/i.test(text)) kernelResets++;
         if (/Debugger (is )?(un|not )attached/i.test(text)) unattached++;
         if (c.is_error) errors.push({ t: e.t, id: c.tool_use_id, name: byId.get(c.tool_use_id).name, text: text.slice(0, 300) });
@@ -345,7 +386,26 @@ export function parseTranscript(lines) {
     }
   }
   const actions = calls.reduce((n, c) => n + (c.input?.code ? (c.input.code.match(codexAction) || []).length : 1), 0);
-  return { servers, calls, errors, actions, kernelResets, unattached, elicitations, focusCalls, result };
+  return { servers, calls, errors, actions, kernelResets, unattached, elicitations, focusCalls, namedTabs, result };
+}
+
+// The tabs a Codex agent provably created (Codex keeps no journal, and its group or a demo tag says nothing about who
+// opened a tab): ids its tab-creating calls returned ("Browser tab: N"), and tabs a call's result named that came into
+// being while that call ran (a popup Codex adopted). transcript: parseTranscript(); monitor: the round's monitor log.
+export function codexCreatedTabs({ browser, transcript, monitor, startKeys }) {
+  const born = new Map();
+  for (const e of monitor) {
+    if (e.kind === 'activity' && e.event === 'created' && e.browser === browser && e.tabId != null) born.set(`${browser}:${e.tabId}`, e.at ?? e.t);
+    if (e.kind === 'tab' && e.event === 'new' && !born.has(e.tab)) born.set(e.tab, e.t);
+  }
+  const created = new Set();
+  for (const { from, t, ids, creates } of transcript.namedTabs) {
+    for (const k of ids.map((id) => `${browser}:${id}`)) {
+      // The monitor polls every 250 ms: a tab made just before the result can show up a little after it.
+      if (!startKeys.has(k) && (creates || (born.get(k) >= from && born.get(k) <= t + 500))) created.add(k);
+    }
+  }
+  return created;
 }
 
 // Elicitations a Codex run hit, from the tee in its MCP pipe (tools/mcp-tee.mjs: {t, dir, message} lines): the
@@ -791,11 +851,13 @@ export async function takeoverAct(task, hosts, finished) {
     const windows = (await cua('list_windows', { on_screen_only: true })).windows
       .filter((w) => w.app_name === BROWSER_APP[tab.browser]).sort((a, b) => (b.z_index ?? 0) - (a.z_index ?? 0));
     const win = windows.find((w) => w.title.includes(tab.title)) ?? windows[0];
-    // A pixel click is in the coordinates of the window's latest screenshot, which must be taken first.
+    // A pixel click is in the coordinates of the window's latest screenshot, which must be taken first. Through the HID
+    // (foreground) like a person's: a click posted to the app arrives with event.timeStamp 0 (measured on mac2 Chrome),
+    // which dates it to the page's load.
     const shot = await cua('get_window_state', { session, pid: win.pid, window_id: win.window_id, include_accessibility_tree: false });
     const at = Date.now();
     await cua('click', { session, pid: win.pid, window_id: win.window_id, capture_id: shot.capture_id,
-      x: Math.round(shot.screenshot_width / 2), y: Math.round(shot.screenshot_height * 0.6) });
+      x: Math.round(shot.screenshot_width / 2), y: Math.round(shot.screenshot_height * 0.6), delivery_mode: 'foreground' });
     await cua('end_session', { session }).catch(() => {});
     return { at, from, to: Date.now() + 1500, tab: keyOf(tab.browser, tab) };
   } catch (err) {
@@ -835,7 +897,7 @@ async function main() {
   if (!['fowlbrowser', 'codex'].includes(surface)) { console.error(`--surface ${surface}: use fowlbrowser or codex`); process.exit(2); }
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
   const graded = tasks.flatMap((t) => [t.grade, t.site?.log].filter(Boolean)).map((u) => new URL(u));
-  if (args.remote) await openRemote(args.remote, { owner: args['remote-owner'] || 'fb-rounds', ports: [...new Set(graded.map((u) => u.port))], stamp, held: args['remote-held'] });
+  if (args.remote) await openRemote(args.remote, { owner: args['remote-owner'] || 'fb-rounds', ports: [...new Set(graded.map((u) => u.port))], stamp, held: args['remote-held'], surface });
   const codex = surface === 'codex' ? (remote ? await loadRemoteCodex(args) : loadCodex(args)) : null;
   const model = args.model || 'opus';
   const effort = args.effort || 'medium';
@@ -958,10 +1020,17 @@ async function main() {
 
   // Cleanup before the report, so its failures count: tabs this round's agents created and left for the user, then this
   // round's downloads in ~/Downloads, then a final inventory. FowlBrowser's journals name the tabs its agents opened;
-  // for Codex, the tabs seen in an agent's group or on its demo site pages that were not open at round start.
-  const created = surface === 'codex' ? new Set(runs.flatMap((run) => [...run.tabs].filter((k) => !startKeys.has(k)))) : createdTabs(journals, startKeys);
+  // for Codex, the tabs its transcript proves it created (codexCreatedTabs). Other new tabs seen in an agent's group or on
+  // its demo pages may be the user's: left open and reported.
+  const created = surface === 'codex' ? new Set(tasks.flatMap((t, i) => [...codexCreatedTabs({ browser: t.browser, transcript: transcripts[i], monitor: monitor.log, startKeys })]))
+    : createdTabs(journals, startKeys);
   if (!args['keep-tabs']) {
     const now = await inventory(hosts);
+    if (surface === 'codex') {
+      for (const [i, run] of runs.entries()) {
+        for (const k of run.tabs) if (now[k] && !startKeys.has(k) && !created.has(k)) problems.push(`round · teardown · left open, not proven ${tasks[i].name}'s: ${k} ${now[k].url}`);
+      }
+    }
     for (const k of created) {
       if (!now[k] || now[k].owner) continue;
       try { await hosts[now[k].browser].request('tabs.closeUnowned', { tabId: now[k].id }); console.log(`closed ${k} ${now[k].url}`); }
