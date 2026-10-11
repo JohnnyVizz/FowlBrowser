@@ -109,9 +109,10 @@ export async function pointSeen(tab, target, readState) {
     readState().catch(() => null),
     new Promise((resolve) => { timer = setTimeout(resolve, CAPTURE_CAP_MS, null); }),
   ]).finally(() => clearTimeout(timer));
-  const { frame, captureMs } = await journal.frame(tab, CAPTURE_CAP_MS - (Date.now() - started));
+  const { frame } = await journal.frame(tab, CAPTURE_CAP_MS - (Date.now() - started));
   const cursor = state ? { visible: state.visible, x: state.x, y: state.y, opacity: state.opacity } : null;
-  return { type: 'point', tool: calls.getStore() ?? null, tab: tab.id, target: target ?? null, cursor, frame, captureMs };
+  // captureMs: the whole observation (state and frame), which the action waited for; rounds take it off the agent's time.
+  return { type: 'point', tool: calls.getStore() ?? null, tab: tab.id, target: target ?? null, cursor, frame, captureMs: Date.now() - started };
 }
 
 export function pointDone(line, error) {

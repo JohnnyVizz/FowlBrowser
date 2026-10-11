@@ -229,9 +229,10 @@ const UNITS = { ms: { ms: 1, s: 1000 }, mb: { mb: 1, kb: 1 / 1024, b: 1 / 104857
 export function gradeNumbers({ task, run }) {
   if (!task.numbers?.length) return { ok: true, cell: 'n/a', problems: [] };
   const text = String(run.result?.result ?? '');
-  // The numbers the agent quotes are the ones on its RESULT line (the task's `result` format); the prose before it
-  // may mention others (a trace taken under tracing overhead beside the clean load it reports).
-  const scope = /^.*\bRESULT:.*$/m.exec(text)?.[0] ?? text;
+  // The numbers the agent quotes are the ones on its RESULT line (the task's `result` format, the answer's last line
+  // by the prompt); the prose before it may mention others (a trace taken under tracing overhead beside the clean
+  // load it reports, or the format itself).
+  const scope = text.match(/^.*\bRESULT:.*$/gm)?.at(-1) ?? text;
   const problems = [];
   for (const n of task.numbers) {
     const m = new RegExp(n.pattern, 'i').exec(scope);

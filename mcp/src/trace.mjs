@@ -332,8 +332,14 @@ async function stopRecording(tab) {
     complete.catch(() => {});
     throw error;
   }
-  const { stream, dataLossOccurred } = await complete;
-  return { gz: await readStream((method, params) => cdp(tab, method, params), stream), dataLoss: dataLossOccurred };
+  // From here Chrome has stopped recording: a failure below loses the trace, not the recording's end.
+  try {
+    const { stream, dataLossOccurred } = await complete;
+    return { gz: await readStream((method, params) => cdp(tab, method, params), stream), dataLoss: dataLossOccurred };
+  } catch (error) {
+    error.traceEnded = true;
+    throw error;
+  }
 }
 
 async function stop(tab, header, text) {
@@ -409,16 +415,19 @@ export function registerTrace(tool, manager, { withTab, header, text, tabArg }) 
       }
       tab.trace = { ...tab.trace, startedAt: Date.now(), url, release, waitedMs };
       tab.page.on('close', release); // a closed tab ends Chrome's recording too; endRecording removes it
+      if (tab.page.isClosed?.()) { endRecording(tab); throw new Error('The tab closed while the trace started.'); } // closed before the listener
       try {
         takenOver(); // during the start: the recording ends, the user's page is left alone
         if (reload) await tab.page.goto(url, { waitUntil: 'load' });
       } catch (error) {
-        // A recording that could not be ended stays tracked, with the slot: trace_stop ends it (or its tab's close).
+        // A recording still live because its end was refused stays tracked, with the slot: trace_stop ends it (or
+        // its tab's close). One Chrome did stop (the trace itself was lost) or whose tab is gone is let go of.
         try {
           await stopRecording(tab);
           endRecording(tab);
         } catch (stopError) {
-          error.message += `\nThe recording could not be ended (${stopError.message}): call trace_stop to end it.`;
+          if (stopError.traceEnded || tab.page.isClosed?.()) endRecording(tab);
+          else error.message += `\nThe recording could not be ended (${stopError.message}): call trace_stop to end it.`;
         }
         throw error;
       }
