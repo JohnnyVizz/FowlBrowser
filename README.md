@@ -93,7 +93,7 @@ opens a remote-debugging port. Everything stays on your Mac.
 | Area | Tools |
 | --- | --- |
 | Browsers and tabs | `browser_list`, `tab_list`, `tab_open`, `tab_claim`, `tab_release`, `tab_close`, `tab_keep`, `tab_mute`, `tab_focus` |
-| Reading | `snapshot`, `screenshot`, `evaluate`, `console`, `network`, `wait_for` |
+| Reading | `snapshot`, `screenshot`, `evaluate`, `console`, `network`, `wait_for`, `viewport` (lay a tab out at a phone or window size; reset when done) |
 | Acting | `navigate`, `click`, `hover`, `type`, `fill_form`, `select_option`, `press_key`, `scroll`, `drag`, `upload_files`, `dialog`, `media` |
 | Files and data | `download`, `downloads`, `export` (YouTube transcripts, Google Docs, Sheets and Slides), `browser_data` (history, bookmarks, recently closed, top sites; read only) |
 

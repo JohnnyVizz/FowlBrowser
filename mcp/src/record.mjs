@@ -124,3 +124,8 @@ export function scriptClicks(tab, clicks) {
 export function tabEvent(event, tab, url, extra = {}) {
   record({ type: 'tab', event, tab, url: url ?? '', ...extra });
 }
+
+// A viewport override set or cleared (viewport.mjs); reason: tool, release, turn end, handoff.
+export function viewportEvent(event, tab, { width, height, mobile }, reason) {
+  record({ type: 'viewport', event, tab: tab.id, width, height, mobile, reason });
+}

@@ -1,0 +1,72 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Mobile shop</title>
+<script>
+  // ?nometa leaves out the viewport meta, so a mobile viewport lays it out at 980 px and zooms out (page scale < 1).
+  if (!location.search.includes('nometa')) {
+    const meta = document.createElement('meta');
+    meta.name = 'viewport';
+    meta.content = 'width=device-width, initial-scale=1';
+    document.head.append(meta);
+  }
+</script>
+<style>
+  body { font: 15px/1.5 -apple-system, system-ui, sans-serif; margin: 0; color: #111; background: #fff; }
+  header { display: flex; gap: 16px; align-items: center; padding: 12px 24px; border-bottom: 1px solid #ddd; }
+  header nav { display: flex; gap: 16px; }
+  #menu { display: none; }
+  main { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 24px; }
+  .item { border: 1px solid #ccc; padding: 12px; height: 160px; }
+  #cart { position: static; margin: 0 24px 24px; padding: 12px 24px; background: #e0245e; color: #fff; border: 0; font: inherit; }
+  #result { margin: 24px; padding: 8px; border: 1px solid #ccc; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+  /* Narrow layout: one column, a menu button instead of the links, Add to cart as a bar fixed to the bottom. */
+  @media (max-width: 599px) {
+    header nav { display: none; }
+    #menu { display: block; }
+    main { grid-template-columns: 1fr; }
+    #cart { position: fixed; left: 0; right: 0; bottom: 0; margin: 0; height: 56px; width: 100%; }
+    #result { margin-bottom: 80px; }
+  }
+</style>
+<header>
+  <strong>Shop</strong>
+  <nav><a href="#deals" id="deals">Deals</a><a href="#help" id="help">Help</a></nav>
+  <button id="menu">Menu</button>
+</header>
+<main id="items"></main>
+<button id="cart">Add to cart</button>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  for (let i = 1; i <= 12; i++) {
+    const item = document.createElement('div');
+    item.className = 'item';
+    const button = document.createElement('button');
+    button.id = `item-${i}`;
+    button.textContent = `Item ${i}`;
+    item.append(button);
+    document.getElementById('items').append(item);
+  }
+  // What the page sees of its viewport, plus every resize and click, in #result and in localStorage under ?tag=.
+  const tag = new URLSearchParams(location.search).get('tag') ?? '';
+  const key = `mobile:${tag}`;
+  const media = q => matchMedia(q).matches;
+  const state = { resizes: [], clicks: [] };
+  const now = () => ({
+    innerWidth, innerHeight, dpr: devicePixelRatio, scale: visualViewport.scale, scrollY: Math.round(scrollY),
+    narrow: media('(max-width: 599px)'), coarse: media('(pointer: coarse)'), hover: media('(hover: hover)'), touchPoints: navigator.maxTouchPoints,
+  });
+  const write = () => {
+    const value = { ...now(), ...state };
+    document.getElementById('result').textContent = JSON.stringify(value);
+    localStorage.setItem(key, JSON.stringify(value));
+  };
+  let pointerType = null;
+  addEventListener('pointerdown', e => { pointerType = e.pointerType; }, true);
+  addEventListener('click', e => {
+    state.clicks.push({ id: e.target.id || e.target.tagName.toLowerCase(), x: Math.round(e.clientX), y: Math.round(e.clientY), pointerType });
+    write();
+  }, true);
+  addEventListener('resize', () => { state.resizes.push(innerWidth); write(); });
+  addEventListener('scroll', write, { passive: true });
+  write();
+</script>

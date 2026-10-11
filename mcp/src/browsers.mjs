@@ -162,6 +162,7 @@ export class Browser {
   // The tab is no longer ours (released or closed) even if the extension's event never came.
   forget(tabId) {
     this.relay.model.forgetTab(tabId);
+    this.relay.viewports.delete(tabId);
     this.tabs.delete(tabId);
   }
 

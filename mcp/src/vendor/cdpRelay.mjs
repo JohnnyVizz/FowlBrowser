@@ -50,6 +50,7 @@ export class CDPRelay {
     this._path = `/${crypto.randomBytes(16).toString('hex')}`;
     this._cdp = null;
     this._detaching = Promise.resolve();
+    this.viewports = new Map(); // tabId -> { deviceScaleFactor } of a viewport override (viewport.mjs)
   }
 
   async start() {
@@ -183,6 +184,16 @@ export class CDPRelay {
         return this.model.getTargetInfo(sessionId);
     }
     if (!sessionId) return await this.model.sendBrowserCommand(method, params);
-    return await this.model.sendCommand(sessionId, method, params);
+    const result = await this.model.sendCommand(sessionId, method, params);
+    // Playwright's CSS-px screenshots under a viewport override (viewport.mjs): they divide by contentSize / cssContentSize,
+    // which stays the screen's own scale, so report the override's devicePixelRatio; and a mobile page zoomed out (no
+    // viewport meta) is reported at page scale 1, so the shot covers the layout viewport in layout px, as clicks use.
+    const override = method === 'Page.getLayoutMetrics' && this.viewports.get(this.model.tabIdForSession(sessionId));
+    if (override && result?.cssContentSize) {
+      const scale = override.deviceScaleFactor;
+      if (scale) result.contentSize = { ...result.contentSize, width: result.cssContentSize.width * scale, height: result.cssContentSize.height * scale };
+      if (result.visualViewport) result.visualViewport = { ...result.visualViewport, scale: 1 };
+    }
+    return result;
   }
 }

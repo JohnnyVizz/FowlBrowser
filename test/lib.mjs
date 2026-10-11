@@ -32,16 +32,19 @@ export const browsersFrom = arg => (arg === 'both' ? BROWSERS : [arg]);
 
 export class ToolError extends Error {}
 
-export async function connect(label) {
-  const command = process.env.FOWLBROWSER_MCP || `${ROOT}mcp/bin/fowlbrowser-mcp`;
+export const MCP_BIN = process.env.FOWLBROWSER_MCP || `${ROOT}mcp/bin/fowlbrowser-mcp`;
+
+// env: extra variables for this server, e.g. FOWLBROWSER_RECORD for a scenario that runs its own recording server.
+// command and args start it another way, e.g. under its own sh so it gets a turn socket of its own.
+export async function connect(label, { env = {}, command = MCP_BIN, args = [] } = {}) {
   const transport = new StdioClientTransport({
-    command, args: [], stderr: 'pipe',
-    env: { ...process.env, FOWLBROWSER_LABEL: label },
+    command, args, stderr: 'pipe',
+    env: { ...process.env, FOWLBROWSER_LABEL: label, ...env },
   });
   let stderr = '';
   transport.stderr?.on('data', d => { stderr = (stderr + d).slice(-20000); });
   const client = new Client({ name: 'fowlbrowser-e2e', version: '0.1.0' });
-  await client.connect(transport);
+  await client.connect(transport).catch(e => { throw new Error(`${e.message}; server stderr: ${stderr.slice(-1500)}`); });
   const server = {
     // opened: tabs a running job holds now; everOpened: every tab any job of this server tracked.
     label, client, opened: new Set(), everOpened: new Set(), pendingOpens: 0,

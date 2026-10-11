@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import * as cursor from './cursor/index.mjs';
 import { record, tabEvent } from './record.mjs';
+import { clearViewport } from './viewport.mjs';
 
 export const turnSocketPath = (pid = process.ppid) => `/tmp/fowlbrowser-turn-${pid}.sock`;
 
@@ -46,6 +47,7 @@ export async function endTurn(manager) {
       const work = async () => {
         if (!same()) return false;
         tab.ending = true; // its page closing now is ours, not "found gone" (record mode)
+        await clearViewport(tab, 'turn end').catch(() => {});
         await cursor.remove(tab, { wait: !close });
         if (close) await browser.host.request('chrome.tabs.remove', [info.id]);
         else await browser.host.request('tabs.release', { tabId: info.id });

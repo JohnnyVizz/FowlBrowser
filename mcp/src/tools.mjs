@@ -9,6 +9,7 @@ import { debug } from './debug.mjs';
 import { EXPORT_DESCRIPTION, exportShape, exportTab } from './exports.mjs';
 import * as record from './record.mjs';
 import { callsByTab } from './turns.mjs';
+import { clearViewport, MAX_SIZE, MIN_SIZE, setViewport } from './viewport.mjs';
 import { cap as capText, collapseText, functionSource, newRefState, numberRefs, playwrightRef, REF_PATTERN, shownRef, SNAPSHOT_MAX_CHARS, SNAPSHOT_MAX_CHARS_LIMIT,
   snapshotChanges, urlMatcher } from './snapshots.mjs';
 
@@ -921,6 +922,7 @@ export function registerTools(server, manager) {
     const url = tab?.page.url();
     const call = async () => {
       if (ends && tab) tab.ending = true; // its page closing now is ours, not "found gone" (record mode)
+      if (event === 'release' && tab) await clearViewport(tab, 'release').catch(() => {});
       if (ends && tab) await cursor.remove(tab, { wait: fadeCursor });
       return browser.host.request(method, params(tabId, args));
     };
@@ -1235,6 +1237,34 @@ export function registerTools(server, manager) {
         { type: 'text', text: `${await header(tab)}\nScreenshot of the ${what}, JPEG, 1 image px = 1 CSS px.` },
         { type: 'image', data: image.toString('base64'), mimeType: 'image/jpeg' },
       ] };
+    }));
+
+  const sizeArg = z.number().int().min(MIN_SIZE).max(MAX_SIZE).optional();
+  tool('viewport',
+    'Lay the page out at another size (CSS px), like a phone or a smaller window; mobile: true also emulates a phone (meta viewport, touch). ' +
+    'Only when the user asks for a size or device, to test a breakpoint or mobile layout, or when the task can\'t be answered without it; never to make screenshots bigger. ' +
+    'Snapshot, screenshot and click x,y then use this size. Reset with reset: true when done unless the user asked to keep it (releasing the tab or the end of your turn resets it too).',
+    { tab: tabArg, width: sizeArg.describe(`Width in CSS px (${MIN_SIZE} to ${MAX_SIZE}).`), height: sizeArg.describe(`Height in CSS px (${MIN_SIZE} to ${MAX_SIZE}).`),
+      mobile: z.boolean().optional().describe('Emulate a phone: meta viewport, overlay scrollbars, touch (default false).'),
+      device_scale_factor: z.number().positive().max(4).optional().describe('devicePixelRatio, e.g. 3 for a recent iPhone (default: the screen\'s own).'),
+      reset: z.boolean().optional().describe('Back to the tab\'s real size.'), snapshot: snapshotArg },
+    withTab(manager, async (tab, args) => {
+      const lines = [];
+      if (args.reset) {
+        lines.push((await clearViewport(tab)) ? 'Viewport reset: the page is back at the tab\'s real size.' : 'No viewport was set on this tab; it is at its real size.');
+      } else {
+        if (args.width === undefined || args.height === undefined) throw new Error('Pass width and height, or reset: true.');
+        await setViewport(tab, { width: args.width, height: args.height, mobile: args.mobile === true, deviceScaleFactor: args.device_scale_factor });
+        const page = await tab.page.evaluate(() => ({ w: innerWidth, h: innerHeight, dpr: devicePixelRatio })).catch(() => null);
+        lines.push(`Viewport set to ${args.width}x${args.height}${args.mobile ? ' (mobile)' : ''}: the page reflowed` +
+          `${page ? ` (innerWidth ${page.w}, innerHeight ${page.h}, devicePixelRatio ${page.dpr})` : ''}. Snapshot, screenshot and click x,y use this size; ` +
+          'reset with viewport reset: true when done.');
+        const info = (await tab.browser.host.request('tabs.listAll', {}).catch(() => [])).find((t) => t.id === tab.tabId);
+        if (info && (info.origin === 'user' || info.kept || info.handedOver)) {
+          lines.push('This is the user\'s tab: they see it resized too until you reset it or release it.');
+        }
+      }
+      return report(tab, { lines, snapshot: args.snapshot !== false });
     }));
 
   tool('evaluate',
