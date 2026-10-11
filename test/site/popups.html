@@ -7,6 +7,7 @@
 <button id="slow">Open slow window</button>
 <button id="features">Open popup window</button>
 <button id="noopener">Open noopener window</button>
+<button id="self-close">Open and close this tab</button>
 <p>
   <a id="blank" href="popup-target.html?via=blank" target="_blank">Open link in new tab</a>
   <a id="rel-noopener" href="popup-target.html?via=rel-noopener" target="_blank" rel="noopener">Open noopener link</a>
@@ -30,5 +31,6 @@
   // The popup's server answers after 3 s, so its page commits long after the click returns.
   document.getElementById('slow').onclick = () => { window.open(`${target('slow')}&delay=3000`); };
   document.getElementById('features').onclick = () => result(window.open(target('features'), 'fbpopup', 'popup,width=400,height=300') ? 'opened' : 'blocked');
+  document.getElementById('self-close').onclick = () => { window.open(target('self-close'), '_blank', 'noopener'); window.close(); };
   document.getElementById('noopener').onclick = () => result(window.open(target('noopener'), '_blank', 'noopener') === null ? 'null' : 'window');
 </script>

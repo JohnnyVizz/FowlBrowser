@@ -125,7 +125,8 @@ ends.
 ## Good to know
 
 - FowlBrowser runs on macOS only for now.
-- A sign-in window that a website opens as a separate pop-up window can still bring the browser to the front.
+- A pop-up that talks back to its page (a sign-in or payment window, some size guides) opens in the background, but
+  if you are in another app at that moment, the browser comes to the front for a moment.
 - Agents read pages as text with numbered elements, not as screenshots, so they're fast and cheap. They can still take
   a screenshot when the layout matters.
 

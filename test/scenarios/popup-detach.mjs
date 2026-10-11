@@ -26,7 +26,14 @@ export default {
       // Playwright's job in the server: page scripts run, and bindings go into new contexts, only with these on.
       await send(tabId, 'Page.enable');
       await send(tabId, 'Runtime.enable');
-      const tab = Object.assign(new EventEmitter(), { tabId, browser: { host }, page: Object.assign(new EventEmitter(), { frames: () => [] }) });
+      // A tier 1 open's blank child is attached before it is navigated.
+      const waitForTab = async (id) => { await host.request('chrome.debugger.attach', [{ tabId: id }]); return { tabId: id, browser: { host } }; };
+      const tab = Object.assign(new EventEmitter(), { tabId, browser: { host, waitForTab },
+        page: Object.assign(new EventEmitter(), { frames: () => [], url: () => `${t.site}/detach.html` }) });
+      // The page's reports, as the server's Tab hears them (a tier 1 open becomes tabs.openChild).
+      host.on('chrome.debugger.onEvent', ([source, method, params]) => {
+        if (source.tabId === tabId && method === 'Runtime.bindingCalled') tab.emit('binding', params.name, params.payload);
+      });
       await installPopups(tab);
       await send(tabId, 'Page.navigate', { url: `${t.site}/detach.html?tag=${t.tag}` });
       await t.until(async () => (await send(tabId, 'Runtime.evaluate', { expression: 'document.readyState', returnByValue: true })).result?.value === 'complete', 'page loaded');

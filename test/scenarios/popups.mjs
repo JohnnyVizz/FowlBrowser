@@ -1,5 +1,6 @@
 // window.open and target=_blank: the action reports the new tab (even one whose page loads slowly), it is ours,
-// in the background, and closable.
+// in the background, and closable. One the extension opens (target=_blank) has no referrer (the page's referrer policy
+// isn't known to the server), and a page that opens one and closes itself at once still gets it.
 import { tabIdsIn } from '../lib.mjs';
 
 export default {
@@ -24,9 +25,23 @@ export default {
       t.eq(entry.active, false, 'popup stays in the background');
       t.eq(entry.muted, true, 'popup muted like its opener');
       t.eq(await t.resultOf(entry.tab), `popup:${via}`, 'popup page drivable');
+      if (via === 'blank') t.eq(await t.eval(entry.tab, '() => document.referrer'), '', 'no referrer');
 
       t.step(`${via}: close popup`);
       await t.close(entry.tab);
     }
+
+    // Only a tab a script opened may close itself: the opener is a window.open popup of the first tab.
+    t.step('self-close: the opener closes itself right after window.open');
+    const res = await t.call('click', { tab, ref: t.ref(s, 'button', 'Open window'), snapshot: false });
+    const closer = tabIdsIn(res.text, t.browser).find(id => id !== tab); // not tracked: it closes itself
+    await t.call('navigate', { tab: closer, url: `${t.site}/popups.html?tag=${t.tag}` });
+    await t.call('click', { tab: closer, ref: await t.refOf(closer, 'button', 'Open and close this tab'), snapshot: false }).catch(() => {});
+    const entry = await t.until(async () => (await t.listMine()).find(x => x.url.includes(`via=self-close&tag=${t.tag}`)), 'popup via=self-close listed as mine');
+    t.track(entry.tab);
+    t.eq(entry.active, false, 'popup stays in the background');
+    t.eq(await t.resultOf(entry.tab), 'popup:self-close', 'popup page drivable');
+    t.ok(!(await t.listMine()).some((x) => x.tab === closer), 'the opener closed itself');
+    await t.close(entry.tab);
   },
 };
