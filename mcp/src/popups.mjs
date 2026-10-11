@@ -1,13 +1,15 @@
 // Popups from agent tabs open without taking the user's eyes or focus (SPEC "Popups (session 5)").
 // Two page scripts, in every same-process frame of an agent tab and every new document, before page scripts:
-// - MAIN world: decides. Opens that need no opener (target=_blank links without rel=opener, links to a name no frame
-//   or window has, window.open with noopener/noreferrer) are handed to the isolated world, which replays them as a
+// - MAIN world: decides. Opens that need no opener (target=_blank links without rel=opener, links with rel=noopener
+//   or noreferrer to a name no frame or window has, window.open with noopener/noreferrer) are handed to the isolated world, which replays them as a
 //   Cmd-click (Ctrl elsewhere) on a private link; Blink opens an isolated-world modified click as a background tab
 //   (NEW_BACKGROUND_TAB: never activated, no window shown). Every other window.open still runs for real (the opener
 //   and the returned window stay real) but without popup features, so it opens as a tab, never as a window; the
-//   extension then switches the window back at once. window.close() is reported before the page closes itself.
-// - isolated world `fowlbrowser-popups`: the private link (closed shadow root, a click that never leaves it) and
-//   the binding that reports to the server.
+//   extension then switches the window back at once. window.close() is reported once the page is closing.
+// - isolated world `fowlbrowser-popups`: checks every request again (the page can't reach this world, but a page
+//   that learned the event name can send it anything), the private link (closed shadow root, a click that never
+//   leaves it) and the binding that reports to the server. It also tells whether the debugger is still attached:
+//   after a detach nothing can switch the MAIN script off over CDP, so it switches itself off at its next decision.
 // Only for tabs the user hasn't been given; removed (scripts, binding, and a live off-switch in the current
 // documents) before a tab goes back to the user.
 import crypto from 'node:crypto';
@@ -25,14 +27,21 @@ const OFF_CAP_MS = 400;
 function main(event) {
   const CONTROL = Symbol.for('fowlbrowser.popups');
   if (window[CONTROL]) return window[CONTROL].on();
+  // Taken before the page's scripts run: a page that replaced dispatchEvent would learn the event name.
+  const { apply } = Reflect;
+  const { dispatchEvent, addEventListener: listen, removeEventListener: unlisten } = EventTarget.prototype;
+  const Custom = CustomEvent;
+  const { stringify } = JSON;
   const nativeOpen = window.open;
   const nativeClose = window.close;
   const nativeToString = Function.prototype.toString;
   const names = new Map(); // window names this document opened -> their windows
   let on = false;
 
-  // Synchronous: the isolated world's listener runs inside dispatchEvent. True when it took the open.
-  const send = (data) => !document.dispatchEvent(new CustomEvent(event, { detail: JSON.stringify(data), cancelable: true }));
+  // Synchronous: the isolated world's listener runs inside dispatchEvent. True when it took the request. Refused
+  // (the debugger is gone, or no isolated world in this frame): off for good, the page's own call goes ahead natively.
+  const dispatch = (data) => !apply(dispatchEvent, document, [new Custom(event, { detail: stringify(data), cancelable: true })]);
+  const send = (data) => dispatch(data) || (control.off(), false);
   const httpUrl = (value) => {
     try {
       const url = new URL(value, document.baseURI);
@@ -61,26 +70,28 @@ function main(event) {
       const name = args[1] === undefined || String(args[1]) === '' ? '_blank' : String(args[1]);
       const features = args[2] === undefined ? '' : String(args[2]);
       if (!on || !navigator.userActivation?.isActive || modified(window.event) || !url || !httpUrl(url) || !newContext(name)) {
-        return Reflect.apply(target, self, args);
+        return apply(target, self, args);
       }
       const noreferrer = feature(features, 'noreferrer');
       if (noreferrer || feature(features, 'noopener')) {
-        return send({ type: 'open', url: httpUrl(url), noreferrer }) ? null : Reflect.apply(target, self, args);
+        return send({ type: 'open', url: httpUrl(url), noreferrer }) ? null : apply(target, self, args);
       }
       // Needs its opener: a real window.open, as a tab (no popup, width, height, left, top...).
-      const opened = Reflect.apply(target, self, [args[0], args[1], '']);
+      if (!send({ type: 'live' })) return apply(target, self, args);
+      const opened = apply(target, self, [args[0], args[1], '']);
       if (opened && !/^_blank$/i.test(name)) names.set(name, opened);
       return opened;
     },
   });
   const close = new Proxy(nativeClose, {
     apply(target, self, args) {
-      if (on && (self === undefined || self === window) && window === window.top) send({ type: 'close' });
-      return Reflect.apply(target, self, args);
+      apply(target, self, args);
+      // Reported once it really closes (the isolated world checks window.closed), so it can't be faked.
+      if (on && (self === undefined || self === window) && window === window.top) dispatch({ type: 'close' });
     },
   });
   const fakes = new Map([[open, nativeOpen], [close, nativeClose]]);
-  const toString = new Proxy(nativeToString, { apply: (target, self, args) => Reflect.apply(target, fakes.get(self) ?? self, args) });
+  const toString = new Proxy(nativeToString, { apply: (target, self, args) => apply(target, fakes.get(self) ?? self, args) });
   fakes.set(toString, nativeToString);
 
   // Links: decided after the page's own click handlers (a bubble listener added again while the click is on its way
@@ -91,15 +102,17 @@ function main(event) {
     if (!link || link.hasAttribute('download')) return;
     const rel = (link.getAttribute('rel') ?? '').toLowerCase().split(/\s+/);
     const url = httpUrl(link.href);
-    const target = link.getAttribute('target') ?? document.querySelector('base[target]')?.getAttribute('target') ?? '';
-    if (!url || rel.includes('opener') || !newContext(target.trim())) return;
+    const target = (link.getAttribute('target') ?? document.querySelector('base[target]')?.getAttribute('target') ?? '').trim();
+    // Only links without an opener: _blank, or rel=noopener|noreferrer (a link to any other name keeps its opener).
+    const noopener = rel.includes('noopener') || rel.includes('noreferrer') || /^_blank$/i.test(target);
+    if (!url || rel.includes('opener') || !noopener || !newContext(target)) return;
     if (send({ type: 'open', url, noreferrer: rel.includes('noreferrer'), referrerPolicy: link.referrerPolicy })) e.preventDefault();
   }
-  addEventListener('click', (e) => {
+  apply(listen, window, ['click', (e) => {
     if (!on || !e.isTrusted) return;
-    removeEventListener('click', onLink);
-    addEventListener('click', onLink);
-  }, true);
+    apply(unlisten, window, ['click', onLink]);
+    apply(listen, window, ['click', onLink]);
+  }, true]);
 
   const control = {
     on() {
@@ -119,32 +132,55 @@ function main(event) {
   control.on();
 }
 
-// Isolated world: opens what MAIN hands over as a background tab, and reports to the server.
+// Isolated world: checks and opens what MAIN hands over as a background tab, and reports to the server.
 function isolated(event, binding) {
   const CONTROL = Symbol.for('fowlbrowser.popups');
   if (globalThis[CONTROL]) return;
   globalThis[CONTROL] = true;
   const modifier = /Mac/.test(navigator.platform) ? 'metaKey' : 'ctrlKey';
   const report = (data) => { try { globalThis[binding](JSON.stringify(data)); } catch {} };
-  document.addEventListener(event, (e) => {
-    const data = JSON.parse(e.detail);
-    if (data.type === 'open') {
-      const host = document.createElement('span');
-      const link = document.createElement('a');
-      link.href = data.url;
-      link.target = '_blank';
-      link.rel = data.noreferrer ? 'noreferrer' : 'noopener';
-      if (data.referrerPolicy) link.referrerPolicy = data.referrerPolicy;
-      host.attachShadow({ mode: 'closed' }).append(link);
-      document.documentElement.append(host); // a link must be connected to navigate
-      try {
-        link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: false, view: window, [modifier]: true }));
-      } finally {
-        host.remove();
-      }
-      e.preventDefault();
+  const httpUrl = (value) => {
+    try {
+      const url = new URL(value);
+      return /^https?:$/.test(url.protocol) ? url.href : null;
+    } catch { return null; }
+  };
+  // Nodes the page can't see (a closed shadow root), connected for the time of fn.
+  const privately = (node, fn) => {
+    const host = document.createElement('span');
+    host.attachShadow({ mode: 'closed' }).append(node);
+    document.documentElement.append(host);
+    try {
+      return fn();
+    } finally {
+      host.remove();
     }
-    report(data);
+  };
+  // The binding goes into every new context of this world only while the debugger is attached (after a detach it stays
+  // in the old ones, silently doing nothing): a new frame's context has it, or the tab is no longer the agent's.
+  const attached = () => {
+    const frame = document.createElement('iframe');
+    return privately(frame, () => typeof frame.contentWindow?.[binding] === 'function');
+  };
+  document.addEventListener(event, (e) => {
+    let data;
+    try { data = JSON.parse(e.detail); } catch { return; }
+    if (data?.type === 'live') {
+      if (attached()) e.preventDefault();
+    } else if (data?.type === 'open') {
+      const url = httpUrl(data.url);
+      if (!url || !navigator.userActivation?.isActive || !attached()) return;
+      const link = document.createElement('a');
+      link.href = url;
+      link.target = '_blank';
+      link.rel = data.noreferrer === true ? 'noreferrer' : 'noopener';
+      if (typeof data.referrerPolicy === 'string' && data.referrerPolicy) link.referrerPolicy = data.referrerPolicy;
+      privately(link, () => link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: false, view: window, [modifier]: true })));
+      e.preventDefault();
+      report({ type: 'open', url });
+    } else if (data?.type === 'close' && window.closed && window === window.top) {
+      report({ type: 'close' });
+    }
   });
 }
 

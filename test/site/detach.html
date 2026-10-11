@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Detach test</title>
+<link rel="stylesheet" href="style.css">
+<h1>Detach test</h1>
+<!-- A click whose window.open runs a moment later (still with the click's user activation), so the debugger can be
+     detached in between. The title then says whether the popup script's wrapper was still in place. -->
+<button id="later">Open later</button>
+<script>
+  const params = new URLSearchParams(location.search);
+  const wrapped = window.open;
+  const installed = Object.getOwnPropertySymbols(window).some((s) => s.description === 'fowlbrowser.popups');
+  let n = 0;
+  document.getElementById('later').addEventListener('click', () => {
+    const via = `detach-${++n}`;
+    setTimeout(() => {
+      const active = navigator.userActivation.isActive;
+      try {
+        window.open(`popup-target.html?via=${via}&tag=${params.get('tag')}`, '_blank', 'noopener');
+        document.title = `${via} ${!installed ? 'no popup script' : window.open === wrapped ? 'wrapped' : 'native'}${active ? '' : ' (no user activation)'}`;
+      } catch (e) {
+        document.title = `${via} error ${e.message}`;
+      }
+    }, Number(params.get('delay') || 1200));
+  });
+</script>

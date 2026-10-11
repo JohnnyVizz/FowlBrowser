@@ -13,24 +13,33 @@ import { registerTools } from '../src/tools.mjs';
 function page({ active = true, take = true, frames = [] } = {}) {
   const handed = [];
   const native = [];
+  const order = []; // both, in turn
   const listeners = [];
   const context = vm.createContext({
     URL,
     navigator: { userActivation: { isActive: active } },
     document: {
       baseURI: 'https://site.example/dir/page.html',
-      dispatchEvent(e) { handed.push(JSON.parse(e.detail)); return !(take && e.cancelable); },
       querySelectorAll: () => frames,
       querySelector: () => null,
     },
-    // Like the DOM: the same listener is added once.
-    addEventListener: (type, fn, capture) => listeners.some((l) => l.fn === fn && l.capture === !!capture) || listeners.push({ type, fn, capture: !!capture }),
-    removeEventListener: (type, fn, capture) => { const i = listeners.findIndex((l) => l.type === type && l.fn === fn && l.capture === !!capture); if (i >= 0) listeners.splice(i, 1); },
-    record: (...call) => native.push(call), // arrays and objects of this realm, for deepEqual
+    // What reaches the isolated world (document only); window's listeners like the DOM: the same one is added once.
+    hooks: {
+      dispatch: (e) => { handed.push(JSON.parse(e.detail)); order.push(`handed ${handed.at(-1).type}`); return !(take && e.cancelable); },
+      listen: (type, fn, capture) => listeners.some((l) => l.fn === fn && l.capture === !!capture) || listeners.push({ type, fn, capture: !!capture }),
+      unlisten: (type, fn, capture) => { const i = listeners.findIndex((l) => l.type === type && l.fn === fn && l.capture === !!capture); if (i >= 0) listeners.splice(i, 1); },
+    },
+    record: (...call) => { native.push(call); order.push(`native ${call[0]}`); }, // arrays and objects of this realm, for deepEqual
     newWindow: () => ({ closed: false }),
   });
   vm.runInContext(`
     globalThis.window = globalThis; globalThis.parent = globalThis; globalThis.top = globalThis; globalThis.name = '';
+    globalThis.EventTarget = class {};
+    EventTarget.prototype.dispatchEvent = function (e) { return hooks.dispatch(e); };
+    EventTarget.prototype.addEventListener = function (...a) { return hooks.listen(...a); };
+    EventTarget.prototype.removeEventListener = function (...a) { return hooks.unlisten(...a); };
+    globalThis.addEventListener = EventTarget.prototype.addEventListener; globalThis.removeEventListener = EventTarget.prototype.removeEventListener;
+    document.dispatchEvent = EventTarget.prototype.dispatchEvent;
     globalThis.CustomEvent = class { constructor(type, init) { this.type = type; Object.assign(this, init); } };
     globalThis.MouseEvent = class { constructor(init) { Object.assign(this, { button: 0 }, init); } };
     globalThis.open = function open() { record('open', ...arguments); return newWindow(); };
@@ -50,7 +59,7 @@ function page({ active = true, take = true, frames = [] } = {}) {
     for (const { fn } of listeners.filter((l) => l.type === 'click' && !l.capture)) fn(event);
     return prevented;
   };
-  return { context, run, handed, native, clickLink };
+  return { context, run, handed, native, order, clickLink };
 }
 
 test('opens that need no opener go to the isolated world and the page gets null, as natively', () => {
@@ -63,10 +72,30 @@ test('opens that need no opener go to the isolated world and the page gets null,
   ]);
   assert.deepEqual(p.native, []);
 
-  // Nobody took it (no isolated world in that frame): the native call runs as asked.
+  // Refused (the debugger is gone, or no isolated world in that frame): the native call runs as asked, and from then
+  // on the natives are back.
   const lone = page({ take: false });
   lone.run(`window.open('next.html', '_blank', 'noopener')`);
   assert.deepEqual(lone.native, [['open', 'next.html', '_blank', 'noopener']]);
+  assert.equal(lone.run('window.open === nativeOpen && window.close === nativeClose && Function.prototype.toString === realToString'), true);
+});
+
+test('a refused opener-keeping open (debugger gone) runs natively with its features and switches the wrappers off', () => {
+  const p = page({ take: false });
+  p.run(`window.open('https://idp.example/auth', 'idp', 'popup,width=480')`);
+  assert.deepEqual(p.handed, [{ type: 'live' }]);
+  assert.deepEqual(p.native, [['open', 'https://idp.example/auth', 'idp', 'popup,width=480']]);
+  assert.equal(p.run('window.open === nativeOpen'), true);
+  assert.equal(p.clickLink({ href: 'target.html', target: '_blank' }), false, 'links are native too');
+});
+
+test('the private event goes through the dispatchEvent of document start: a page that wraps it later learns nothing', () => {
+  const p = page();
+  p.run(`globalThis.leaked = []; const real = EventTarget.prototype.dispatchEvent;
+    EventTarget.prototype.dispatchEvent = document.dispatchEvent = function (e) { leaked.push(e.type); return real.call(this, e); };`);
+  p.run(`window.open('next.html', '_blank', 'noopener')`);
+  assert.equal(p.handed.length, 1);
+  assert.equal(p.run('leaked.length'), 0);
 });
 
 test('window.open that may need its opener runs for real, as a tab: popup features are dropped', () => {
@@ -74,7 +103,7 @@ test('window.open that may need its opener runs for real, as a tab: popup featur
   const w = p.run(`window.open('https://idp.example/auth', 'idp', 'popup,width=480,height=640')`);
   assert.deepEqual(w, { closed: false });
   assert.deepEqual(p.native, [['open', 'https://idp.example/auth', 'idp', '']]);
-  assert.deepEqual(p.handed, []);
+  assert.deepEqual(p.handed, [{ type: 'live' }]); // the isolated world says the debugger is still there
   // noopener=0 is not noopener.
   p.run(`window.open('a.html', '_blank', 'noopener=0,left=10')`);
   assert.deepEqual(p.native.at(-1), ['open', 'a.html', '_blank', '']);
@@ -106,7 +135,7 @@ test('everything else is left to the browser untouched', () => {
   assert.deepEqual(modified.native, [['open', 'next.html', 'x', 'popup']]);
 });
 
-test('links that open a new context without an opener are replaced; the rest keep their default action', () => {
+test('links that open a new context without an opener are replaced; the rest (named targets keep their opener) keep their default action', () => {
   const p = page({ frames: [{ name: 'side' }] });
   assert.equal(p.clickLink({ href: 'target.html', target: '_blank' }), true);
   assert.equal(p.clickLink({ href: 'target.html', target: 'fresh', rel: 'noreferrer' }), true);
@@ -118,6 +147,7 @@ test('links that open a new context without an opener are replaced; the rest kee
     [{ href: 'target.html', target: '_blank', rel: 'opener' }],
     [{ href: 'target.html' }],
     [{ href: 'target.html', target: 'side' }],
+    [{ href: 'target.html', target: 'fresh' }], // a new named context: it has an opener (HTML: only _blank implies noopener)
     [{ href: 'file.zip', target: '_blank', download: '' }],
     [{ href: 'mailto:a@b.example', target: '_blank' }],
     [{ href: 'target.html', target: '_blank' }, { metaKey: true }],
@@ -129,11 +159,10 @@ test('links that open a new context without an opener are replaced; the rest kee
   assert.equal(p.handed.length, 2);
 });
 
-test('window.close is reported first; the wrappers look native and the off-switch restores the originals', () => {
+test('window.close is reported once it ran; the wrappers look native and the off-switch restores the originals', () => {
   const p = page();
   p.run('window.close()');
-  assert.deepEqual(p.handed, [{ type: 'close' }]);
-  assert.deepEqual(p.native, [['close']]);
+  assert.deepEqual(p.order, ['native close', 'handed close']);
   assert.equal(p.run('window.open.name'), 'open');
   assert.equal(p.run('window.open.length'), 0);
   assert.equal(p.run('window.open.toString()'), p.run('realToString.call(nativeOpen)'));
@@ -147,6 +176,77 @@ test('window.close is reported first; the wrappers look native and the off-switc
   assert.equal(p.run('window.open === nativeOpen && window.close === nativeClose && Function.prototype.toString === realToString'), true);
   p.run(`(${pageScripts.main})('fowlbrowser-test')`); // installed again (a resumed tab): on again
   assert.equal(p.run('window.open === nativeOpen'), false);
+});
+
+// The isolated world with a stand-in DOM: `attached` says whether a new context of the world gets the binding (only
+// while the debugger is attached). Returns how to send it a request as MAIN would (true when taken), the clicks it
+// made on its private link, its reports, and the nodes it left in the document.
+function isolatedWorld({ attached = true, active = true, closed = false } = {}) {
+  const clicks = [];
+  const reports = [];
+  const tree = new Set();
+  let listener;
+  const element = (localName) => ({
+    localName,
+    contentWindow: localName === 'iframe' ? (attached ? { __fowlbrowserPopup() {} } : {}) : undefined,
+    attachShadow: () => ({ append() {} }),
+    remove() { tree.delete(this); },
+    dispatchEvent(e) { clicks.push({ href: this.href, target: this.target, rel: this.rel, metaKey: e.metaKey, composed: e.composed }); return true; },
+  });
+  const context = vm.createContext({
+    URL, JSON,
+    navigator: { platform: 'MacIntel', userActivation: { isActive: active } },
+    document: {
+      createElement: element,
+      documentElement: { append: (node) => tree.add(node) },
+      addEventListener: (type, fn) => { listener = fn; },
+    },
+    MouseEvent: class { constructor(type, init) { Object.assign(this, { type }, init); } },
+    __fowlbrowserPopup: (payload) => reports.push(JSON.parse(payload)),
+    closed,
+  });
+  vm.runInContext('globalThis.window = globalThis; globalThis.top = globalThis;', context);
+  vm.runInContext(`(${pageScripts.isolated})('fowlbrowser-test', '__fowlbrowserPopup')`, context);
+  const send = (detail) => {
+    let taken = false;
+    listener({ detail: typeof detail === 'string' ? detail : JSON.stringify(detail), preventDefault: () => { taken = true; } });
+    return taken;
+  };
+  return { send, clicks, reports, tree, context };
+}
+
+test('isolated world: opens what MAIN hands over as a background tab, after checking it again', () => {
+  const w = isolatedWorld();
+  assert.equal(w.send({ type: 'open', url: 'https://site.example/next', noreferrer: false }), true);
+  assert.deepEqual(w.clicks, [{ href: 'https://site.example/next', target: '_blank', rel: 'noopener', metaKey: true, composed: false }]);
+  assert.deepEqual(w.reports, [{ type: 'open', url: 'https://site.example/next' }]);
+  assert.equal(w.tree.size, 0, 'nothing left in the document');
+  assert.equal(w.send({ type: 'live' }), true);
+
+  // Forged by a page that learned the event name: anything MAIN would never send is refused, and never reported.
+  for (const forged of [{ type: 'open', url: 'javascript:alert(1)' }, { type: 'open', url: 'next.html' }, { type: 'open' }, { type: 'nope' }, 'not json']) {
+    assert.equal(w.send(forged), false, JSON.stringify(forged));
+  }
+  const idle = isolatedWorld({ active: false });
+  assert.equal(idle.send({ type: 'open', url: 'https://site.example/next' }), false, 'no user activation, no open');
+  assert.equal(w.clicks.length + idle.clicks.length, 1);
+  assert.equal(w.reports.length + idle.reports.length, 1);
+});
+
+test('isolated world: after a detach (no binding in a new context) it refuses everything, so MAIN switches off', () => {
+  const w = isolatedWorld({ attached: false });
+  assert.equal(w.send({ type: 'open', url: 'https://site.example/next' }), false);
+  assert.equal(w.send({ type: 'live' }), false);
+  assert.deepEqual([w.clicks, w.reports, w.tree.size], [[], [], 0]);
+});
+
+test('isolated world: a close is reported only when the window really is closing', () => {
+  const open = isolatedWorld();
+  open.send({ type: 'close' }); // forged: the page is not closing
+  assert.deepEqual(open.reports, []);
+  const closing = isolatedWorld({ closed: true });
+  closing.send({ type: 'close' });
+  assert.deepEqual(closing.reports, [{ type: 'close' }]);
 });
 
 function fakeTab() {
