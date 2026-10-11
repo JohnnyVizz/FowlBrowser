@@ -25,6 +25,7 @@ const MAX_IN_FLIGHT = 64; // the host refuses a client with over 256; Lighthouse
 // timeout (run() waited the long wait before starting, so this covers one that began meanwhile).
 const LH_TRACE_WAIT_MS = 25_000;
 const TRACE_CHUNK = 10_000; // trace events per Tracing.dataCollected handed to Lighthouse
+const LH_SETTLE_MS = 60_000; // a run abandoned at the browser connection's close gets this long to end on its own
 const TRACE_BUSY = 'Lighthouse could not trace the page: something else kept recording a trace in this browser (another session\'s trace or Lighthouse run, or DevTools\' Performance panel) for as long as this call waited. Stop it, then run lighthouse again.';
 const gunzip = promisify(zlib.gunzip);
 const MAX_FLAGGED = 20;
@@ -58,10 +59,16 @@ export class Session extends EventEmitter {
     try {
       // The run's trace comes back as a gzipped stream (many times fewer bytes through the extension and the host than
       // its Tracing.dataCollected events; collectTrace hands the events over), and its start waits a little for another
-      // session's trace to end.
+      // session's trace to end: one in-flight operation for settled(), ended by a close at its next try.
       if (method === 'Tracing.start') {
         params = { ...params, transferMode: 'ReturnAsStream', streamCompression: 'gzip' };
-        ({ result } = await startTracing(call, { waitMs: LH_TRACE_WAIT_MS }));
+        const op = startTracing(() => (this.shared.closed ? Promise.reject(closedError()) : call()), { waitMs: LH_TRACE_WAIT_MS });
+        this.shared.inFlightSends.add(op);
+        try {
+          const { result: started, waitedMs } = await op;
+          result = started;
+          this.shared.traceWaitMs = waitedMs;
+        } finally { this.shared.inFlightSends.delete(op); }
       } else result = await call();
     } catch (error) { debug('lh err', method, String(error?.message).slice(0, 120)); throw error; } finally { this.release(); debug('lh', method, `${Date.now() - started} ms`); }
     if (method === 'Page.addScriptToEvaluateOnNewDocument' && result?.identifier) this.shared.scripts.push({ sessionId: this.sessionId, identifier: result.identifier });
@@ -89,14 +96,23 @@ export class Session extends EventEmitter {
     this.emitSafe(method, params);
     if (child) this.emitSafe('sessionattached', child);
   }
-  async collectTrace({ stream, dataLossOccurred }) {
-    try {
-      const { traceEvents } = JSON.parse((await gunzip(await readStream((m, p) => this.send(m, p), stream))).toString('utf8'));
-      for (let i = 0; i < traceEvents.length; i += TRACE_CHUNK) this.dispatch('Tracing.dataCollected', { value: traceEvents.slice(i, i + TRACE_CHUNK) });
-    } catch (error) {
-      debug('lh trace', String(error?.message).slice(0, 120)); // Lighthouse then has no trace events, and says so
-    }
-    this.dispatch('Tracing.tracingComplete', { dataLossOccurred });
+  // One in-flight operation for settled(). IO.close goes raw: a run that closed meanwhile refuses sends, but the
+  // stream's buffer in Chrome is still worth freeing. Such a run gets its completion with no events (Lighthouse's
+  // collector would otherwise wait for it without end), and says so.
+  collectTrace({ stream, dataLossOccurred }) {
+    const send = (m, p) => (m === 'IO.close' ? cdp(this.shared.tab, m, p, this.sessionId) : this.send(m, p));
+    const op = (async () => {
+      let events = [];
+      try {
+        ({ traceEvents: events } = JSON.parse((await gunzip(await readStream(send, stream))).toString('utf8')));
+      } catch (error) {
+        debug('lh trace', String(error?.message).slice(0, 120)); // Lighthouse then has no trace events, and says so
+      }
+      if (!this.shared.closed) for (let i = 0; i < events.length; i += TRACE_CHUNK) this.dispatch('Tracing.dataCollected', { value: events.slice(i, i + TRACE_CHUNK) });
+      this.dispatch('Tracing.tracingComplete', { dataLossOccurred });
+    })();
+    this.shared.inFlightSends.add(op);
+    op.finally(() => this.shared.inFlightSends.delete(op)).catch(() => {});
   }
   // Lighthouse's listeners are partly async (TargetManager's sessionattached and frameNavigated) and their promises
   // reach nobody: a rejection there (a child target gone before its answer) would be unhandled and end the process.
@@ -127,7 +143,14 @@ export function rootSession(tab) {
     return Promise.race([Promise.allSettled([...shared.inFlightSends]), new Promise((r) => { timer = setTimeout(r, timeoutMs); })]).finally(() => clearTimeout(timer));
   };
   root.scripts = shared.scripts;
+  root.waited = () => shared.traceWaitMs ?? 0; // how long the run's own Tracing.start retried for another session's trace
   return root;
+}
+
+// Resolves once `promise` settles, or after timeoutMs.
+function within(promise, timeoutMs) {
+  let timer;
+  return Promise.race([promise.catch(() => {}), new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs); })]).finally(() => clearTimeout(timer));
 }
 
 // After a run, whatever happened: Lighthouse leaves its emulation, blocked URLs and scripts on the session, and
@@ -175,14 +198,19 @@ async function run(tab, lh, { device, mode, categories }) {
   // override); in navigation mode it first makes way for Lighthouse's emulation, a snapshot audits the page at it.
   const viewport = tab.viewport;
   const warnings = [];
+  // The slot and the wait below can take a while: a user who took the tab over meanwhile keeps it as it is.
+  const takenOver = () => { const n = notice(tab.id); if (n) { release(); throw new Error(n); } };
+  takenOver();
   // Another session's recording would fail the run's own Tracing.start (Chrome records one trace per browser): it ends
   // first, waited for on the page as it is (up to TRACE_WAIT), and the result says for how long.
   if (mode === 'navigation') {
     let waitedMs;
     try { waitedMs = await waitForTracing(tab); } catch (error) { release(); throw traceBusy(error) ? new Error(TRACE_BUSY) : error; }
+    takenOver();
     if (waitedMs >= 1000) warnings.push(`Waited ${Math.round(waitedMs / 1000)} s for another session's trace to end before the run.`);
   }
   let failure = null;
+  let running = null; // the Lighthouse run itself
   const root = rootSession(tab);
   const page = { url: async () => (await root.send('Target.getTargetInfo')).targetInfo.url, target: () => ({ createCDPSession: async () => root }) };
   try {
@@ -195,8 +223,10 @@ async function run(tab, lh, { device, mode, categories }) {
     const closed = new Promise((_, reject) => { onClose = () => reject(new Error('The browser\'s FowlBrowser connection closed during the audit (the tab is no longer controlled).')); tab.browser.host.once('close', onClose); });
     closed.catch(() => {});
     let result;
+    running = mode === 'navigation' ? lh.navigation(page, url, { flags, config }) : lh.snapshot(page, { flags, config });
+    running.catch(() => {});
     try {
-      result = await Promise.race([mode === 'navigation' ? lh.navigation(page, url, { flags, config }) : lh.snapshot(page, { flags, config }), closed]);
+      result = await Promise.race([running, closed]);
     } finally {
       tab.browser.host.off('close', onClose);
     }
@@ -207,14 +237,18 @@ async function run(tab, lh, { device, mode, categories }) {
   } finally {
     root.close();
     await root.settled(45_000); // a host request can take that long to time out
+    if (root.waited() >= 1000) warnings.push(`Waited ${Math.round(root.waited() / 1000)} s for another session's trace to end before recording.`);
     await restore(tab, root.scripts);
-    // The user took the tab over meanwhile: it is theirs now, and nothing more is done to its page.
-    const takenOver = !!notice(tab.id);
-    if (viewport && !takenOver) await setViewport(tab, viewport).catch((error) => warnings.push(`The viewport you had set (${viewport.width}x${viewport.height}) could not be put back: ${error.message}. Set it again with viewport.`));
+    // The user took the tab over meanwhile (asked right before each step: a takeover lands at any time): it is theirs
+    // now, and nothing more is done to its page.
+    if (viewport && !notice(tab.id)) await setViewport(tab, viewport).catch((error) => warnings.push(`The viewport you had set (${viewport.width}x${viewport.height}) could not be put back: ${error.message}. Set it again with viewport.`));
     // Lighthouse's init scripts ran in the audited document and its frames (one wraps requestIdleCallback): after a
     // navigation run, whatever its outcome, the page loads once more, so the agent goes on with a clean document
     // (Playwright's reload: refs start over).
-    if (mode === 'navigation' && !takenOver) await tab.page.reload({ waitUntil: 'load' }).catch((error) => warnings.push(`The page could not be loaded again after the audit (${error.message.split('\n')[0]}): navigate to it before going on.`));
+    if (mode === 'navigation' && !notice(tab.id)) await tab.page.reload({ waitUntil: 'load' }).catch((error) => warnings.push(`The page could not be loaded again after the audit (${error.message.split('\n')[0]}): navigate to it before going on.`));
+    // A run abandoned at the browser connection's close may still be parsing its trace with the shared engine: it
+    // ends (its sends fail now, its load waits time out) before the engine is reset and the slot released.
+    if (running) await within(running, LH_SETTLE_MS);
     await resetEngine().catch(() => {}); // Lighthouse parsed its trace with the shared engine
     release();
     if (failure && warnings.length) failure.message += `\n${warnings.join('\n')}`;

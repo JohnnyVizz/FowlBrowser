@@ -70,20 +70,28 @@ export const traceBusy = (error) => /already (been )?started/i.test(error?.messa
 export async function startTracing(send, { waitMs = TRACE_WAIT.waitMs, retryMs = TRACE_WAIT.retryMs } = {}) {
   const started = Date.now();
   for (;;) {
-    try { return { result: await send(), waitedMs: Date.now() - started }; }
+    const attempt = Date.now(); // waitedMs: the retries, not the start that went through
+    try { return { result: await send(), waitedMs: attempt - started }; }
     catch (error) { if (!traceBusy(error) || Date.now() - started + retryMs > waitMs) throw error; }
     await sleep(retryMs);
   }
 }
 
 // Waits for the browser's tracing to be free (up to the wait above): starts an empty trace on the tab's session (busy:
-// retried like any start) and ends it at once. Resolves with how long it waited, so the tool can say so.
+// retried like any start) and ends it at once. Resolves with how long it waited, so the tool can say so. The empty
+// trace failing to end is an error (it may be left recording until the tab's session ends); its stream not completing
+// within 10 s leaves that stream to Chrome.
 export async function waitForTracing(tab, options) {
   const { waitedMs } = await startTracing(() => cdp(tab, 'Tracing.start', { transferMode: 'ReturnAsStream', traceConfig: { includedCategories: ['__metadata'], excludedCategories: ['*'] } }), options);
   const waiting = new AbortController();
   const complete = cdpEvent(tab, 'Tracing.tracingComplete', { timeoutMs: 10_000, signal: waiting.signal });
   complete.catch(() => {});
-  try { await cdp(tab, 'Tracing.end'); } catch { waiting.abort(); return waitedMs; }
+  try {
+    await cdp(tab, 'Tracing.end');
+  } catch (error) {
+    waiting.abort();
+    throw new Error(`The empty trace that checks whether the browser's tracing is free could not be ended (${error.message}); it may be recording until this tab is released.`);
+  }
   const { stream } = await complete.catch(() => ({}));
   if (stream) await cdp(tab, 'IO.close', { handle: stream }).catch(() => {});
   return waitedMs;

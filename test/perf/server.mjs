@@ -125,8 +125,7 @@ const handler = async (req, res) => {
   if (rest === 'app.html') return send(appPage(), 'html');
   return send('not found', 'html', 404);
 };
-// 127.0.0.1 and localhost (::1 too): two origins, so two pages need not share one renderer (Chrome puts same-site tabs
-// in one process once over its process limit, and one page's long tasks or a run's CPU throttling then slow the other).
+// 127.0.0.1 and localhost (::1 too): two origins, so a round can keep two of its pages as apart as two sites are.
 for (const host of ['127.0.0.1', '::1']) {
   const shown = host.includes(':') ? `[${host}]` : host;
   createServer(handler).on('error', (error) => console.warn(`perf pages: not on ${shown} (${error.code})`))

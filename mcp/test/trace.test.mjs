@@ -175,6 +175,15 @@ test('trace_start: busy at first, then free: the empty probe trace ends, the pag
   assert.notEqual(await slotIsFree(), null, 'slot released');
 });
 
+test('trace_start: a blank navigation that fails after it began (the page may have changed) is undone too', async () => {
+  const tab = fakeTab();
+  tab.page.goto = async (u) => { tab.page.gotos.push(u); if (u === 'about:blank') throw new Error('load wait timed out'); };
+  await assert.rejects(tools.trace_start(tab, { reload: true, auto_stop: false }), /load wait timed out/);
+  assert.deepEqual(tab.page.gotos, ['about:blank', 'http://127.0.0.1/perf.html']);
+  assert.ok(!tab.trace?.startedAt);
+  assert.notEqual(await slotIsFree(), null, 'slot released');
+});
+
 test('trace_start: a start failing after the page was blanked releases the slot and goes back', async () => {
   const tab = fakeTab({ 'Tracing.start': (n) => (n === 2 ? 'boom' : undefined) });
   await assert.rejects(tools.trace_start(tab, { reload: true, auto_stop: false }), /boom/);

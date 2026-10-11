@@ -299,3 +299,36 @@ test('a failed stream read still completes the trace, with no events, and closes
   assert.deepEqual(tab.browser.host.calls.map((c) => c.method), ['IO.read', 'IO.close']);
   root.close();
 });
+
+test('a Tracing.start retrying while the run closes stops at its next try, and counts as in flight until then', async () => {
+  Object.assign(TRACE_WAIT, { waitMs: 500, retryMs: 30 });
+  const tab = fakeTab((method) => { if (method === 'Tracing.start') throw new Error(BUSY); return {}; });
+  const root = rootSession(tab);
+  const sending = root.send('Tracing.start', { categories: '-*' });
+  let ended = false;
+  sending.catch(() => { ended = true; });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  root.close();
+  await root.settled(5000);
+  assert.ok(ended, 'settled waited for the retrying start');
+  await assert.rejects(sending, /Target closed/);
+  assert.equal(tab.browser.host.calls.filter((c) => c.method === 'Tracing.start').length, 1, 'no start after close');
+});
+
+test('a stream read that ends after the run closed: completion with no events, IO.close still sent raw', async () => {
+  let finishRead;
+  const read = new Promise((resolve) => { finishRead = resolve; });
+  const tab = fakeTab((method) => (method === 'IO.read' ? read : {}));
+  const root = rootSession(tab);
+  const seen = [];
+  root.on('Tracing.dataCollected', (p) => seen.push(p));
+  const complete = new Promise((resolve) => root.once('Tracing.tracingComplete', resolve));
+  event(tab, 'Tracing.tracingComplete', { stream: 's2', dataLossOccurred: false });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(tab.browser.host.calls.map((c) => c.method), ['IO.read']);
+  root.close();
+  finishRead({ data: zlib.gzipSync(JSON.stringify({ traceEvents: [{ name: 'e' }] })).toString('base64'), base64Encoded: true, eof: true });
+  assert.deepEqual(await complete, { dataLossOccurred: false });
+  assert.deepEqual(seen, [], 'no events for a run that ended');
+  assert.deepEqual(tab.browser.host.calls.map((c) => c.method), ['IO.read', 'IO.close']);
+});

@@ -7,6 +7,7 @@ import zlib from 'node:zlib';
 import { z } from 'zod';
 import { cdp, cdpEvent, fileTab, isUsersTab, outputDir, readStream, stamp, startTracing, traceBusy, tracingSlot, waitForTracing } from './perf.mjs';
 import { cap } from './snapshots.mjs';
+import { notice } from './takeover.mjs';
 
 const INSIGHT_MAX_CHARS = 20_000;
 const gunzip = promisify(zlib.gunzip);
@@ -380,14 +381,18 @@ export function registerTrace(tool, manager, { withTab, header, text, tabArg }) 
       const release = await tracingSlot();
       let blanked = false;
       let waitedMs = 0;
+      // The slot and the waits below can take a while: a user who took the tab over meanwhile keeps it as it is.
+      const takenOver = () => { const n = notice(tab.id); if (n) throw new Error(n); };
       try {
+        takenOver();
         // Chrome records one trace per browser (this server's own runs take turns; another session's or DevTools'
         // recording is waited for, on the page as it is, so a reload does not leave the tab blank meanwhile; the start
         // itself retries a little for one that began just now).
         if (reload) {
           waitedMs = await waitForTracing(tab);
+          takenOver();
+          blanked = true; // from here the page may have changed, even if the load wait fails
           await tab.page.goto('about:blank', { waitUntil: 'load' });
-          blanked = true;
         }
         // As puppeteer records (what chrome-devtools-mcp uses): a 1.2 GB buffer, so a busy page's load is not cut short.
         // Gzipped by Chrome: many times fewer bytes through the extension and the host (a 39 MB trace is 2.8 MB).
@@ -396,7 +401,7 @@ export function registerTrace(tool, manager, { withTab, header, text, tabArg }) 
         reload ? { waitMs: 10_000 } : {})).waitedMs;
       } catch (error) {
         release();
-        if (blanked) await tab.page.goto(url, { waitUntil: 'load' }).catch(() => {});
+        if (blanked && !notice(tab.id)) await tab.page.goto(url, { waitUntil: 'load' }).catch(() => {});
         if (traceBusy(error)) {
           throw new Error('Chrome records one trace at a time and something else kept recording (a trace or Lighthouse run of another session, or DevTools) for as long as this call waited. Try again when it ends.');
         }

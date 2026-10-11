@@ -36,12 +36,13 @@ test('tracingSlot: releasing twice is harmless and a free slot resolves at once'
 
 const BUSY = 'Tracing has already been started (possibly in another tab).';
 
-test('startTracing: a busy browser is retried until the start goes through, and says how long it waited', async () => {
+test('startTracing: a busy browser is retried until the start goes through, and says how long the retries took', async () => {
   let calls = 0;
-  const { result, waitedMs } = await startTracing(async () => { if (++calls < 3) throw new Error(BUSY); return 'ok'; }, { waitMs: 500, retryMs: 10 });
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const { result, waitedMs } = await startTracing(async () => { if (++calls < 3) throw new Error(BUSY); await sleep(100); return 'ok'; }, { waitMs: 500, retryMs: 10 });
   assert.equal(result, 'ok');
   assert.equal(calls, 3);
-  assert.ok(waitedMs >= 15 && waitedMs < 500, `waited ${waitedMs} ms`);
+  assert.ok(waitedMs >= 15 && waitedMs < 80, `waited ${waitedMs} ms: the start that went through is not counted`);
 });
 
 test('startTracing: still busy at the end of the wait throws the last error; any other error throws at once', async () => {
@@ -71,10 +72,10 @@ test('waitForTracing: an empty trace is started (retried while busy) and ended a
   assert.equal(host.listenerCount('chrome.debugger.onEvent'), 0);
 });
 
-test('waitForTracing: a failing Tracing.end stops the wait for tracingComplete', async () => {
+test('waitForTracing: the empty trace failing to end is an error (it may still be recording), and the wait stops', async () => {
   const host = new EventEmitter();
   host.request = async (name, [, command]) => { if (command === 'Tracing.end') throw new Error('end failed'); return {}; };
-  assert.equal(await waitForTracing({ tabId: 3, id: 'chrome:3', browser: { host } }, { waitMs: 100, retryMs: 5 }), 0);
+  await assert.rejects(waitForTracing({ tabId: 3, id: 'chrome:3', browser: { host } }, { waitMs: 100, retryMs: 5 }), /could not be ended \(end failed\); it may be recording/);
   assert.equal(host.listenerCount('chrome.debugger.onEvent'), 0);
 });
 

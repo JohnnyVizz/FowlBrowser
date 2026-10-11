@@ -535,13 +535,14 @@ Lighthouse runs of one server take turns (`tracingSlot`, process-wide; a holder 
   min); a recording of another session or of DevTools makes `Tracing.start` fail with "already been started": the tools
   wait for it to end (`startTracing`: retried every 2 s, up to 90 s, `TRACE_WAIT`; `waitForTracing` first starts and
   ends an empty trace on the page as it is, so a reload is not left blank meanwhile) and say for how long they waited
-  (from 1 s); still busy after that, the error says so. Traces come back as gzipped streams (`Tracing.start` with
+  (from 1 s: the retries, not the start that went through; Lighthouse's own start retries count too); still busy after
+  that, the error says so. The empty trace failing to end is an error (it may record until the tab's session ends); its
+  stream not completing within 10 s is left to Chrome. A takeover recorded while the slot or the wait was pending ends
+  the call with the takeover notice before anything touches the page. Traces come back as gzipped streams (`Tracing.start` with
   `ReturnAsStream` and `streamCompression: gzip`, `IO.read` 1 MB at a time, `readStream`): about 14x fewer bytes through
   the extension, the host and the client than the plain events (a 39 MB trace of a busy page is 2.8 MB), which had one
   Lighthouse run drop its client at the host's 64 MB write backlog and stall the browser's other sessions meanwhile. A
-  page's main-thread work and a run's CPU throttling are shared by every tab in its renderer process, and Chrome puts
-  same-site tabs in one process once over its process limit: another tab on the same site (the user's, another agent's)
-  slows while one is measured (DevTools has the same). A tab the user owns
+  tab the user owns
 (claimed, `for_user`, kept) is never reloaded for a measurement (`isUsersTab`). File names carry a millisecond stamp and
 the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements never share one.
 
@@ -554,7 +555,8 @@ the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements 
   tab (the user's page), like Lighthouse's navigation mode. Chrome records one trace at a time per browser (a trace, a
   Lighthouse run or DevTools in any tab): another session's is waited for as above (with `reload`, before the page is
   blanked; the start itself retries for 10 s more), then the tool errors saying so. The tracing slot is taken before the
-  page is blanked; if the start fails after that, the slot is released and the page loaded again before the error.
+  page is blanked; once the blanking navigation began, any failure (that navigation's own too) releases the slot and
+  loads the page again before the error, unless the user took the tab over.
   With `auto_stop` it waits `seconds` after the load (or after the start) and returns what `trace_stop` returns; without it
   the result says the trace is recording and `trace_stop` ends it. One recording per tab; a second `trace_start` meanwhile
   errors, a `trace_stop` without a recording errors.
@@ -604,15 +606,19 @@ the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements 
   again for Playwright (Lighthouse disables them when it finishes) and the takeover and popup bindings added again
   (`Runtime.disable` drops them), the trace engine's module state reset (Lighthouse parses its trace with the same
   engine). After a navigation run, whatever its outcome, the page is loaded once more (Playwright's reload, so refs start
-  over; a failed load is a warning line, the reports are written in any case), so the document the agent goes on with
-  has none of Lighthouse's init scripts (one wraps `window.requestIdleCallback` in every frame). If the user took the
-  tab over during the run (`takeover.notice`), neither the viewport nor the reload touches their page. Lighthouse records a trace, so a run takes the tracing slot like
+  over; a failed load is a warning line, and the reports of a run that produced a result are written before it), so the
+  document the agent goes on with has none of Lighthouse's init scripts (one wraps `window.requestIdleCallback` in every
+  frame). If the user took the tab over during the run (`takeover.notice`, asked right before each step), neither the
+  viewport nor the reload touches their page. Lighthouse records a trace, so a run takes the tracing slot like
   `trace_start` (this server's runs queue; a navigation run waits for another session's or DevTools' recording as above
   before it starts, its own `Tracing.start` then retries for up to 25 s more, under Lighthouse's 30 s protocol timeout,
   and a wait of 1 s or more is a warning line; still busy, the run fails saying so). Its trace comes back as a gzipped
   stream too: the session turns Lighthouse's `Tracing.start` into one and, on `tracingComplete`, reads it, gunzips it
   and hands the events to Lighthouse as `Tracing.dataCollected` chunks of 10,000, then `tracingComplete`; a failed read
-  completes with no events, and Lighthouse reports that. Result:
+  completes with no events, and Lighthouse reports that; so does a run that ended meanwhile (its `IO.close` still goes
+  out, raw). The retrying start and the stream read count as sends in flight for the 45 s settle, and a start retrying
+  when the run ends stops at its next try. A run abandoned when the browser connection closed gets up to 60 s to end
+  on its own (its sends fail, its load waits time out) before the engine is reset and the slot released. Result:
   Lighthouse version, device, mode and wall time; scores as 0-100 (a category holding only weight-0 audits, performance in
   snapshot mode, prints `n/a (<passed> of <n> audits pass)` instead of Lighthouse's 0); FCP, LCP, TBT, CLS, Speed Index and
   TTI when the run has them; failed or flagged audits (score under 1; informative, manual and not-applicable ones skipped;
