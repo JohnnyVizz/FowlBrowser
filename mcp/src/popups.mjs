@@ -28,8 +28,9 @@ const OFF_CAP_MS = 400;
 // MAIN world. Gate: transient user activation, no modifier on the event being handled (a real modified click already
 // means a background tab or a new window), http(s) only, a new browsing context only (never _self/_parent/_top or a
 // frame or window that exists), never about:blank or empty (window.open('') then document.write needs the window).
-// An opaque origin (a sandbox without allow-same-origin, which may also lack allow-popups) is left to the browser, and
-// so is a second window.open in one activation (the browser's own open would have used it up).
+// An opaque origin (a sandbox without allow-same-origin, which may also lack allow-popups) is left to the browser. Once
+// an activation went to the extension, every later window.open for a new context in it gets null, whatever its
+// features: the browser's own open would have used the activation up and blocked them.
 function main(event) {
   const CONTROL = Symbol.for('fowlbrowser.popups');
   if (window[CONTROL]) return window[CONTROL].on();
@@ -50,13 +51,18 @@ function main(event) {
   const rearm = (e) => { if (e.isTrusted && (e.type !== 'pointerup' || e.pointerType !== 'mouse')) spent = false; };
   for (const type of ['keydown', 'mousedown', 'pointerdown', 'pointerup', 'touchend']) apply(listen, window, [type, rearm, true]);
   // The new-tab modifier the server adds to an agent click that may open a popup (backgroundClick below), so Blink
-  // opens it as a background tab with its opener; the page must not see it. While the server holds this window open
-  // (for one element, under one token), trusted mouse events that carry the modifier and target that element or its
-  // descendants read metaKey and ctrlKey false, decided when the event is first read (a window capture listener reads
-  // each one first) and kept for that event; everything else reads as is. The modifier's own key events stop at this
-  // first window listener. Closed after the click, or after capMs if that never comes (a detach mid-click).
-  let hidden = null; // { element, token }
+  // opens it as a background tab with its opener; the page must not see it. The probe arms this (for one element, under
+  // one token); nothing is hidden while Playwright waits for the element. The click's own trusted modifier keydown, the
+  // first event of its input, opens a short window (CLICK_MS): during it the modifier's key events stop at this first
+  // window listener, and trusted mouse events that carry the modifier and target that element or its descendants read
+  // metaKey and ctrlKey false, decided when the event is first read (a window capture listener reads each one first)
+  // and kept for that event; everything else reads as is. Disarmed after the click, or after capMs if that never comes
+  // (a detach mid-click).
+  const CLICK_MS = 1000;
+  const { now } = Date;
+  let hidden = null; // { element, token, until }: until is the end of the window the click's keydown opened
   let hiddenTimer;
+  const clicking = () => hidden?.until !== undefined && now() <= hidden.until;
   const closedTokens = []; // a late hide() of a window already closed never opens it again
   const decided = new WeakMap(); // mouse event -> masked
   const { setTimeout: later, clearTimeout: cancel } = window;
@@ -65,7 +71,7 @@ function main(event) {
   const nativeKeys = ['metaKey', 'ctrlKey'].map((key) => Object.getOwnPropertyDescriptor(mouse, key));
   const masked = (e) => {
     if (decided.has(e)) return decided.get(e);
-    if (!hidden || !e.isTrusted) return false;
+    if (!clicking() || !e.isTrusted) return false;
     let value = false;
     if (apply(nativeKeys[0].get, e, []) || apply(nativeKeys[1].get, e, [])) {
       const path = apply(composedPath, e, []);
@@ -87,7 +93,9 @@ function main(event) {
     apply: (target, self, args) => apply(target, self, args) && !((args[0] === 'Meta' || args[0] === 'Control') && masked(self)),
   });
   const stopModifierKey = (e) => {
-    if (hidden && e.isTrusted && (e.key === 'Meta' || e.key === 'Control')) apply(stopImmediatePropagation, e, []);
+    if (!hidden || !e.isTrusted || (e.key !== 'Meta' && e.key !== 'Control')) return;
+    if (e.type === 'keydown' && !clicking()) hidden.until = now() + CLICK_MS;
+    if (clicking()) apply(stopImmediatePropagation, e, []);
   };
   apply(listen, window, ['keydown', stopModifierKey, true]);
   apply(listen, window, ['keyup', stopModifierKey, true]);
@@ -123,12 +131,12 @@ function main(event) {
       const url = args[0] === undefined ? '' : String(args[0]);
       const name = args[1] === undefined || String(args[1]) === '' ? '_blank' : String(args[1]);
       const features = args[2] === undefined ? '' : String(args[2]);
-      if (!on || opaque || spent || !navigator.userActivation?.isActive || modified(window.event) || !url || !httpUrl(url) || !newContext(name)) {
+      if (on && spent && navigator.userActivation?.isActive && newContext(name)) return null;
+      if (!on || opaque || !navigator.userActivation?.isActive || modified(window.event) || !url || !httpUrl(url) || !newContext(name)) {
         return apply(target, self, args);
       }
-      const noreferrer = feature(features, 'noreferrer');
-      if (noreferrer || feature(features, 'noopener')) {
-        if (!send({ type: 'open', url: httpUrl(url), noreferrer })) return apply(target, self, args);
+      if (feature(features, 'noreferrer') || feature(features, 'noopener')) {
+        if (!send({ type: 'open', url: httpUrl(url) })) return apply(target, self, args);
         spent = true;
         return null;
       }
@@ -162,7 +170,7 @@ function main(event) {
     // Only links without an opener: _blank, or rel=noopener|noreferrer (a link to any other name keeps its opener).
     const noopener = rel.includes('noopener') || rel.includes('noreferrer') || /^_blank$/i.test(target);
     if (!url || rel.includes('opener') || !noopener || !newContext(target)) return;
-    if (send({ type: 'open', url, noreferrer: rel.includes('noreferrer') })) e.preventDefault();
+    if (send({ type: 'open', url })) e.preventDefault();
   }
   apply(listen, window, ['click', (e) => {
     if (!on || !e.isTrusted) return;
@@ -248,7 +256,7 @@ function isolated(event, binding) {
       const url = httpUrl(data.url);
       if (!url || !navigator.userActivation?.isActive || !attached()) return;
       e.preventDefault();
-      report({ type: 'open', url, noreferrer: data.noreferrer === true });
+      report({ type: 'open', url });
     } else if (data?.type === 'close' && window.closed && window === window.top) {
       report({ type: 'close' });
     }
@@ -280,7 +288,7 @@ export const BACKGROUND_CLICK_FN = (el, { capMs, token }) => {
   if (!inside || hit.isContentEditable) return false;
   for (let node = hit; node; node = up(node)) {
     const tag = node.localName;
-    if ((tag === 'a' || tag === 'area') && node.hasAttribute('href')) return false;
+    if (tag === 'a' || tag === 'area') return false; // also without href: a handler may give it one
     if (tag === 'button' && node.type === 'submit' && node.form) return false;
     if (tag === 'input' && node.type !== 'button') return false;
     if (/^(textarea|select|option|label)$/.test(tag)) return false;
@@ -295,8 +303,8 @@ const installed = new Map(); // Tab -> identifiers of its two scripts
 const heard = new WeakSet(); // Tabs whose reports are listened to (once, however often they are installed)
 
 // Call when an agent tab comes under control, before it navigates. Reports: 'close' sets tab.closedByPageAt; 'open' (a
-// popup without an opener) is opened by the extension and announced like a Page.windowOpen, so the action that caused
-// it names the tab.
+// popup without an opener) is opened by the extension and announced like a Page.windowOpen (with the opening, and the
+// creation that gives its tab id first), so the action that caused it names the tab.
 export const popupsInstalled = (tab) => installed.has(tab);
 
 export async function installPopups(tab) {
@@ -310,9 +318,10 @@ export async function installPopups(tab) {
       try { data = JSON.parse(payload); } catch { return; }
       if (data?.type === 'close') tab.closedByPageAt = Date.now();
       else if (data?.type === 'open' && typeof data.url === 'string') {
-        const opening = openChild(tab, data.url, data.noreferrer === true);
+        const created = tab.browser.host.request('tabs.openChild', { tabId: tab.tabId, url: data.url });
+        const opening = created.then(({ tabId }) => navigateChild(tab, tabId, data.url));
         opening.catch((e) => debug('popups: openChild failed', e.message));
-        tab.emit('windowopen', data.url, opening);
+        tab.emit('windowopen', data.url, opening, created);
       }
     });
     tab.page.once('close', () => installed.delete(tab));
@@ -325,15 +334,34 @@ export async function installPopups(tab) {
   if (installed.has(tab)) installed.set(tab, scripts.map((s) => s.identifier));
 }
 
-// The extension opens a blank background child; once it is attached it goes to the URL as the page's own open would
-// have (the opener's page as referrer, unless noreferrer), so a download it turns into shows on the child's session.
-// Resolves with { tabId, url } once the navigation is sent.
-async function openChild(tab, url, noreferrer) {
-  const referrer = noreferrer ? '' : tab.page.url();
-  const { tabId } = await tab.browser.host.request('tabs.openChild', { tabId: tab.tabId, url });
+// The extension opens a blank background child (tabs.openChild); once it is attached it goes to the URL, so a download
+// it turns into shows on the child's session. With no referrer: the page's referrer policy isn't known here, and none
+// never tells more than the page would. Resolves with { tabId, url } once the navigation went through; one that failed
+// fails the opening (net::ERR_ABORTED is a download or an empty response, which the page's own open would not show
+// either).
+async function navigateChild(tab, tabId, url) {
   const child = await tab.browser.waitForTab(tabId);
-  cdp(child, 'Page.navigate', { url, referrer }).catch((e) => debug('popups: child navigation failed', e.message));
+  const { errorText } = (await cdp(child, 'Page.navigate', { url })) ?? {};
+  if (errorText && errorText !== 'net::ERR_ABORTED') throw new Error(errorText);
   return { tabId, url };
+}
+
+// What became of the opens an action had the extension make ([{ url, opening }]), at most `ms` after it: an error line
+// for each that failed and one for each still under way (the rest went through).
+export async function openingLines(openings, ms) {
+  const states = openings.map(({ url, opening }) => {
+    const state = { url };
+    state.done = opening.then(() => { state.line = null; },
+      (error) => { state.line = `The page opened ${url} in a new tab, which failed: ${error.message}`; });
+    return state;
+  });
+  let timer;
+  await Promise.race([Promise.allSettled(states.map((s) => s.done)), new Promise((resolve) => { timer = setTimeout(resolve, ms); })])
+    .finally(() => clearTimeout(timer));
+  return {
+    failed: states.filter((s) => s.line).map((s) => s.line),
+    pending: states.filter((s) => s.line === undefined).map((s) => `The page opened ${s.url} in a new tab, which is still loading.`),
+  };
 }
 
 // Before a tab goes back to the user (release, keep, turn end, handoff, takeover while attached; at session end every
@@ -358,19 +386,23 @@ export async function uninstallPopups(tab) {
 
 // A plain left click on a main-frame ref: click(modifiers) runs it, with the new-tab modifier when the page says so
 // (BACKGROUND_CLICK_FN, in tabs with the scripts). Afterwards, whatever the outcome, the modifier is lifted (Playwright
-// lifts it only after a click that went through; the page never sees this key either) and the window is closed, also
-// when the probe's answer never came back (the page may have opened it), for good: a late probe can't open it again.
+// lifts it only after a click that went through; the page never sees this key either) and the window is closed. A
+// probe whose answer never came back (the page may have armed it) is closed before the plain click, for good: a late
+// probe can't arm it again.
 const PROBE_MS = 300;
 export async function backgroundClick(tab, loc, capMs, click) {
   if (!installed.has(tab)) return click();
   const token = crypto.randomUUID();
+  // In the main frame's current document (after a navigation the new one never had it).
+  const close = () => capped(cdp(tab, 'Runtime.evaluate', { expression: `window[Symbol.for('fowlbrowser.popups')]?.show(${JSON.stringify(token)})` }).catch(() => {}));
   const background = await loc.evaluate(BACKGROUND_CLICK_FN, { capMs, token }, { timeout: PROBE_MS }).then((yes) => yes === true, () => null);
+  if (background === null) await close();
+  if (!background) return click();
   try {
-    return await click(background ? ['ControlOrMeta'] : undefined);
+    return await click(['ControlOrMeta']);
   } finally {
-    if (background) await capped(tab.page.keyboard.up('ControlOrMeta').catch(() => {}));
-    // In the main frame's current document (after a navigation the new one never had it).
-    if (background !== false) await capped(cdp(tab, 'Runtime.evaluate', { expression: `window[Symbol.for('fowlbrowser.popups')]?.show(${JSON.stringify(token)})` }).catch(() => {}));
+    await capped(tab.page.keyboard.up('ControlOrMeta').catch(() => {}));
+    await close();
   }
 }
 

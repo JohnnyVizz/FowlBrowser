@@ -92,7 +92,7 @@ opened by an owned tab) or `user` (claimed). Only the owner may attach/send/deta
 | `tabs.claim` | `{tabId, resume?}` | owns a user tab (origin user); on a parked tab of the same client it un-parks it only with `resume: true` (see `tabs.park`), refused without. Errors: owned by another client; URL scheme chrome:, chrome-extension:, devtools:, edge:, about: other than about:blank, or the Web Store. A new-tab page (chrome://newtab, chrome-search://, Helium's new tab) is first navigated to about:blank. Never activates. Emits `chrome.tabs.onCreated [tab]` to the client, returns tab |
 | `tabs.release` | `{tabId}` | detaches the debugger, drops ownership, tab stays open (an agent tab is ungrouped, unmuted, discardable again); always emits `chrome.tabs.onRemoved [tabId, {windowId, isWindowClosing:false}]` to the client, also when the tab closes meanwhile. If the handover keeps failing, the tab stays reserved (releasing) and the call errors; it is retried when the client disconnects |
 | `tabs.expectChild` | `{tabId, ms}` | owner only; for the next `ms` (capped at 5000), a tab whose navigation-target source is `tabId` is adopted for this client even if `tabId` is a claimed user tab (background, muted like its opener, the client's default group). The MCP server calls it before every action, so the agent's own click can open a tab it then drives. Also notes the tab's window, so a popup of this action can be switched back without awaiting anything. Replies `{ok:true}` |
-| `tabs.openChild` | `{tabId, url}` | owner only, `tabId` must pass children on (an agent tab not handed over, or a claimed tab inside its expectChild window), http(s) `url`: `chrome.tabs.create({windowId and index right after the opener, url:"about:blank", active:false, openerTabId})`, then adopted like any child (background, muted like its opener, its group, `chrome.tabs.onCreated` with `openerTabId`); the client navigates it (the server: `Page.navigate {url, referrer}` once attached). For popups without an opener (Popups (session 5), tier 1). The opener's owner record is taken before anything is awaited: if, once the tab exists, the client is gone or the opener's record changed (released, claimed by another client, handed over, parked), the tab is closed and the command fails. An opener that closed (its record is kept 5 s) still gets its child, at the end of its last window, without `openerTabId`. Until a page other than about:blank commits in the child, its `Page.downloadWillBegin` names the opener (so a target=_blank download is the opener's) and the child is closed, as Chrome closes a new tab whose first navigation became a download. Replies `{tabId}` |
+| `tabs.openChild` | `{tabId, url}` | owner only, `tabId` must pass children on (an agent tab not handed over, or a claimed tab inside its expectChild window), http(s) `url`: `chrome.tabs.create({windowId and index right after the opener, url:"about:blank", active:false, openerTabId})`, then adopted like any child (background, muted like its opener, its group, `chrome.tabs.onCreated` with `openerTabId`); the client navigates it (the server: `Page.navigate {url}`, no referrer, once attached). For popups without an opener (Popups (session 5), tier 1). The opener's ownership (its owner record and that record's kept, handedOver, parked, origin and releasing values) is taken before anything is awaited: if, once the tab exists, someone else owns the new tab or it is being closed, the command fails and leaves the tab alone; if the client is gone or the opener's ownership changed (released, claimed by another client, kept, handed over, parked), the tab is closed and the command fails. An opener that closed still gets its child, at the end of its last window, without `openerTabId`: its record is kept 5 s (checked on lookup) for its client on the same native port, and dropped when that client disconnects or the port closes; an opener that closes after the lookup makes `tabs.create` fail on its `openerTabId`, and creation is tried once more in the same window without it if the ownership is unchanged. Until a page other than about:blank commits in the child, its `Page.downloadWillBegin` names the opener (so a target=_blank download is the opener's) and the child is closed, as Chrome closes a new tab whose first navigation became a download. Replies `{tabId}` |
 | `tabs.keep` | `{tabId}` | marks a tab to stay open after the client disconnects and hands an agent tab over now (ungroup, discardable; unmuted, except a tab this extension muted stays muted as `agentMuted` until control ends); the client keeps driving it until it disconnects |
 | `tabs.closeUnowned` | `{tabId}` | closes a tab nobody owns (the user's) without attaching the debugger (a claim would wake it). Errors: owned by another client, owned by this client (use `chrome.tabs.remove`), incognito |
 | `tabs.focus` | `{tabId}` | the only call that activates a tab and focuses its window (explicit user-visible request); ends an `agentMuted` tab's mute first (unmuted if still ours, flag cleared) |
@@ -489,14 +489,19 @@ name could send anything.
   link with `rel=noopener` or `noreferrer` to a target no frame or window has, `window.open(url, name,
   "noopener"|"noreferrer")` (returns null, as natively). A link to any other name keeps its opener (HTML's "get an
   element's noopener"), so it is tier 2. The default action is cancelled and the isolated world reports
-  `{"type":"open","url","noreferrer"}`; the server counts it like a Page.windowOpen and asks the extension for
+  `{"type":"open","url"}`; the server counts it like a Page.windowOpen and asks the extension for
   `tabs.openChild` (a blank background tab), so the browser stays behind the user's app, then navigates the child
-  with `Page.navigate {url, referrer}`: the opener's URL as referrer (sent under the default referrer policy), none
-  for noreferrer. A failure to open it is a line in the result of the action that caused it. Lost on the way: the
-  initiator is the browser, not the page (Sec-Fetch-Site none), and the child gets no copy of sessionStorage. Like the
-  browser's own open uses up the activation, only one window.open per activation goes this way: the next one runs
-  natively, until the next activation-triggering input (keydown, mousedown, pointerdown, a non-mouse pointerup,
-  touchend). A document with an opaque origin (`self.origin === "null"`: sandboxed without allow-same-origin, maybe
+  with `Page.navigate {url}`: tier 1 tabs get no Referer (the page's referrer policy, document or link, isn't known
+  to the server, and none never tells more than the page would). A failure to open it (the extension refused, the
+  navigation was rejected or replied with an `errorText` other than `net::ERR_ABORTED`, which a download or an empty
+  response gives) is a line in the result of the action that caused it; the action waits up to 2 s for its openings,
+  reports every one that failed by then and names each still under way as still loading. Lost on the way: the
+  referrer, the initiator is the browser, not the page (Sec-Fetch-Site none), and the child gets no copy of
+  sessionStorage. Like the browser's own open uses up the activation, only one open per activation goes this way:
+  every later window.open for a new context in that activation (any tier, any features, also `''`) returns null
+  without a native call, as the popup blocker would, until the next activation-triggering input (keydown, mousedown,
+  pointerdown, a non-mouse pointerup, touchend); once the activation has expired the browser decides again. Known
+  limit: this is per document, while the browser's activation is shared by the page's frames. A document with an opaque origin (`self.origin === "null"`: sandboxed without allow-same-origin, maybe
   without allow-popups too) takes the browser's own path for links and window.open. Known limit: a CSP sandbox with
   allow-same-origin but without allow-popups can't be told from the page, so its tier 1 popups open though natively
   they would be blocked.
@@ -512,19 +517,22 @@ name could send anything.
   when the last snapshot shows the ref as a link, field, toggle, option or row). It scrolls the target into view, takes
   the point Playwright will click (the middle of its first client rect, clipped to the viewport) and judges the element
   hit there (`elementFromPoint`, through open shadow roots), which must be the target or inside it, with everything
-  up from it. If it qualifies, that call opens the MAIN script's hidden-modifier window for the target under a fresh
-  token. After the click, whatever happened (an error, a timeout, a probe whose answer never came), the server lifts
-  the modifier on Playwright's keyboard (Playwright does only after a click that went through; capped at 300 ms) and
-  then closes the window with that token (Runtime.evaluate in the main frame); a closed token never opens again, and
-  the window closes itself after the action timeout plus 5 s if nothing comes. While it is open, the
-  `MouseEvent.prototype` metaKey and ctrlKey getters (PointerEvent and the rest inherit them) and getModifierState
-  ("Meta", "Control") read false for trusted mouse events that carry the modifier and have the target in their
-  composed path; a window capture listener reads each mouse event first, and the value is kept for that event, so a
-  handler that keeps the event reads the same later, and the user's own Cmd-click elsewhere reads as it is. Trusted
-  keydown and keyup of Meta or Control stop at a window capture listener added at document start
-  (stopImmediatePropagation), before any page listener. The getters are
+  up from it. If it qualifies, that call arms the MAIN script's hidden-modifier window for the target under a fresh
+  token. A probe whose answer never came (300 ms) is closed with its token before the click, which then goes plain.
+  After a modified click, whatever happened (an error, a timeout), the server lifts the modifier on Playwright's
+  keyboard (Playwright does only after a click that went through; capped at 300 ms) and then closes the window with
+  that token (Runtime.evaluate in the main frame); a closed token never arms again, and an armed window disarms itself
+  after the action timeout plus 5 s if nothing comes. Armed, nothing is hidden yet (Playwright's actionability waits
+  come first). The click's own input starts with the modifier's trusted keydown: that opens a 1 s window (a retried
+  click's next keydown opens another). During it, the `MouseEvent.prototype` metaKey and ctrlKey getters
+  (PointerEvent and the rest inherit them) and getModifierState ("Meta", "Control") read false for trusted mouse
+  events that carry the modifier and have the target in their composed path; a window capture listener reads each
+  mouse event first, and the value is kept for that event, so a handler that keeps the event reads the same later,
+  and the user's own Cmd-click elsewhere reads as it is. Trusted keydown and keyup of Meta or Control stop at a window
+  capture listener added at document start (stopImmediatePropagation), before any page listener, only during that
+  window. The getters are
   Proxies of the natives, shown native by the toString patch, and restored by the off-switch. Not for: anything inside
-  an `a` or `area` with href, a submit control of a form (button of type submit with a form, input submit or image),
+  an `a` or `area`, with href or not (a handler may give it one), a submit control of a form (button of type submit with a form, input submit or image),
   inputs other than type=button, textarea, select, option, label, contenteditable, roles checkbox, radio, switch,
   option, menuitemcheckbox, menuitemradio, row, gridcell, treeitem (on the target or any ancestor, across shadow
   roots, judged from the element hit at the click point), focus inside a frame (the modifier's key events would go
@@ -533,7 +541,10 @@ name could send anything.
   synthetic one without modifiers, means the current tab). Known limits: the popup still makes Chrome show its
   window, so while the user is in another app the browser comes to the front for opener-dependent popups (accepted
   by argo, 2026-10-11); a sign-in button inside a cross-origin iframe opens natively; a native default action that
-  reads the real modifier (none among the elements that qualify) would act as Cmd-clicked. Measured on mac2 (bench,
+  reads the real modifier (none among the elements that qualify) would act as Cmd-clicked; the target is judged once,
+  before Playwright's actionability waits and retries (an element that moves, or gains a link under the click point,
+  meanwhile is not judged again), and a page handler that changes the default action while the click is dispatched
+  (turning the target into a link or a submit control in its mousedown handler) gets the modified default action. Measured on mac2 (bench,
   20 runs, median): a qualifying button click 158 to 164-195 ms in Chrome, 170 to 190-194 ms in Helium (the probe, the
   closing call and the modifier's key events, and the extra lift of the modifier since 2026-10-11's fix round); a checkbox click by ref, skipped by the snapshot check, is unchanged
   within noise.

@@ -50,7 +50,10 @@ function fakeChrome({ session = {}, local = {} } = {}) {
       async create(props) {
         calls.push(['tabs.create', props]);
         await wait('tabs.create');
-        return structuredClone(addTab({ windowId: props.windowId, url: props.url, active: props.active }));
+        if (props.openerTabId !== undefined && !tabs.has(props.openerTabId)) throw new Error(`No tab with id: ${props.openerTabId}.`);
+        const tab = addTab({ windowId: props.windowId, url: props.url, active: props.active });
+        await hooks.created?.(tab); // the tab exists before the call answers
+        return structuredClone(tab);
       },
       async update(id, props) {
         calls.push(['tabs.update', id, props]);
@@ -256,6 +259,11 @@ test('tabs.openChild: a child created while its opener changed hands, or its cli
       await call(2, 'tabs.expectChild', { tabId: opener, ms: 3000 });
     },
     'kept (handed to the user)': (call, opener) => call(1, 'tabs.keep', { tabId: opener }),
+    'kept while its action expects a child': async (call, opener) => {
+      await call(1, 'tabs.expectChild', { tabId: opener, ms: 3000 });
+      await call(1, 'tabs.keep', { tabId: opener });
+    },
+    'taken over by the user': (call, opener) => call(1, 'tabs.park', { tabId: opener, kind: 'takeover' }),
     'its client disconnected': (call, opener, core) => core.handleMessage({ method: 'host.clientDisconnected', params: { client: 1 } }),
   };
   for (const [change, run] of Object.entries(changes)) {
@@ -285,6 +293,75 @@ test('tabs.openChild: an opener that closed itself right after asking still gets
   assert.deepEqual(chrome.calls.filter((c) => c[0] === 'tabs.create').at(-1)[1], { windowId: 3, url: 'about:blank', active: false });
   assert.equal(core.owners.get(result.tabId)?.client, 1);
   assert.equal(chrome.tabsById.get(result.tabId).mutedInfo.muted, true);
+});
+
+test('tabs.openChild: an opener that closes while its child is being created still gets it, in its window, without the stale opener id', async () => {
+  const { core, call, start, chrome } = setup();
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  chrome.tabsById.get(opener.id).windowId = 3;
+  const open = gate(chrome, 'tabs.create');
+  const request = start(1, 'tabs.openChild', { tabId: opener.id, url: 'https://example.com/next' });
+  await tick();
+  await chrome.tabs.remove(opener.id);
+  open();
+  await request.done;
+  const { result, error } = request.reply();
+  assert.equal(error, undefined);
+  assert.deepEqual(chrome.calls.filter((c) => c[0] === 'tabs.create').at(-1)[1], { windowId: 3, url: 'about:blank', active: false });
+  assert.equal(core.owners.get(result.tabId)?.client, 1);
+
+  // Not when its client left meanwhile.
+  const second = setup();
+  const { result: other } = await second.call(1, 'tabs.open', { url: 'https://example.com' });
+  const release = gate(second.chrome, 'tabs.create');
+  const lost = second.start(1, 'tabs.openChild', { tabId: other.id, url: 'https://example.com/next' });
+  await tick();
+  await second.chrome.tabs.remove(other.id);
+  await second.core.handleMessage({ method: 'host.clientDisconnected', params: { client: 1 } });
+  release();
+  await lost.done;
+  assert.ok(lost.reply().error);
+  assert.equal(second.chrome.calls.filter((c) => c[0] === 'tabs.create').length, 2, 'no retry');
+});
+
+test('tabs.openChild never takes over a tab another client owns by the time it exists', async () => {
+  const { core, call, start, chrome } = setup();
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  chrome.hooks.created = async (tab) => {
+    chrome.hooks.created = null;
+    assert.equal((await call(2, 'tabs.claim', { tabId: tab.id })).error, undefined);
+  };
+  const request = start(1, 'tabs.openChild', { tabId: opener.id, url: 'https://example.com/next' });
+  await request.done;
+  assert.ok(request.reply().error);
+  const child = [...chrome.tabsById.values()].find((t) => t.id > opener.id);
+  assert.equal(core.owners.get(child.id)?.client, 2, 'still the other client\'s');
+  assert.ok(!chrome.calls.some((c) => c[0] === 'tabs.remove' && c[1] === child.id), 'and not closed');
+});
+
+test('tabs.openChild: a closed opener\'s reservation lasts 5 s, for its client on the same port only', async () => {
+  const closedOpener = async () => {
+    const s = setup();
+    const { result: opener } = await s.call(1, 'tabs.open', { url: 'https://example.com' });
+    await s.chrome.tabs.remove(opener.id);
+    return { ...s, ask: () => s.call(1, 'tabs.openChild', { tabId: opener.id, url: 'https://example.com/next' }) };
+  };
+  const late = await closedOpener();
+  const now = Date.now;
+  Date.now = () => now() + 6000;
+  try {
+    assert.match((await late.ask()).error?.message ?? '', /not owned/, 'expired on lookup, with no other close to prune it');
+  } finally {
+    Date.now = now;
+  }
+  const reconnected = await closedOpener();
+  await reconnected.core.handleMessage({ method: 'host.clientDisconnected', params: { client: 1 } });
+  await reconnected.connect(1);
+  assert.ok((await reconnected.ask()).error, 'cleared when its client disconnects');
+  const restarted = await closedOpener();
+  await restarted.core.portClosed();
+  await restarted.connect(1); // a new client that reuses the id
+  assert.ok((await restarted.ask()).error, 'cleared when the port closes');
 });
 
 test('a popup Chrome activates after Page.windowOpen is switched back inside the onCreated listener, once', async () => {

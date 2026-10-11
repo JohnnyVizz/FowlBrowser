@@ -1,6 +1,6 @@
 // window.open and target=_blank: the action reports the new tab (even one whose page loads slowly), it is ours,
-// in the background, and closable. One the extension opens (target=_blank) has its opener's page as referrer, and a
-// page that opens one and closes itself at once still gets it.
+// in the background, and closable. One the extension opens (target=_blank) has no referrer (the page's referrer policy
+// isn't known to the server), and a page that opens one and closes itself at once still gets it.
 import { tabIdsIn } from '../lib.mjs';
 
 export default {
@@ -25,7 +25,7 @@ export default {
       t.eq(entry.active, false, 'popup stays in the background');
       t.eq(entry.muted, true, 'popup muted like its opener');
       t.eq(await t.resultOf(entry.tab), `popup:${via}`, 'popup page drivable');
-      if (via === 'blank') t.ok((await t.eval(entry.tab, '() => document.referrer')).includes('/popups.html'), 'referrer is the opener\'s page');
+      if (via === 'blank') t.eq(await t.eval(entry.tab, '() => document.referrer'), '', 'no referrer');
 
       t.step(`${via}: close popup`);
       await t.close(entry.tab);

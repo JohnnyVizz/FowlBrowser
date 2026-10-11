@@ -8,7 +8,7 @@ import * as cursor from './cursor/index.mjs';
 import { debug } from './debug.mjs';
 import { EXPORT_DESCRIPTION, exportShape, exportTab } from './exports.mjs';
 import { registerPerf } from './perf.mjs';
-import { backgroundClick, uninstallPopups } from './popups.mjs';
+import { backgroundClick, openingLines, uninstallPopups } from './popups.mjs';
 import * as record from './record.mjs';
 import * as takeover from './takeover.mjs';
 import { callsByTab } from './turns.mjs';
@@ -379,15 +379,15 @@ async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenT
   const knownBefore = new Set(tab.browser.relay.model._knownTabs.keys());
   const generation = tab.documentGeneration;
   const opens = []; // URLs the page asked to open in a new tab or window during this action
-  const openings = []; // of those, the ones the extension opens (popups.mjs): an error line, or null once under way
+  const openings = []; // of those, the ones the extension opens (popups.mjs): { url, opening }
   const urls = new Map(); // tab id -> URL of a popup the extension opened
   const popupIds = new Set();
   const requests = [];
-  const onOpen = (url, opening) => {
+  const onOpen = (url, opening, created) => {
     opens.push(url);
     if (opening) {
-      openings.push(opening.then(({ tabId }) => { urls.set(tabId, url); return null; },
-        (error) => `The page opened ${url} in a new tab, which failed: ${error.message}`));
+      created.then(({ tabId }) => urls.set(tabId, url), () => {});
+      openings.push({ url, opening });
     }
   };
   const mapping = []; // popups being mapped to their tabs
@@ -410,10 +410,8 @@ async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenT
     // Returning early for a dialog: the action goes on once it is resolved, so later calls on this tab
     // wait for it (the dialog tool itself skips the queue).
     if (tab.dialog) tab.keepBusy(work.catch(() => {}));
-    let timer;
-    const failed = (await Promise.race([Promise.all(openings), new Promise((resolve) => { timer = setTimeout(resolve, POPUP_WAIT_MS, []); })])
-      .finally(() => clearTimeout(timer))).filter(Boolean);
-    lines = [...(lines ?? []), ...failed];
+    const { failed, pending } = await openingLines(openings, POPUP_WAIT_MS);
+    lines = [...(lines ?? []), ...failed, ...pending];
     newTabs = await openedTabs(tab, popupIds, mapping, knownBefore, opens.length - failed.length, urls);
     // kept: the extension hands it back at session end, never closes it (a child of a claimed, kept or for_user tab:
     // it may be the user's own Cmd-click).

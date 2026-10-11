@@ -360,6 +360,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
     for (const [id, record] of downloads) if (record.client === client) downloads.delete(id);
     for (const [tabId, expected] of downloadExpectations) if (expected.client === client) downloadExpectations.delete(tabId);
     for (let i = downloadSignals.length - 1; i >= 0; i--) if (downloadSignals[i].client === client) downloadSignals.splice(i, 1);
+    for (const [tabId, last] of lastOwned) if (last.owner.client === client) lastOwned.delete(tabId);
     const mine = [...owners].filter(([, owner]) => owner.client === client);
     for (const [, owner] of mine) owner.releasing = true;
     await Promise.allSettled([persist(), ...mine.map(([tabId, owner]) => serialize(tabId, () => cleanUp(tabId, owner)))]);
@@ -491,22 +492,32 @@ export function createCore({ chrome, send, timers = globalThis }) {
     // opener, adopted like any child of it, which the client then navigates (with the opener's referrer). A tab the
     // page opens itself, with a user gesture, makes Chrome show the opener's window, which brings the browser to the
     // front; tabs.create doesn't. An opener that closed itself right after asking (window.open, then window.close)
-    // still gets it, in its last window. The child is this client's only if the opener's owner record is still the
-    // one it asked with once the tab exists; otherwise it closes again.
+    // still gets it, in its last window (also when it closes while the tab is being created). The child is this
+    // client's only if the opener's ownership (record, keep, handover, parking) is what it asked with once the tab
+    // exists and nobody else has the tab; otherwise it closes again, unless someone else has it.
     async 'tabs.openChild'({ tabId, url }, { client, live }) {
       if (!/^https?:\/\//i.test(String(url))) throw new Error(`Not an http(s) URL: ${url}`);
-      const ownerNow = () => owners.get(tabId) ?? lastOwned.get(tabId)?.owner;
-      const owner = ownerNow();
+      const ownership = () => {
+        const owner = owners.get(tabId) ?? closedOwner(tabId)?.owner;
+        return owner ? [owner, !!owner.kept, !!owner.handedOver, owner.parked, owner.origin, !!owner.releasing] : [];
+      };
+      const asked = ownership();
+      const [owner] = asked;
       if (!owner || owner.client !== client) throw new Error(`Tab ${tabId} is not owned by this client`);
       if (!passesOn(owner, tabId)) throw new Error(`Tab ${tabId} passes no children on`);
+      const unchanged = () => live() && ownership().every((value, i) => value === asked[i]);
       return tracked(async () => {
         const source = await chrome.tabs.get(tabId).catch(() => null);
-        const windowId = source?.windowId ?? lastOwned.get(tabId)?.windowId;
+        const windowId = source?.windowId ?? closedOwner(tabId)?.windowId;
         if (windowId === undefined) throw new Error(`Tab ${tabId} closed`);
-        const tab = await chrome.tabs.create(source
-          ? { windowId, index: source.index + 1, url: 'about:blank', active: false, openerTabId: tabId }
-          : { windowId, url: 'about:blank', active: false });
-        if (!live() || ownerNow() !== owner || !passesOn(owner, tabId)) {
+        const blank = { windowId, url: 'about:blank', active: false };
+        const tab = await chrome.tabs.create(source ? { ...blank, index: source.index + 1, openerTabId: tabId } : blank).catch(async (error) => {
+          // The opener closed after the lookup (Chrome refuses a gone openerTabId): once more without it.
+          if (!source || !unchanged() || await chrome.tabs.get(tabId).then(() => true, () => false)) throw error;
+          return chrome.tabs.create(blank);
+        });
+        if (owners.has(tab.id) || closing.has(tab.id)) throw new Error(`Tab ${tab.id} was taken meanwhile`);
+        if (!unchanged()) {
           await chrome.tabs.remove(tab.id).catch(() => {});
           throw new Error(`Tab ${tabId} is no longer this client's to open from`);
         }
@@ -985,8 +996,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
     const owner = owners.get(tabId);
     if (!owner) return;
     owners.delete(tabId);
-    for (const [id, { at }] of lastOwned) if (Date.now() - at > LAST_OWNED_MS) lastOwned.delete(id);
-    lastOwned.set(tabId, { owner, windowId: removeInfo?.windowId, at: Date.now() });
+    lastOwned.set(tabId, { owner, windowId: removeInfo?.windowId, at: Date.now(), gen: generation });
     await persist();
     emitToOwner(owner, 'chrome.tabs.onRemoved', [tabId, removeInfo]);
   }
@@ -1078,6 +1088,14 @@ export function createCore({ chrome, send, timers = globalThis }) {
     return expected?.client === opener.client && Date.now() <= expected.until;
   }
 
+  // A closed owned tab's record and window, for 5 s, while its client is still served on the same port.
+  function closedOwner(tabId) {
+    const last = lastOwned.get(tabId);
+    if (!last) return;
+    if (Date.now() - last.at <= LAST_OWNED_MS && last.gen === generation && liveClients.has(last.owner.client)) return last;
+    lastOwned.delete(tabId);
+  }
+
   function adoptChild(tabId, openerTabId) {
     const opener = adopter(openerTabId);
     if (!opener || owners.has(tabId) || closing.has(tabId)) return;
@@ -1157,6 +1175,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
     downloadSignals.length = 0;
     strayDownloads.clear();
     downloadExpectations.clear();
+    lastOwned.clear();
     startsInFlight = 0;
     timers.clearTimeout(settleTimer);
     settleTimer = null;

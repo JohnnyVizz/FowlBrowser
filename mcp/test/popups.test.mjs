@@ -7,7 +7,7 @@ import vm from 'node:vm';
 
 const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 import { Browser, Tab } from '../src/browsers.mjs';
-import { BACKGROUND_CLICK_FN, backgroundClick, installPopups, pageScripts, uninstallPopups } from '../src/popups.mjs';
+import { BACKGROUND_CLICK_FN, backgroundClick, installPopups, openingLines, pageScripts, uninstallPopups } from '../src/popups.mjs';
 import { registerTools } from '../src/tools.mjs';
 
 // A window with a native-looking open/close, and an isolated world that takes every open it is handed (unless
@@ -38,6 +38,7 @@ function page({ active = true, take = true, frames = [], origin = 'https://site.
   });
   vm.runInContext(`
     globalThis.window = globalThis; globalThis.parent = globalThis; globalThis.top = globalThis; globalThis.name = '';
+    globalThis.clock = null; const realNow = Date.now; Date.now = () => clock ?? realNow(); // set clock to move time
     globalThis.EventTarget = class {};
     EventTarget.prototype.dispatchEvent = function (e) { return hooks.dispatch(e); };
     EventTarget.prototype.addEventListener = function (...a) { return hooks.listen(...a); };
@@ -95,8 +96,8 @@ test('opens that need no opener go to the isolated world and the page gets null,
   p.input('mousedown'); // a new activation
   assert.equal(p.run(`window.open('https://other.example/', 'x', 'width=300, noreferrer')`), null);
   assert.deepEqual(p.handed, [
-    { type: 'open', url: 'https://site.example/dir/next.html', noreferrer: false },
-    { type: 'open', url: 'https://other.example/', noreferrer: true },
+    { type: 'open', url: 'https://site.example/dir/next.html' },
+    { type: 'open', url: 'https://other.example/' },
   ]);
   assert.deepEqual(p.native, []);
 
@@ -168,8 +169,8 @@ test('links that open a new context without an opener are replaced; the rest (na
   assert.equal(p.clickLink({ href: 'target.html', target: '_blank' }), true);
   assert.equal(p.clickLink({ href: 'target.html', target: 'fresh', rel: 'noreferrer' }), true);
   assert.deepEqual(p.handed, [
-    { type: 'open', url: 'https://site.example/dir/target.html', noreferrer: false },
-    { type: 'open', url: 'https://site.example/dir/target.html', noreferrer: true },
+    { type: 'open', url: 'https://site.example/dir/target.html' },
+    { type: 'open', url: 'https://site.example/dir/target.html' },
   ]);
   const kept = [
     [{ href: 'target.html', target: '_blank', rel: 'opener' }],
@@ -206,13 +207,18 @@ test('window.close is reported once it ran; the wrappers look native and the off
   assert.equal(p.run('window.open === nativeOpen'), false);
 });
 
-test('one open through the extension per activation, as the browser consumes it; an opaque origin is left to the browser', () => {
+test('one open per activation, as the browser consumes it: later ones in it get null, whatever their features; an opaque origin is left to the browser', () => {
   const p = page();
   const open = () => p.run(`window.open('next.html', '_blank', 'noopener')`);
   open();
-  open(); // same activation: the browser's own (which would have used it up natively)
-  assert.equal(p.handed.length, 1);
-  assert.deepEqual(p.native, [['open', 'next.html', '_blank', 'noopener']]);
+  // Same activation: natively the first open used it up, so these are blocked, popup features or not.
+  for (const call of [`'next.html', '_blank', 'noopener'`, `'https://other.example/', '_blank', 'popup,width=400'`, `'https://idp.example/', 'idp'`, `''`]) {
+    assert.equal(p.run(`window.open(${call})`), null, call);
+  }
+  assert.deepEqual([p.handed.length, p.native], [1, []]);
+  p.run(`window.open('https://site.example/', '_self')`); // not a new context: as is
+  assert.deepEqual(p.native, [['open', 'https://site.example/', '_self']]);
+  p.native.length = 0;
   p.input('click'); // not activation-triggering
   p.input('pointerup', { pointerType: 'mouse' });
   p.input('mousedown', { isTrusted: false });
@@ -223,6 +229,10 @@ test('one open through the extension per activation, as the browser consumes it;
     open();
   }
   assert.equal(p.handed.length, 6, 'each activation-triggering input allows one more');
+  // Once the activation is over the browser decides (its popup blocker, or the site's popup permission).
+  p.run(`navigator.userActivation.isActive = false`);
+  p.run(`window.open('https://other.example/', '_blank', 'popup')`);
+  assert.deepEqual(p.native, [['open', 'https://other.example/', '_blank', 'popup']]);
 
   // A sandbox without allow-same-origin may also lack allow-popups: the browser decides, for opens and links.
   const sandboxed = page({ origin: 'null' });
@@ -231,7 +241,7 @@ test('one open through the extension per activation, as the browser consumes it;
   assert.equal(sandboxed.clickLink({ href: 'target.html', target: '_blank' }), false);
 });
 
-test('hidden-modifier window: the page reads no Cmd or Ctrl on the agent\'s trusted mouse events and never gets the key itself', async () => {
+test('hidden-modifier window: opened by the agent click\'s own modifier keydown, for a moment; the page reads no Cmd or Ctrl on its trusted mouse events and never gets the key', async () => {
   const p = page();
   p.run(`globalThis.target = { id: 'button' }; globalThis.elsewhere = { id: 'other' };`);
   const control = (call) => p.run(`window[Symbol.for('fowlbrowser.popups')].${call}`);
@@ -249,6 +259,10 @@ test('hidden-modifier window: the page reads no Cmd or Ctrl on the agent\'s trus
   assert.equal(meta('keydown'), true);
 
   assert.equal(control(`hide(10000, target, 't1')`), true);
+  // Armed while Playwright waits for the element: the user's own Cmd-click and keys still read as they are.
+  assert.deepEqual([...read(dispatch('target'))], held, 'before the click starts');
+  assert.equal(meta('keyup'), true);
+  assert.equal(meta('keydown'), false, 'the click\'s modifier opens the window, and is stopped');
   const agents = dispatch('target');
   assert.deepEqual([...read(agents)], plain, 'the agent\'s click on its element');
   assert.deepEqual([...read(dispatch('target', { type: 'click' }))], plain);
@@ -267,12 +281,27 @@ test('hidden-modifier window: the page reads no Cmd or Ctrl on the agent\'s trus
   assert.deepEqual([...read(dispatch('target'))], held, 'closed again');
   assert.equal(meta('keydown'), true);
 
-  // Never left open: it closes by itself after capMs (a detach mid-click), and on the off-switch.
+  // The window is short: after a second nothing is hidden, and only another modifier keydown (a retried click) opens it.
+  control(`hide(10000, target, 't5')`);
+  p.run(`clock = Date.now()`);
+  meta('keydown');
+  p.run(`clock += 1001`);
+  assert.deepEqual([...read(dispatch('target'))], held);
+  assert.equal(meta('keyup'), true);
+  assert.equal(meta('keydown'), false);
+  assert.deepEqual([...read(dispatch('target'))], plain);
+  p.run(`clock = null`);
+  control(`show('t5')`);
+
+  // Never left armed: disarmed by itself after capMs (a detach mid-click), and on the off-switch.
   control(`hide(20, target, 't2')`);
+  meta('keydown');
   assert.deepEqual([...read(dispatch('target'))], plain);
   await sleepMs(40);
   assert.deepEqual([...read(dispatch('target'))], held);
+  assert.equal(meta('keydown'), true);
   control(`hide(10000, target, 't3')`);
+  meta('keydown');
   control('off()');
   assert.deepEqual([...read(dispatch('target'))], held);
   assert.equal(control(`hide(10000, target, 't4')`), false, 'off: no window');
@@ -340,10 +369,12 @@ test('background click probe: plain buttons and click-handler elements qualify; 
     [{ tag: 'body' }, { tag: 'div', attrs: { role: 'button' } }, { tag: 'span' }],
     [{ tag: 'body' }, { tag: 'div' }],
     [{ tag: 'body' }, { tag: 'input', type: 'button' }],
-    [{ tag: 'body' }, { tag: 'a' }, { tag: 'span' }], // an anchor without href is no link
   ];
   const no = [
     [{ tag: 'body' }, { tag: 'a', attrs: { href: '/x' } }, { tag: 'span' }],
+    [{ tag: 'body' }, { tag: 'a' }, { tag: 'span' }], // no href yet: its mousedown handler may give it one
+    [{ tag: 'body' }, { tag: 'a', attrs: { role: 'button' } }],
+    [{ tag: 'map' }, { tag: 'area' }],
     [{ tag: 'map' }, { tag: 'area', attrs: { href: '/x' } }],
     [{ tag: 'form' }, { tag: 'button', type: 'submit', form }, { tag: 'span' }],
     [{ tag: 'form' }, { tag: 'input', type: 'submit', form }],
@@ -413,12 +444,13 @@ test('background click: only in tabs with the scripts; the modifier is lifted an
   assert.deepEqual([asked.at(-1).capMs, clicks.at(-1), keys], [15000, ['ControlOrMeta'], ['ControlOrMeta']]);
   assert.deepEqual(shown(), [`window[Symbol.for('fowlbrowser.popups')]?.show(${JSON.stringify(token)})`]);
 
-  // A probe that timed out (its window may be open in the page): no modifier, but the window is closed for good.
+  // A probe that timed out (the page may have armed it): closed for good before the plain click, which has no modifier.
   commands.length = 0;
   keys.length = 0;
-  await backgroundClick(tab, loc(() => { throw new Error('Timeout 300ms exceeded'); }), 15000, click);
+  let shownAtClick;
+  await backgroundClick(tab, loc(() => { throw new Error('Timeout 300ms exceeded'); }), 15000, async (modifiers) => { shownAtClick = shown(); return click(modifiers); });
   assert.notEqual(asked.at(-1).token, token, 'a token per click');
-  assert.deepEqual([clicks.at(-1), keys, shown()], [undefined, [], [`window[Symbol.for('fowlbrowser.popups')]?.show(${JSON.stringify(asked.at(-1).token)})`]]);
+  assert.deepEqual([clicks.at(-1), keys, shownAtClick], [undefined, [], [`window[Symbol.for('fowlbrowser.popups')]?.show(${JSON.stringify(asked.at(-1).token)})`]]);
 
   // A click that failed after the modifier went down (Playwright lifts it only on success): lifted here, then closed.
   commands.length = 0;
@@ -484,9 +516,9 @@ function isolatedWorld({ attached = true, active = true, closed = false } = {}) 
 
 test('isolated world: reports what MAIN hands over (the server has the extension open it), after checking it again', () => {
   const w = isolatedWorld();
-  assert.equal(w.send({ type: 'open', url: 'https://site.example/next', noreferrer: false }), true);
-  assert.equal(w.send({ type: 'open', url: 'https://site.example/other', noreferrer: true }), true);
-  assert.deepEqual(w.reports, [{ type: 'open', url: 'https://site.example/next', noreferrer: false }, { type: 'open', url: 'https://site.example/other', noreferrer: true }]);
+  assert.equal(w.send({ type: 'open', url: 'https://site.example/next' }), true);
+  assert.equal(w.send({ type: 'open', url: 'https://site.example/other', referrer: 'https://site.example/secret' }), true);
+  assert.deepEqual(w.reports, [{ type: 'open', url: 'https://site.example/next' }, { type: 'open', url: 'https://site.example/other' }]);
   assert.deepEqual(w.clicks, [], 'nothing clicked in the page');
   assert.equal(w.tree.size, 0, 'nothing left in the document');
   assert.equal(w.send({ type: 'live' }), true);
@@ -576,33 +608,59 @@ test('installed over raw CDP: the binding first (isolated world only), then both
   ].sort());
 });
 
-test('a popup without an opener: the extension opens a blank child, which goes to the URL with the opener as referrer; a failure reaches the action', async () => {
+test('a popup without an opener: the extension opens a blank child, which goes to the URL with no referrer; a failed navigation fails the opening', async () => {
   const { tab, browser, commands } = fakeTab();
   const child = { tabId: 9, browser };
   browser.waitForTab = async (tabId) => (tabId === 9 ? child : null);
   const request = browser.host.request;
+  let navigate = async () => ({ frameId: 'f', loaderId: 'l' });
   browser.host.request = async (method, params) => {
     if (method === 'tabs.openChild') { commands.push([method, params]); return { tabId: 9 }; }
-    if (method === 'chrome.debugger.sendCommand' && params[0].tabId === 9) { commands.push(['child', params[1], params[2]]); return {}; }
+    if (method === 'chrome.debugger.sendCommand' && params[0].tabId === 9) { commands.push(['child', params[1], params[2]]); return navigate(params[2]); }
     return request(method, params);
   };
   await installPopups(tab);
   const opens = [];
   tab.on('windowopen', (url, opening) => opens.push(opening));
-  tab.emit('binding', '__fowlbrowserPopup', '{"type":"open","url":"https://site.example/next","noreferrer":false}');
-  tab.emit('binding', '__fowlbrowserPopup', '{"type":"open","url":"https://other.example/","noreferrer":true}');
+  tab.emit('binding', '__fowlbrowserPopup', '{"type":"open","url":"https://site.example/next"}');
+  tab.emit('binding', '__fowlbrowserPopup', '{"type":"open","url":"https://other.example/","referrer":"https://site.example/?token=SECRET"}');
   assert.deepEqual(await Promise.all(opens), [{ tabId: 9, url: 'https://site.example/next' }, { tabId: 9, url: 'https://other.example/' }]);
   assert.deepEqual(commands.filter(([m]) => m === 'tabs.openChild' || m === 'child'), [
     ['tabs.openChild', { tabId: 7, url: 'https://site.example/next' }],
     ['tabs.openChild', { tabId: 7, url: 'https://other.example/' }],
-    ['child', 'Page.navigate', { url: 'https://site.example/next', referrer: 'https://site.example/' }],
-    ['child', 'Page.navigate', { url: 'https://other.example/', referrer: '' }],
-  ]);
+    ['child', 'Page.navigate', { url: 'https://site.example/next' }],
+    ['child', 'Page.navigate', { url: 'https://other.example/' }],
+  ], 'never a referrer: the page\'s policy may forbid one');
+
+  // A navigation that failed, or was refused, fails the opening; a download (net::ERR_ABORTED) does not.
+  navigate = async () => ({ frameId: 'f', errorText: 'net::ERR_NAME_NOT_RESOLVED' });
+  tab.emit('binding', '__fowlbrowserPopup', '{"type":"open","url":"https://nowhere.example/"}');
+  await assert.rejects(opens.at(-1), /ERR_NAME_NOT_RESOLVED/);
+  navigate = async () => { throw new Error('Debugger is not attached to the tab'); };
+  tab.emit('binding', '__fowlbrowserPopup', '{"type":"open","url":"https://site.example/x"}');
+  await assert.rejects(opens.at(-1), /not attached/);
+  navigate = async () => ({ frameId: 'f', errorText: 'net::ERR_ABORTED' });
+  tab.emit('binding', '__fowlbrowserPopup', '{"type":"open","url":"https://site.example/file.zip"}');
+  assert.deepEqual(await opens.at(-1), { tabId: 9, url: 'https://site.example/file.zip' });
 
   // Refused (the opener changed hands meanwhile): the action that caused it is told, not only the log.
   browser.host.request = async (method, params) => (method === 'tabs.openChild' ? Promise.reject(new Error('Tab 7 is no longer this client\'s to open from')) : request(method, params));
   tab.emit('binding', '__fowlbrowserPopup', '{"type":"open","url":"https://site.example/lost"}');
   await assert.rejects(opens.at(-1), /no longer this client/);
+});
+
+test('an action reports every opening that failed by its deadline, and names the ones still under way', async () => {
+  const never = new Promise(() => {});
+  const started = Date.now();
+  const { failed, pending } = await openingLines([
+    { url: 'https://a.example/', opening: Promise.reject(new Error('net::ERR_NAME_NOT_RESOLVED')) },
+    { url: 'https://b.example/', opening: never },
+    { url: 'https://c.example/', opening: Promise.resolve() },
+  ], 50);
+  assert.ok(Date.now() - started < 1000);
+  assert.deepEqual(failed, ['The page opened https://a.example/ in a new tab, which failed: net::ERR_NAME_NOT_RESOLVED']);
+  assert.deepEqual(pending, ['The page opened https://b.example/ in a new tab, which is still loading.']);
+  assert.deepEqual(await openingLines([], 50), { failed: [], pending: [] });
 });
 
 test('an unanswered uninstall (debugger gone, page hung) never holds up the release', async () => {
