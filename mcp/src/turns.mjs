@@ -6,7 +6,7 @@ import net from 'node:net';
 import * as cursor from './cursor/index.mjs';
 import { uninstallPopups } from './popups.mjs';
 import { record, tabEvent } from './record.mjs';
-import { markEnding } from './takeover.mjs';
+import { markEnding, parked } from './takeover.mjs';
 import { clearViewport } from './viewport.mjs';
 
 export const turnSocketPath = (pid = process.ppid) => `/tmp/fowlbrowser-turn-${pid}.sock`;
@@ -42,7 +42,8 @@ export async function endTurn(manager) {
       const id = `${browser.key}:${info.id}`;
       const tab = tabs.get(info.id);
       // A parked tab (taken over, handed off) stays this session's, so the next turn can resume it once the user says so.
-      if (!tab || info.parked || tab.busy || callsByTab.get(id) > 0) return result.skipped.push(id);
+      // The server notes a takeover before the extension has parked the tab: both count, here and right before closing.
+      if (!tab || info.parked || parked(id) || tab.busy || callsByTab.get(id) > 0) return result.skipped.push(id);
       // Older extensions don't send kept; handedOver was their rule.
       const close = info.origin === 'agent' && !(info.kept ?? info.handedOver);
       // Re-checked when its turn on the tab queue comes: a later turn may have released and reclaimed the same id.
@@ -53,6 +54,10 @@ export async function endTurn(manager) {
         markEnding(id); // nor the user closing it
         await clearViewport(tab, 'turn end').catch(() => {});
         await cursor.remove(tab, { wait: !close });
+        if (parked(id)) { // taken over meanwhile: the user's now
+          tab.ending = false;
+          return false;
+        }
         if (close) await browser.host.request('chrome.tabs.remove', [info.id]);
         else {
           await uninstallPopups(tab);

@@ -1088,3 +1088,45 @@ test('tabs opened from a parked tab are the user\'s, even inside an expectChild 
   await tick();
   assert.equal(core.owners.has(child.id), false);
 });
+
+test('a resume that fails partway leaves the tab parked and protected: the disconnect hands it over, never closes it', async () => {
+  const { core, chrome, call } = setup();
+  const { result: tab } = await call(1, 'tabs.open', {});
+  await call(1, 'tabs.park', { tabId: tab.id, kind: 'handoff' });
+  chrome.hooks.groupError = 'Tabs cannot be edited right now (user may be dragging a tab).';
+  assert.match((await call(1, 'tabs.claim', { tabId: tab.id })).error.message, /dragging/);
+  const owner = core.owners.get(tab.id);
+  assert.deepEqual([owner.parked?.kind, owner.kept, owner.handedOver], ['handoff', true, true]);
+  assert.equal(chrome.session.owners[tab.id].parked?.kind, 'handoff', 'persisted as parked');
+  await core.handleMessage({ method: 'host.clientDisconnected', params: { client: 1 } });
+  await tick();
+  assert.ok(chrome.tabsById.has(tab.id), 'still open');
+});
+
+test('parking ends our mute while the debugger is still attached, then detaches', async () => {
+  const { chrome, call } = setup();
+  const { result: tab } = await call(1, 'tabs.open', {});
+  await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3']);
+  chrome.calls.length = 0;
+  await call(1, 'tabs.park', { tabId: tab.id, kind: 'handoff' });
+  const unmute = chrome.calls.findIndex((c) => c[0] === 'tabs.update' && c[2].muted === false);
+  const detach = chrome.calls.findIndex((c) => c[0] === 'debugger.detach');
+  assert.ok(unmute >= 0 && detach > unmute, JSON.stringify(chrome.calls));
+
+  const { result: user } = await call(1, 'tabs.open', {});
+  chrome.tabsById.get(user.id).mutedInfo = { muted: true, reason: 'user' }; // the user's own mute meanwhile stays
+  await call(1, 'tabs.park', { tabId: user.id, kind: 'handoff' });
+  assert.deepEqual(chrome.tabsById.get(user.id).mutedInfo, { muted: true, reason: 'user' });
+});
+
+test('a replaced parked tab stays parked under its new id and is not announced for attaching', async () => {
+  const { core, chrome, call, sent } = setup();
+  const { result: tab } = await call(1, 'tabs.open', {});
+  await call(1, 'tabs.park', { tabId: tab.id, kind: 'handoff' });
+  const replacement = chrome.addTab({ url: 'https://example.com/prerendered' });
+  chrome.tabsById.delete(tab.id);
+  sent.length = 0;
+  await core.onTabReplaced(replacement.id, tab.id);
+  assert.equal(core.owners.get(replacement.id).parked.kind, 'handoff');
+  assert.deepEqual(sent.map((m) => [m.method, m.params[1]?.replacedBy]), [['chrome.tabs.onRemoved', replacement.id]]);
+});

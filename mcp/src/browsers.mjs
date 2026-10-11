@@ -10,7 +10,7 @@ import { debug } from './debug.mjs';
 import { HostClient, listSockets } from './hostClient.mjs';
 import { installPopups } from './popups.mjs';
 import { downloadDone, record } from './record.mjs';
-import { Activity, watchTakeovers, watchUserInput } from './takeover.mjs';
+import { Activity, currentCall, refuseParked, watchTakeovers, watchUserInput } from './takeover.mjs';
 import { CDPRelay } from './vendor/cdpRelay.mjs';
 
 export const LABEL = process.env.FOWLBROWSER_LABEL || 'Claude';
@@ -76,10 +76,12 @@ export class Tab extends EventEmitter {
 
   // The next call starts once this one, and any work it left running (keepBusy), has finished. The check runs
   // right before each call starts, so work that resumes after its dialog is answered still holds the tab.
+  // A tool call queued before the tab was parked (taken over, handed off) fails with the notice when its turn comes.
   run(fn) {
     this._calls++;
     const acted = this.activity.begin();
-    const result = this._queue.then(() => this._idle()).then(fn).finally(() => { this._calls--; acted(); });
+    const call = currentCall();
+    const result = this._queue.then(() => this._idle()).then(() => { refuseParked(this, call); return fn(); }).finally(() => { this._calls--; acted(); });
     this._queue = result.catch(() => {});
     return result;
   }

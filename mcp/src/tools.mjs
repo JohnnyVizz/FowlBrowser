@@ -811,7 +811,7 @@ export function registerTools(server, manager) {
         // A parked tab (taken over by the user, or handed to them) refuses everything but resuming or letting it go, at once.
         const parked = tabKey && !ON_PARKED_TABS.has(name) && takeover.notice(tabKey);
         if (parked) throw new Error(parked);
-        result = await handler(args);
+        result = await takeover.inCall({ tabKey, onParked: ON_PARKED_TABS.has(name) }, () => handler(args));
         debug('tool <', name, `${Date.now() - started} ms`);
       } catch (error) {
         debug('tool !', name, `${Date.now() - started} ms`, String(error?.message ?? error));
@@ -912,6 +912,7 @@ export function registerTools(server, manager) {
     async ({ tab: value, snapshot, resume }) => {
       const { key, tabId } = parseTabId(value);
       const id = `${key}:${tabId}`;
+      await takeover.settled(id); // a takeover still parking the tab: resume what it parked, not before
       const parked = takeover.parked(id);
       if (parked && (!resume || parked.gone)) throw new Error(takeover.notice(id));
       const browser = await manager.get(key);
@@ -919,7 +920,14 @@ export function registerTools(server, manager) {
       const claimed = await browser.host.request('tabs.claim', { tabId });
       // If the debugger isn't attached (an earlier attach failed), announce the tab again so a retry really retries.
       if (!browser.relay.model.isAttached(tabId)) browser.relay.model.onTabCreated(claimed);
-      const tab = await browser.waitForTab(tabId, NAVIGATION_TIMEOUT_MS);
+      let tab;
+      try {
+        tab = await browser.waitForTab(tabId, NAVIGATION_TIMEOUT_MS);
+      } catch (error) {
+        // A resume that did not get the tab back leaves it with the user, parked as before (its notice stays).
+        if (parked) await browser.host.request('tabs.park', { tabId, kind: parked.kind }).catch(() => {});
+        throw error;
+      }
       record.tabEvent(parked ? 'resume' : 'claim', tab.id, tab.page.url());
       if (parked) takeover.forget(id);
       const line = parked

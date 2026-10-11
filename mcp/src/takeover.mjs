@@ -4,6 +4,7 @@
 // listener), the user's navigations (the extension's tabs.committed), the debugger taken away, and the tab closed.
 // A taken-over or handed-off tab is parked (extension tabs.park): still this session's, but the user's until the
 // agent resumes it with tab_claim {resume: true}. Notices for the agent live here too.
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { cdp } from './cdp.mjs';
 import * as cursor from './cursor/index.mjs';
 import { debug } from './debug.mjs';
@@ -30,7 +31,7 @@ export const USER_BINDING = '__fowlbrowserUserInput';
 // 250 ms, as {type, at, what}: `at` on the page's wall clock, `what` a short name of the target, never field values.
 // Cross-origin frames are other processes: a click into one shows up as the top window's blur with an iframe focused.
 // Navigations the page starts itself (history.back() from a script) report as "navigate".
-const USER_SCRIPT = `(() => {
+export const USER_SCRIPT = `(() => {
   if (globalThis.__fowlbrowserUser) return;
   globalThis.__fowlbrowserUser = true;
   const last = {};
@@ -54,7 +55,9 @@ const USER_SCRIPT = `(() => {
   addEventListener('keydown', (e) => { if (!e.metaKey && !modifiers.has(e.key)) report('keydown', e, name(e.target)); }, options);
   addEventListener('beforeinput', (e) => report('beforeinput', e, name(e.target)), options);
   addEventListener('wheel', (e) => report('wheel', e), options);
-  if (window === top) addEventListener('blur', (e) => setTimeout(() => { if (document.activeElement?.tagName === 'IFRAME') report('frame', e); }), options);
+  if (window !== top) return;
+  addEventListener('blur', (e) => setTimeout(() => { if (document.activeElement?.tagName === 'IFRAME') report('frame', e); }), options);
+  // Only the top frame's: a frame navigating itself says nothing about the tab's Back or Reload.
   window.navigation?.addEventListener('navigate', (e) => { if (!e.userInitiated) report('navigate', e); });
 })();`;
 
@@ -84,6 +87,8 @@ const selfNavigated = new Map(); // "chrome:52" -> when the page last asked for 
 const crashed = new Map(); // "chrome:52" -> when its renderer died
 const histories = new Map(); // "chrome:52" -> { urls, index }: the tab's committed documents, for back vs forward
 const lastTabs = new Map(); // "chrome:52" -> the Tab it was when its debugger went (its page may close first)
+const parking = new Map(); // "chrome:52" -> its takeover's or handoff's cleanup and park, until done
+const calls = new AsyncLocalStorage(); // the tool call code runs for: { tabKey, onParked } (see inCall)
 
 const keyOf = (browser, tabId) => `${browser.key}:${tabId}`;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -168,6 +173,29 @@ export function withNotices(result, tabKey) {
   return result;
 }
 
+// Waits for a park in progress (a resume must not reach the extension before it).
+export async function settled(key) {
+  await parking.get(key)?.catch(() => {});
+}
+
+// Runs a tool call's handler; `onParked`: the tool still works on a parked tab (tools.mjs ON_PARKED_TABS).
+export const inCall = (call, fn) => calls.run(call, fn);
+
+// Tab.run, right before a queued call starts: one queued before its tab was parked fails with the notice now.
+export const currentCall = () => calls.getStore();
+export function refuseParked(tab, call = currentCall()) {
+  const parked = call?.tabKey === tab.id && !call.onParked && notice(tab.id);
+  if (parked) throw new Error(parked);
+}
+
+// Chrome swapped the tab for another id (prerender, back/forward cache): a parked one stays parked under it.
+function moveRecord(from, to) {
+  if (!records.has(from)) return;
+  records.set(to, records.get(from));
+  records.delete(from);
+  if (unseen.delete(from)) unseen.add(to);
+}
+
 // Control ended (released, closed, resumed): the tab's parked state and notice go.
 export function forget(key) {
   records.delete(key);
@@ -186,33 +214,49 @@ export function markEnding(key) {
 export async function takeOver(browser, tabId, how, { tab = browser.tabs.get(tabId), detached = false, gone = false } = {}) {
   const key = keyOf(browser, tabId);
   if (records.has(key)) return;
-  records.set(key, { kind: 'takeover', at: Date.now(), how, gone });
+  const record = { kind: 'takeover', at: Date.now(), how, gone };
+  records.set(key, record);
   unseen.add(key);
   debug('takeover', key, how);
   const url = tab?.page.url();
-  if (tab && !detached && !gone) {
-    await cursor.remove(tab, { wait: true });
-    await uninstallPopups(tab); // the user's own popups open natively again (after a detach they do from the next page on)
-    await clearViewport(tab, 'takeover').catch(() => {});
+  if (!gone) {
+    await park(key, async () => {
+      if (tab && !detached) {
+        await cursor.remove(tab, { wait: true });
+        await uninstallPopups(tab); // the user's own popups open natively again (after a detach they do from the next page on)
+        await clearViewport(tab, 'takeover').catch(() => {});
+      }
+      if (records.get(key) !== record) return; // released or closed meanwhile: no longer ours to park
+      await browser.host.request('tabs.park', { tabId, kind: 'takeover' });
+    }).catch((error) => debug('park failed', key, error.message));
   }
-  if (!gone) await browser.host.request('tabs.park', { tabId, kind: 'takeover' }).catch((error) => debug('park failed', key, error.message));
   tabEvent('takeover', key, url, { how });
 }
 
 // tab_handoff: the cursor fades, a viewport override goes, then the tab is parked for the user. Runs in the tab's queue.
 export async function handOff(tab, reason) {
   const key = tab.id;
-  records.set(key, { kind: 'handoff', at: Date.now(), reason });
+  const record = { kind: 'handoff', at: Date.now(), reason };
+  records.set(key, record);
   try {
-    await cursor.remove(tab, { wait: true });
-    await uninstallPopups(tab);
-    await clearViewport(tab, 'handoff').catch(() => {});
-    await tab.browser.host.request('tabs.park', { tabId: tab.tabId, kind: 'handoff' });
+    await park(key, async () => {
+      await cursor.remove(tab, { wait: true });
+      await uninstallPopups(tab);
+      await clearViewport(tab, 'handoff').catch(() => {});
+      await tab.browser.host.request('tabs.park', { tabId: tab.tabId, kind: 'handoff' });
+    });
   } catch (error) {
-    records.delete(key);
+    if (records.get(key) === record) records.delete(key);
     throw error;
   }
   tabEvent('handoff', key, tab.page.url(), { reason });
+}
+
+// Runs a tab's way to being parked, which a resume waits for (settled).
+function park(key, work) {
+  const done = work().finally(() => { if (parking.get(key) === done) parking.delete(key); });
+  parking.set(key, done);
+  return done;
 }
 
 // --- Signals ---
@@ -252,7 +296,10 @@ export function watchTakeovers(browser) {
     else if (method === 'chrome.debugger.onEvent') {
       const [source, cdpMethod] = params ?? [];
       if (source?.sessionId) return;
-      if (cdpMethod === 'Page.frameRequestedNavigation') selfNavigated.set(keyOf(browser, source?.tabId), Date.now());
+      // Only the main frame's (its frame id is the tab's target id): an iframe navigating says nothing about the tab.
+      if (cdpMethod === 'Page.frameRequestedNavigation') {
+        if (browser.relay.model.tabIdForTarget(params[2]?.frameId) === source?.tabId) selfNavigated.set(keyOf(browser, source.tabId), Date.now());
+      }
       else if (cdpMethod === 'Inspector.targetCrashed') crashed.set(keyOf(browser, source?.tabId), Date.now());
     }
   });
@@ -283,8 +330,9 @@ async function onRemoved(browser, tabId, removeInfo) {
   const known = !!tab || browser.relay.model.hasTab(tabId);
   histories.delete(key);
   inputs.delete(key);
+  if (removeInfo?.replacedBy !== undefined) return moveRecord(key, keyOf(browser, removeInfo.replacedBy));
   if (records.get(key)?.kind === 'handoff') return forget(key); // the user closed what they were handed
-  if (!known || removeInfo?.replacedBy !== undefined || records.has(key) || recently(ending, key, ENDING_MS)) return;
+  if (!known || records.has(key) || recently(ending, key, ENDING_MS)) return;
   if (Date.now() - (tab?.closedByPageAt ?? -Infinity) <= CLOSED_BY_PAGE_MS) return; // the page closed itself
   await takeOver(browser, tabId, 'closed the tab', { tab, gone: true });
 }

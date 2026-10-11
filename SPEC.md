@@ -347,8 +347,9 @@ A tab this session controls (agent or claimed) is **taken over** when the user d
   `tabs.committed {tabId, url, transitionType, transitionQualifiers}` to the owner): `from_address_bar`, or
   `auto_bookmark`, `keyword`, `keyword_generated`, `generated`; or `reload` / `forward_back` outside every agent window
   of the tab (above, plus 1.5 s, since the agent's own navigate commits after its command) and not within 1 s of the page
-  asking for a navigation itself (`Page.frameRequestedNavigation` on the tab's session, or the listener's `navigate`
-  report); `forward_back` also only while the tab is shown in the focused window (the Back button, Cmd-[ and the swipe
+  asking for a navigation itself (`Page.frameRequestedNavigation` of the main frame on the tab's session, its `frameId`
+  being the tab's target id, or the listener's `navigate` report, sent from the top frame only: an iframe navigating
+  itself says nothing about the tab); `forward_back` also only while the tab is shown in the focused window (the Back button, Cmd-[ and the swipe
   need the window). Measured on mac2 (both browsers): CDP `Page.navigate` commits as `typed` without `from_address_bar`;
   CDP `Page.reload` as `reload`; a page's own `location.reload()` as `link` + `client_redirect`, after a
   `frameRequestedNavigation`; a page's own `history.back()` as `typed` + `forward_back` with no
@@ -358,18 +359,25 @@ A tab this session controls (agent or claimed) is **taken over** when the user d
 - Closing the tab: `chrome.tabs.onRemoved` for a tab this session did not close (no tab_close, turn end or release in
   the last 30 s), that Chrome did not just swap for another (`removeInfo.replacedBy`), and that did not close itself
   (`window.close()` reported by the popup script of agent tabs within 3 s, `tab.closedByPageAt`, see Popups). Its notice
-  has no resume line.
+  has no resume line. A swapped parked tab stays parked under its new id: the extension moves its parked owner record and
+  does not announce it for attaching, the server moves the record and any unseen notice, so a plain `tab_claim` of the
+  new id is refused like the old one.
 
 On takeover the server, at once and in this order: records the takeover `{at, how}`; removes the cursor (its exit
 fade; skipped when the debugger is gone: then the overlay fades on its own idle timer); sends `tabs.park {tabId,
-kind:"takeover"}`; journals `tab takeover` in record mode. Calls on the tab already running end with the takeover
-message instead of their result or error; queued and later calls fail at once with it (no waiting for the tab); only
-`tab_claim` (with resume), `tab_release`, `tab_close` and `tab_focus` still run on a parked tab.
+kind:"takeover"}` (not when the tab was released or closed meanwhile); journals `tab takeover` in record mode. The
+record counts as parked from the start: turn end skips such a tab, checking again right before it closes or releases
+one. Calls on the tab already running end with the takeover message instead of their result or error; later calls fail
+at once with it (no waiting for the tab), and calls queued in the tab's queue before it was parked fail with it when
+their turn comes (`Tab.run` checks the call it runs for); only `tab_claim` (with resume), `tab_release`, `tab_close` and
+`tab_focus` still run on a parked tab.
 The very next result of any tool not naming that tab also starts with it, once per session:
 "The user took over chrome:52 at 14:02 (typed in "Search"). Stop working in that tab, tell the user where you got to,
 and ask before going on. If they say to carry on there, call tab_claim on it with resume: true."
 `tab_claim {tab, resume: true}` takes it back (re-attach, back into its group and mute, fresh snapshot even with
-`snapshot: false`; record mode journals `tab resume`); without `resume` it fails with the same message. The server
+`snapshot: false`; record mode journals `tab resume`), after waiting for a takeover or handoff still parking the tab;
+if the tab does not come back (the attach fails), it is parked again and keeps its notice. Without `resume` it fails
+with the same message. The server
 instructions say to use `resume` only after the user said so. A tab now on a page that can't be controlled (chrome://)
 stays parked and the claim fails. Agent windows are kept in `mcp/src/takeover.mjs`: `Tab.run` and the relay's `onInput`
 hook (every `Input.*` it forwards, by the session's tab) open and close them; finished ones are kept 5 s.
@@ -387,13 +395,15 @@ detached; navigation and close events of parked tabs are ignored).
 
 `tabs.park {tabId, kind}` (owner only): remembers `{kind, at, grouped, muted (our mute was on), agentMuted, kept,
 handedOver}`, detaches the debugger (marked `detached`), ungroups an agent tab (a claimed tab's group is the user's own
-and stays), ends this extension's mute (unmuted only if our mute is still on), autoDiscardable again, and marks it `kept`
-and `handedOver`, so a disconnect hands it to the user (never closes it). `chrome.debugger.attach` is refused while
+and stays), ends this extension's mute (unmuted only if our mute is still on, and while still attached, as in cleanup:
+Helium can lose an unmute sent right after a detach), autoDiscardable again, and marks it `kept` and `handedOver`, so a disconnect hands it to the user (never closes it). `chrome.debugger.attach` is refused while
 parked, and tabs opened from a parked tab are the user's, even inside an `expectChild` window.
 Emits `chrome.debugger.onDetach [{tabId}, "parked"]` to the owner (the relay drops the page). `tabs.listAll` shows
 `parked: "takeover"|"handoff"|null`. `tabs.claim` on a parked tab of the same client un-parks it: back into the
 client's group if it was grouped, muted again if it was muted by us, `kept`/`handedOver`/`agentMuted` and an agent
-tab's autoDiscardable as before, and emits `chrome.tabs.onCreated` so the relay re-attaches. Turn end leaves parked tabs alone (still owned, so the next turn can
+tab's autoDiscardable as before, and emits `chrome.tabs.onCreated` so the relay re-attaches. It stays parked (kept,
+handed over) until the group and mute are back; a failed step is rolled back (ungrouped again) and the claim errors, so a
+failed resume never leaves the tab for a disconnect to close. Turn end leaves parked tabs alone (still owned, so the next turn can
 resume); session end hands them to the user.
 
 ### Viewport

@@ -265,28 +265,35 @@ export function createCore({ chrome, send, timers = globalThis }) {
     delete owner.agentMuted;
     await persist();
     try {
+      // Unmuted before the detach, as in cleanUp: Helium can lose an unmute sent right after one.
+      await chrome.tabs.update(tabId, { autoDiscardable: true, ...(owner.parked.muted && { muted: false }) });
+      if (grouped) await chrome.tabs.ungroup(tabId);
+    } finally {
       await chrome.debugger.detach({ tabId }).catch(() => {});
       childTargets.delete(tabId);
-      if (grouped) await chrome.tabs.ungroup(tabId);
-      await chrome.tabs.update(tabId, { autoDiscardable: true, ...(owner.parked.muted && { muted: false }) });
-    } finally {
       emitToOwner(owner, 'chrome.debugger.onDetach', [{ tabId }, 'parked']);
     }
   }
 
   // tabs.claim of a parked tab: back into the client's group and its mute as it was; the claim then re-attaches.
+  // It stays parked (kept, handed over: a disconnect never closes it) until that worked; a failed step is rolled back.
   async function unpark(tabId, owner, tab) {
     const url = tab.pendingUrl || tab.url || '';
     if (isRestricted(url)) throw new Error(`Tab ${tabId} shows ${url}, which can't be controlled`);
     const { parked } = owner;
+    try {
+      if (parked.grouped) await addToGroup(owner.client, owner.group ?? labelFor(owner.client), tabId, tab.windowId);
+      const restore = { ...(parked.muted && { muted: true }), ...(owner.origin === 'agent' && !parked.handedOver && { autoDiscardable: false }) };
+      if (Object.keys(restore).length) await chrome.tabs.update(tabId, restore);
+    } catch (error) {
+      if (parked.grouped) await ungroup(tabId).catch(() => {});
+      throw error;
+    }
     delete owner.parked;
     owner.kept = parked.kept;
     owner.handedOver = parked.handedOver;
     if (parked.agentMuted) owner.agentMuted = true;
     await persist();
-    if (parked.grouped) await addToGroup(owner.client, owner.group ?? labelFor(owner.client), tabId, tab.windowId);
-    const restore = { ...(parked.muted && { muted: true }), ...(owner.origin === 'agent' && !owner.handedOver && { autoDiscardable: false }) };
-    if (Object.keys(restore).length) await chrome.tabs.update(tabId, restore);
     return chrome.tabs.get(tabId);
   }
 
@@ -919,7 +926,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
     const tab = await chrome.tabs.get(addedTabId);
     // replacedBy: nobody closed it (the owner must not take it for the user closing the tab).
     emitToOwner(owner, 'chrome.tabs.onRemoved', [removedTabId, { windowId: tab.windowId, isWindowClosing: false, replacedBy: addedTabId }]);
-    emitToOwner(owner, 'chrome.tabs.onCreated', [tab]);
+    if (!owner.parked) emitToOwner(owner, 'chrome.tabs.onCreated', [tab]); // a parked one attaches only when resumed
   }
 
   async function onTabUpdated(_tabId, changeInfo) {

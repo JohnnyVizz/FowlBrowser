@@ -22,11 +22,13 @@ function fakePage(url = 'https://shop.example/checkout') {
 let browsers = 0;
 // A browser (its own key per test: takeover state is per "<browser>:<id>") with mapped tabs `ids`, whose extension
 // answers isShown with `seen` and tabs.listAll with `listed`.
-async function fakeBrowser({ ids = [1], seen = { shown: true, focused: true }, listed = () => [] } = {}) {
+// `hold`: requests (by method, or CDP method for sendCommand) wait on these promises before they are answered.
+async function fakeBrowser({ ids = [1], seen = { shown: true, focused: true }, listed = () => [], hold = {} } = {}) {
   const requests = [];
   const host = Object.assign(new EventEmitter(), {
     async request(method, params) {
       requests.push([method, params]);
+      await hold[method === 'chrome.debugger.sendCommand' ? params[1] : method];
       if (method === 'tabs.isShown') return seen;
       if (method === 'tabs.listAll') return listed();
       if (method === 'tabs.claim') return { id: params.tabId };
@@ -39,7 +41,7 @@ async function fakeBrowser({ ids = [1], seen = { shown: true, focused: true }, l
   const known = new Set(ids);
   const browser = {
     key: `chrome-t${++browsers}`, name: 'Chrome', host, tabs: new Map(), requests,
-    relay: { viewports: new Map(), model: { hasTab: (id) => known.has(id), isAttached: () => true, onTabCreated() {} } },
+    relay: { viewports: new Map(), model: { hasTab: (id) => known.has(id), isAttached: () => true, onTabCreated() {}, tabIdForTarget: (target) => (/^MAIN-(\d+)$/.exec(target) ? Number(target.slice(5)) : undefined) } },
     async playwright() {}, async waitForTab(id) { return this.tabs.get(id); }, forget(id) { known.delete(id); this.tabs.delete(id); },
   };
   watchTakeovers(browser);
@@ -276,4 +278,125 @@ test('turn end leaves parked tabs alone', async () => {
   const result = await endTurn({ browsers: new Map([[browser.key, browser]]) });
   assert.deepEqual(result, { closed: [], released: [], skipped: [`${browser.key}:1`] });
   assert.ok(!browser.requests.some(([m]) => m === 'tabs.release' || m === 'chrome.tabs.remove'));
+});
+
+const gate = () => { let open; const promise = new Promise((resolve) => { open = resolve; }); return [promise, open]; };
+const agentTab = (id) => ({ id, owner: 'you', origin: 'agent', kept: false, handedOver: false, parked: null, url: 'https://shop.example/' });
+
+test('a resume whose attach fails parks the tab again and keeps its notice', async () => {
+  const browser = await fakeBrowser({ ids: [1] });
+  const call = toolsFor(browser);
+  const id = `${browser.key}:1`;
+  await call('tab_handoff', { tab: id, reason: 'log in' });
+  browser.waitForTab = async () => { throw new Error('Timed out waiting for the tab'); };
+  assert.equal((await call('tab_claim', { tab: id, resume: true })).error, true);
+  assert.deepEqual(parks(browser), [{ tabId: 1, kind: 'handoff' }, { tabId: 1, kind: 'handoff' }]);
+  assert.match((await call('console', { tab: id })).text, /You handed .*:1 to the user/);
+});
+
+test('turn end leaves a tab alone whose takeover is noted but not parked yet, also when it comes during the cleanup', async () => {
+  const [parking, park] = gate();
+  const early = await fakeBrowser({ ids: [1], listed: () => [agentTab(1)], hold: { 'tabs.park': parking } });
+  early.host.emit('event', 'chrome.debugger.onDetach', [{ tabId: 1 }, 'canceled_by_user']);
+  await sleep(10);
+  assert.deepEqual((await endTurn({ browsers: new Map([[early.key, early]]) })).skipped, [`${early.key}:1`]);
+  park();
+
+  const [clearing, clear] = gate();
+  const late = await fakeBrowser({ ids: [1], listed: () => [agentTab(1)], hold: { 'Emulation.clearDeviceMetricsOverride': clearing } });
+  late.tabs.get(1).viewport = { width: 390, height: 844, mobile: false };
+  const ending = endTurn({ browsers: new Map([[late.key, late]]) });
+  await sleep(10);
+  late.host.emit('event', 'chrome.debugger.onDetach', [{ tabId: 1 }, 'canceled_by_user']);
+  await sleep(10);
+  clear();
+  assert.deepEqual((await ending).skipped, [`${late.key}:1`]);
+  for (const browser of [early, late]) assert.ok(!browser.requests.some(([m]) => m === 'chrome.tabs.remove' || m === 'tabs.release'));
+});
+
+test('calls queued before a handoff fail with its notice when their turn comes; release still works', async () => {
+  const browser = await fakeBrowser({ ids: [1] });
+  const tab = browser.tabs.get(1);
+  const call = toolsFor(browser);
+  const id = `${browser.key}:1`;
+  let finish;
+  const blocker = tab.run(() => new Promise((resolve) => { finish = resolve; }));
+  const handoff = call('tab_handoff', { tab: id, reason: 'log in' });
+  await sleep(10);
+  const mute = call('tab_mute', { tab: id, muted: true });
+  const release = call('tab_release', { tab: id });
+  finish();
+  await blocker;
+  assert.equal((await handoff).error, false);
+  const muted = await mute;
+  assert.equal(muted.error, true);
+  assert.match(muted.text, /You handed .*:1 to the user/);
+  assert.ok(!browser.requests.some(([m]) => m === 'tabs.setMuted'));
+  assert.equal((await release).error, false);
+});
+
+test('a resume waits for the takeover\'s parking; a takeover whose tab was let go meanwhile does not park it', async () => {
+  const [clearing, clear] = gate();
+  const browser = await fakeBrowser({ ids: [1, 2], hold: { 'Emulation.clearDeviceMetricsOverride': clearing } });
+  const call = toolsFor(browser);
+  for (const id of [1, 2]) browser.tabs.get(id).viewport = { width: 390, height: 844, mobile: false };
+  report(browser.tabs.get(1), 'pointerdown', Date.now() + 1000, 'Pay now');
+  await sleep(10);
+  const resumed = call('tab_claim', { tab: `${browser.key}:1`, resume: true });
+  await sleep(10);
+  assert.ok(!browser.requests.some(([m]) => m === 'tabs.claim'), 'not before the park');
+  clear();
+  assert.equal((await resumed).error, false);
+  const order = browser.requests.map(([m]) => m).filter((m) => m === 'tabs.park' || m === 'tabs.claim');
+  assert.deepEqual(order, ['tabs.park', 'tabs.claim']);
+
+  const [clearing2, clear2] = gate();
+  const other = await fakeBrowser({ ids: [2], hold: { 'Emulation.clearDeviceMetricsOverride': clearing2 } });
+  other.tabs.get(2).viewport = { width: 390, height: 844, mobile: false };
+  report(other.tabs.get(2), 'pointerdown', Date.now() + 1000, 'Pay now');
+  await sleep(10);
+  assert.equal((await toolsFor(other)('tab_release', { tab: `${other.key}:2` })).error, false);
+  clear2();
+  await sleep(10);
+  assert.deepEqual(parks(other), []);
+});
+
+test('only the main frame asking for a navigation makes a Back the page\'s own', async () => {
+  const browser = await fakeBrowser({ ids: [1, 2] });
+  const commit = (tabId, url, transitionType, transitionQualifiers = []) => browser.host.emit('event', 'tabs.committed', { tabId, url, transitionType, transitionQualifiers });
+  for (const tabId of [1, 2]) { commit(tabId, 'https://a.example/', 'typed'); commit(tabId, 'https://b.example/', 'link'); }
+  await sleep(10);
+  browser.host.emit('event', 'chrome.debugger.onEvent', [{ tabId: 1 }, 'Page.frameRequestedNavigation', { frameId: 'CHILD-7', url: 'https://ads.example/' }]);
+  browser.host.emit('event', 'chrome.debugger.onEvent', [{ tabId: 2 }, 'Page.frameRequestedNavigation', { frameId: 'MAIN-2', url: 'https://a.example/' }]);
+  for (const tabId of [1, 2]) commit(tabId, 'https://a.example/', 'typed', ['forward_back']);
+  await sleep(400);
+  assert.deepEqual(parks(browser), [{ tabId: 1, kind: 'takeover' }]);
+});
+
+test('the page listener reports its own navigations from the top frame only', async () => {
+  const vm = await import('node:vm');
+  const { USER_SCRIPT } = await import('../src/takeover.mjs');
+  for (const top of [true, false]) {
+    const navigations = [];
+    const context = { addEventListener() {}, performance, navigation: { addEventListener: (type) => navigations.push(type) } };
+    context.window = context.globalThis = context;
+    context.top = top ? context : {};
+    vm.runInNewContext(USER_SCRIPT, context);
+    assert.deepEqual(navigations, top ? ['navigate'] : [], `top: ${top}`);
+  }
+});
+
+test('a replaced parked tab keeps its record and notice under the new id; a plain claim of it is refused', async () => {
+  const browser = await fakeBrowser({ ids: [1, 2] });
+  const call = toolsFor(browser);
+  await call('tab_handoff', { tab: `${browser.key}:1`, reason: 'log in' });
+  browser.host.emit('event', 'chrome.debugger.onDetach', [{ tabId: 2 }, 'canceled_by_user']);
+  await sleep(10);
+  browser.host.emit('event', 'chrome.tabs.onRemoved', [1, { windowId: 1, isWindowClosing: false, replacedBy: 11 }]);
+  browser.host.emit('event', 'chrome.tabs.onRemoved', [2, { windowId: 1, isWindowClosing: false, replacedBy: 12 }]);
+  await sleep(10);
+  assert.match((await call('tab_claim', { tab: `${browser.key}:11` })).text, new RegExp(`You handed ${browser.key}:11 to the user`));
+  const claim = await call('tab_claim', { tab: `${browser.key}:12` });
+  assert.match(claim.text, new RegExp(`The user took over ${browser.key}:12 .*resume: true`));
+  assert.ok(!browser.requests.some(([m]) => m === 'tabs.claim'));
 });
