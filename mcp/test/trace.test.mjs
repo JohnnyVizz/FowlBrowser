@@ -143,6 +143,8 @@ function fakeTab(fail = {}) {
 }
 
 const slotIsFree = async () => (await Promise.race([tracingSlot(), sleep(500).then(() => null)]))?.();
+// 'held' or 'free' now; a queued acquire releases the slot the moment it gets it, so nothing stays held by the check.
+const slotState = () => Promise.race([tracingSlot().then((release) => { release(); return 'free'; }), sleep(300).then(() => 'held')]);
 
 test('trace_start takes the slot first; a busy browser is waited for on the page as it is, then given up on', async () => {
   const tab = fakeTab({ 'Tracing.start': BUSY });
@@ -181,6 +183,36 @@ test('trace_start: a blank navigation that fails after it began (the page may ha
   await assert.rejects(tools.trace_start(tab, { reload: true, auto_stop: false }), /load wait timed out/);
   assert.deepEqual(tab.page.gotos, ['about:blank', 'http://127.0.0.1/perf.html']);
   assert.ok(!tab.trace?.startedAt);
+  assert.notEqual(await slotIsFree(), null, 'slot released');
+});
+
+test('trace_start: a reload that fails after the start ends the recording; a lost trace read still lets go, a refused end keeps it tracked', async () => {
+  // Chrome stopped (IO.read failed after a successful end): nothing is recording, so the state and the slot go.
+  let tab = fakeTab({ 'IO.read': 'read refused' });
+  tab.page.goto = async (u) => { tab.page.gotos.push(u); if (u !== 'about:blank') throw new Error('load failed'); };
+  await assert.rejects(tools.trace_start(tab, { reload: true, auto_stop: false }), (e) => /load failed/.test(e.message) && !/could not be ended/.test(e.message));
+  assert.ok(!tab.trace.startedAt);
+  assert.equal(tab.page.listenerCount('close'), 0);
+  assert.notEqual(await slotIsFree(), null, 'slot released');
+  // The end itself refused: Chrome may still record, so the recording stays tracked for trace_stop, with the slot.
+  tab = fakeTab({ 'Tracing.end': (n) => (n === 2 ? 'Request refused: the browser is not keeping up' : undefined) }); // the probe's end is the first
+  tab.page.goto = async (u) => { tab.page.gotos.push(u); if (u !== 'about:blank') throw new Error('load failed'); };
+  await assert.rejects(tools.trace_start(tab, { reload: true, auto_stop: false }), /load failed\nThe recording could not be ended \(Request refused: the browser is not keeping up\): call trace_stop to end it\./);
+  assert.ok(tab.trace.startedAt, 'still tracked');
+  assert.equal(tab.page.listenerCount('close'), 1);
+  assert.equal(await slotState(), 'held', 'slot still held');
+  const out = await tools.trace_stop(tab);
+  fs.rmSync(/^File: (\S+)/m.exec(out)[1]);
+  assert.ok(!tab.trace.startedAt);
+  assert.equal(await slotState(), 'free', 'slot released by trace_stop');
+});
+
+test('trace_start: a tab that closed while the start was underway is let go of at once', async () => {
+  const tab = fakeTab();
+  tab.page.isClosed = () => true;
+  await assert.rejects(tools.trace_start(tab, { reload: false, auto_stop: false }), /The tab closed while the trace started/);
+  assert.ok(!tab.trace.startedAt);
+  assert.equal(tab.page.listenerCount('close'), 0);
   assert.notEqual(await slotIsFree(), null, 'slot released');
 });
 

@@ -138,6 +138,24 @@ test('flashes: an agent tab activated and switched back, an agent popup window a
   assert.match(activityFlashes([activity(t, 'activated', 'chrome', 20, 1)], owners).flashes[0].text, /and stayed/);
 });
 
+test('flashes: the user focusing a window themselves, then clicking through it, activates agent tabs that count as theirs', () => {
+  const owners = new Map([['helium:30', 'b']]);
+  const monitor = [
+    activity(t, 'windowFocus', 'helium', null, 7), // Cmd-Tab or a click on a tab: no agent flashed before it
+    activity(t + 1, 'activated', 'helium', 30, 7), // the click landed on the agent's tab (a devtools page in the tab strip)
+    activity(t + 3000, 'activated', 'helium', 31, 7), // the user's own tab
+    activity(t + 3300, 'activated', 'helium', 30, 7), // and back through the agent's
+    activity(t + 16_000, 'activated', 'helium', 30, 7), // long after: an agent's doing again
+  ];
+  const { flashes, notCounted } = activityFlashes(monitor, owners);
+  assert.deepEqual(flashes.map((f) => f.t), [t + 16_000]);
+  assert.equal(notCounted.filter((e) => /the user browsing that window/.test(e.text)).length, 2);
+  assert.ok(notCounted.every((e) => e.owner === 'user'));
+  // An agent's flash right before the focus still makes that focus the agent's.
+  const agentFirst = [activity(t, 'activated', 'helium', 30, 7), activity(t + 500, 'windowFocus', 'helium', null, 7)];
+  assert.deepEqual(activityFlashes(agentFirst, owners).flashes.map((f) => f.owner), ['b', 'b']);
+});
+
 const site = (lines, events = []) => ({ lines, events });
 
 test('site checks: expected lines and forbidden ones (an order placed, an email sent)', () => {

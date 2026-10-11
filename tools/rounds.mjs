@@ -130,6 +130,7 @@ export function gradeCursor({ task, journal }) {
 // else is the user using their Mac while they watch (switching apps, clicking through tabs): listed, not counted.
 // calls: journal call lines (or parseTranscript focusCalls) with the agent's name in `agent`.
 const FLASH_MS = 1500;
+const USER_BROWSING_MS = 15_000; // after the user focused a window themselves, the activations there are theirs
 const CLOSED_MS = 2000;
 const FRONT_MS = 2000;
 
@@ -229,9 +230,10 @@ const UNITS = { ms: { ms: 1, s: 1000 }, mb: { mb: 1, kb: 1 / 1024, b: 1 / 104857
 export function gradeNumbers({ task, run }) {
   if (!task.numbers?.length) return { ok: true, cell: 'n/a', problems: [] };
   const text = String(run.result?.result ?? '');
-  // The numbers the agent quotes are the ones on its RESULT line (the task's `result` format); the prose before it
-  // may mention others (a trace taken under tracing overhead beside the clean load it reports).
-  const scope = /^.*\bRESULT:.*$/m.exec(text)?.[0] ?? text;
+  // The numbers the agent quotes are the ones on its RESULT line (the task's `result` format, the answer's last line
+  // by the prompt); the prose before it may mention others (a trace taken under tracing overhead beside the clean
+  // load it reports, or the format itself).
+  const scope = text.match(/^.*\bRESULT:.*$/gm)?.at(-1) ?? text;
   const problems = [];
   for (const n of task.numbers) {
     const m = new RegExp(n.pattern, 'i').exec(scope);
@@ -487,13 +489,20 @@ export function gradeCalls(transcript, elicitations = []) {
 export function activityFlashes(monitor, owners, acts = []) {
   const acting = (t) => acts.some((a) => t >= a.from && t <= a.to);
   const activity = monitor.filter((e) => e.kind === 'activity').sort((a, b) => a.at - b.at);
+  // The user at a window: its focus taken with no agent's flash right before it (their click or Cmd-Tab), and the
+  // activations there for the next USER_BROWSING_MS are theirs too, the agents' tabs they click through included
+  // (a devtools agent's pages sit in their tab strip).
+  const agentActivation = (f) => activity.some((a) => a.event === 'activated' && a.browser === f.browser && owners.has(`${a.browser}:${a.tabId}`) && a.at < f.at && f.at - a.at <= FLASH_MS);
+  const userFocus = activity.filter((f) => f.event === 'windowFocus' && f.windowId >= 0 && !agentActivation(f));
+  const browsing = (e) => userFocus.some((f) => f.browser === e.browser && f.windowId === e.windowId && e.at >= f.at - 100 && e.at - f.at <= USER_BROWSING_MS);
   const flashes = []; const notCounted = [];
   for (const [i, e] of activity.entries()) {
     const key = `${e.browser}:${e.tabId}`;
     if (e.event === 'activated' && owners.has(key)) {
       const next = activity.slice(i + 1).find((n) => n.event === 'activated' && n.browser === e.browser && n.windowId === e.windowId);
-      const text = `${time(e.at)} ${key} became the active tab of ${e.browser} window ${e.windowId}${next ? ` and ${next.browser}:${next.tabId} was back after ${next.at - e.at} ms` : ' and stayed'}`;
-      (acting(e.at) ? notCounted : flashes).push({ t: e.at, browser: e.browser, owner: owners.get(key), text });
+      const theirs = browsing(e);
+      const text = `${time(e.at)} ${key} became the active tab of ${e.browser} window ${e.windowId}${next ? ` and ${next.browser}:${next.tabId} was back after ${next.at - e.at} ms` : ' and stayed'}${theirs ? ' (the user browsing that window)' : ''}`;
+      (acting(e.at) || theirs ? notCounted : flashes).push({ t: e.at, browser: e.browser, owner: theirs ? 'user' : owners.get(key), text });
     }
     if (e.event === 'windowCreated') {
       const tab = activity.find((c) => c.event === 'created' && c.browser === e.browser && c.windowId === e.windowId && owners.has(`${c.browser}:${c.tabId}`));

@@ -595,8 +595,11 @@ Lighthouse runs of one server take turns (`tracingSlot`, process-wide; a holder 
   that, the error says so. The empty trace failing to end is an error (it may record until the tab's session ends); its
   stream not completing within 10 s is left to Chrome. A takeover recorded while the slot, the wait, the start or the
   set-up was pending ends the call with the takeover notice before anything touches the page (a recording already
-  started is ended; one that could not be stays tracked with its slot, for `trace_stop` or the tab's close, and the
-  error says so). Traces come back as gzipped streams (`Tracing.start` with
+  started is ended; one whose `Tracing.end` was refused, so Chrome may still record, stays tracked with its slot and
+  close listener until `trace_stop`, which after a takeover needs the user's resume first, or the tab's close, or the
+  slot's 10 min bypass, and the error says so unless the takeover notice replaces it; one Chrome did stop, or whose tab
+  is gone, is let go of). Lighthouse's `restore` asks for a takeover once, before its commands, not between them.
+  Traces come back as gzipped streams (`Tracing.start` with
   `ReturnAsStream` and `streamCompression: gzip`, `IO.read` 1 MB at a time, `readStream`): about 14x fewer bytes through
   the extension, the host and the client than the plain events (a 39 MB trace of a busy page is 2.8 MB), which had one
   Lighthouse run drop its client at the host's 64 MB write backlog and stall the browser's other sessions meanwhile. A
@@ -614,7 +617,8 @@ the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements 
   Lighthouse run or DevTools in any tab): another session's is waited for as above (with `reload`, before the page is
   blanked; the start itself retries for 10 s more), then the tool errors saying so. The tracing slot is taken before the
   page is blanked; once the blanking navigation began, any failure (that navigation's own too) releases the slot and
-  loads the page again before the error, unless the user took the tab over.
+  loads the page again before the error, unless the user took the tab over (or the recording could not be ended, as
+  above). A tab closed while the start was underway is let go of at once.
   With `auto_stop` it waits `seconds` after the load (or after the start) and returns what `trace_stop` returns; without it
   the result says the trace is recording and `trace_stop` ends it. One recording per tab; a second `trace_start` meanwhile
   errors, a `trace_stop` without a recording errors.
