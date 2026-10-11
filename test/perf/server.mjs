@@ -21,7 +21,9 @@ for (let i = 0; i < 2000; i++) bloat += `function unused${i}(a, b) { const s = "
 // Logs page views and panel cycles to this tag's log.
 const LOG_SCRIPT = `<script>
 const base = location.pathname.split('/').slice(0, 3).join('/');
-const log = (e) => fetch(base + '/api/log', { method: 'POST', body: JSON.stringify({ ...e, path: location.pathname.slice(base.length) }), keepalive: true });
+// The reply is read: Chrome reports no loadingFinished for a fetch whose body nobody reads (keepalive or not), and
+// Lighthouse then waits its whole 30 s for the network to go idle.
+const log = (e) => fetch(base + '/api/log', { method: 'POST', body: JSON.stringify({ ...e, path: location.pathname.slice(base.length) }) }).then((r) => r.text()).catch(() => {});
 log({ kind: 'view' });
 </script>`;
 

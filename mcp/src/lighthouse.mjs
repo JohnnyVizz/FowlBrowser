@@ -183,7 +183,7 @@ const load = () => loading ??= (async () => {
 })();
 
 async function run(tab, lh, { device, mode, categories }) {
-  const flags = { disableStorageReset: true, skipAudits: SKIP_AUDITS, logLevel: 'error', maxWaitForLoad: 30_000 }; // 30 s as chrome-devtools-mcp
+  const flags = { disableStorageReset: true, skipAudits: SKIP_AUDITS, logLevel: process.env.FOWLBROWSER_LH_LOG || 'error', maxWaitForLoad: 30_000 }; // 30 s as chrome-devtools-mcp; the level: Lighthouse sets its logger from it
   if (categories) flags.onlyCategories = categories;
   let config;
   if (device === 'desktop') config = lh.desktopConfig;

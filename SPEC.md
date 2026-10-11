@@ -600,7 +600,10 @@ the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements 
   and the run waits up to 45 s for sends in flight (a host request can take that long to time out). Both modes run on
   the tab's session beside Playwright's (with both on one session Lighthouse's network-quiet wait runs longer on busy
   pages: the BBC took about 80 s against 12 s for chrome-devtools-mcp). `maxWaitForLoad` 30 s, as chrome-devtools-mcp
-  sets it. A tab whose own trace is recording is refused (`trace_stop` first: it would queue behind the run). A
+  sets it: a page with a fetch whose reply nobody reads (a fire-and-forget beacon, keepalive or not) keeps Lighthouse
+  waiting for the network to go idle that long, since Chrome sends no `loadingFinished` for it; the result then carries
+  Lighthouse's "loaded too slowly" warning and the run takes 30 s longer (the test pages read their log replies for
+  that reason). `FOWLBROWSER_LH_LOG=verbose` makes Lighthouse log its waits and protocol traffic to the server's stderr. A tab whose own trace is recording is refused (`trace_stop` first: it would queue behind the run). A
   viewport the agent set (`viewport`) is set again after the run in both modes, also on failure (the clean-up clears
   every override; a failed re-set is a warning line in the result, or in the error); in navigation mode it first makes
   way for Lighthouse's emulation, a snapshot audits the page as it is, at that viewport. After the run, whatever happened: `clearEmulation` (script execution enabled again too: Lighthouse disables
