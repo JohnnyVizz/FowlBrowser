@@ -1,6 +1,7 @@
 // Agent clicks that may open a popup carry the new-tab modifier (SPEC "Popups (session 5)"), but the page never sees
 // it: its mouse handlers read metaKey and ctrlKey false and no Meta or Control key event reaches it. Buttons that
-// navigate (location.href, or a page that opens a new tab itself on Cmd-click) still navigate in place.
+// navigate (location.href, or a page that opens a new tab itself on Cmd-click) still navigate in place, and so does a
+// clickable card whose click point lands on a plain link inside it.
 export default {
   name: 'hidden-modifier',
   async run(t) {
@@ -15,10 +16,10 @@ export default {
     t.eq(seen.mouse.filter(([, ...mods]) => mods.some(Boolean)), [], 'no mouse event showed a modifier');
     t.eq(seen.keys, [], 'no key event reached the page');
 
-    for (const [name, via] of [['Go in place', 'in-place'], ['Cmd-click opens new tab', 'cmd-tab']]) {
+    for (const [name, via, role = 'button'] of [['Go in place', 'in-place'], ['Cmd-click opens new tab', 'cmd-tab'], ['Card', 'card-link']]) {
       t.step(`${via}: navigates in place`);
       if (via !== 'in-place') await t.call('navigate', { tab, url });
-      const res = await t.call('click', { tab, ref: await t.refOf(tab, 'button', name), snapshot: false });
+      const res = await t.call('click', { tab, ref: await t.refOf(tab, role, name), snapshot: false });
       t.ok(!/New tab opened/.test(res.text), `${via}: no new tab (${res.text.slice(0, 200)})`);
       t.eq(await t.resultOf(tab), `popup:${via}`, `${via}: the tab itself went there`);
       await new Promise((r) => setTimeout(r, 500));

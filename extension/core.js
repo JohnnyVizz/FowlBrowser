@@ -21,6 +21,7 @@ const BLOCKED_CDP = [
 const CHILD_ONLY_CDP = /^Target\.attachToTarget$/;
 const isBlockedCommand = (method) => BLOCKED_CDP.some((rule) => rule.test(String(method)));
 const EXPECT_CHILD_MAX_MS = 5000;
+const LAST_OWNED_MS = 5000; // how long a closed owned tab can still open the popup it asked for (tabs.openChild)
 const CLEANUP_RETRY_MS = [200, 1000];
 const DOWNLOAD_MATCH_MS = 10_000;      // how long downloads and Page.downloadWillBegin signals are kept for matching
 const DOWNLOAD_SETTLE_MS = 800;        // quiet time after the latest of them before any is attributed
@@ -63,6 +64,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
   const expectations = new Map();   // claimed tabId -> { client, until }: tabs.expectChild windows
   const windowOf = new Map();       // owned tabId -> windowId, learnt before each of its actions (tabs.expectChild)
   const armedWindows = new Map();   // windowId -> { source, url, at, until }: a popup is on its way into that window
+  const openedFor = new Map();      // tabs.openChild child tabId -> opener tabId, until the child's first page commits
+  const lastOwned = new Map();      // owned tabId that closed -> { owner, windowId, at }, for 5 s (tabs.openChild)
   // Downloads: each belongs to the client whose tab started it (see attributeDownload), and only that client
   // ever sees it. Nothing here survives a disconnect; the files stay.
   const downloads = new Map();      // download id -> { client, tabId }
@@ -484,20 +487,31 @@ export function createCore({ chrome, send, timers = globalThis }) {
       return { ok: true };
     },
 
-    // A popup the page opens without an opener (mcp/src/popups.mjs): opened here, in the background right after its
-    // opener, and adopted like any child of it. A tab the page opens itself, with a user gesture, makes Chrome show the
-    // opener's window, which brings the browser to the front; tabs.create doesn't. No referrer (tabs.create sets none).
-    async 'tabs.openChild'({ tabId, url }, { client }) {
-      requireOwner(client, tabId);
-      if (!adopter(tabId)) throw new Error(`Tab ${tabId} passes no children on`);
+    // A popup the page opens without an opener (mcp/src/popups.mjs): a blank tab in the background right after its
+    // opener, adopted like any child of it, which the client then navigates (with the opener's referrer). A tab the
+    // page opens itself, with a user gesture, makes Chrome show the opener's window, which brings the browser to the
+    // front; tabs.create doesn't. An opener that closed itself right after asking (window.open, then window.close)
+    // still gets it, in its last window. The child is this client's only if the opener's owner record is still the
+    // one it asked with once the tab exists; otherwise it closes again.
+    async 'tabs.openChild'({ tabId, url }, { client, live }) {
       if (!/^https?:\/\//i.test(String(url))) throw new Error(`Not an http(s) URL: ${url}`);
+      const ownerNow = () => owners.get(tabId) ?? lastOwned.get(tabId)?.owner;
+      const owner = ownerNow();
+      if (!owner || owner.client !== client) throw new Error(`Tab ${tabId} is not owned by this client`);
+      if (!passesOn(owner, tabId)) throw new Error(`Tab ${tabId} passes no children on`);
       return tracked(async () => {
-        const source = await chrome.tabs.get(tabId);
-        const tab = await chrome.tabs.create({ windowId: source.windowId, index: source.index + 1, url, active: false, openerTabId: tabId });
-        // If the URL turns out to be a download, it is this client's: no referrer to match it by, and the tab closes
-        // before anything can attach to it.
-        downloadSignal(client, tabId, url);
-        await adoptChild(tab.id, tabId);
+        const source = await chrome.tabs.get(tabId).catch(() => null);
+        const windowId = source?.windowId ?? lastOwned.get(tabId)?.windowId;
+        if (windowId === undefined) throw new Error(`Tab ${tabId} closed`);
+        const tab = await chrome.tabs.create(source
+          ? { windowId, index: source.index + 1, url: 'about:blank', active: false, openerTabId: tabId }
+          : { windowId, url: 'about:blank', active: false });
+        if (!live() || ownerNow() !== owner || !passesOn(owner, tabId)) {
+          await chrome.tabs.remove(tab.id).catch(() => {});
+          throw new Error(`Tab ${tabId} is no longer this client's to open from`);
+        }
+        openedFor.set(tab.id, tabId);
+        await reserveChild(tab.id, owner, tabId);
         return { tabId: tab.id };
       });
     },
@@ -810,7 +824,14 @@ export function createCore({ chrome, send, timers = globalThis }) {
       childTargets.get(source.tabId)?.delete(params.targetId);
       childTargets.get(source.tabId)?.delete(params.sessionId);
     } else if (method === 'Page.downloadWillBegin' && !owner.releasing) {
-      downloadSignal(owner.client, source.tabId, params?.url, params?.guid);
+      // A tabs.openChild child's first navigation is its opener's (the agent acted on the opener), and the tab closes
+      // as Chrome closes a new tab whose first navigation turned into a download.
+      const opener = openedFor.get(source.tabId);
+      downloadSignal(owner.client, opener ?? source.tabId, params?.url, params?.guid);
+      if (opener !== undefined) {
+        openedFor.delete(source.tabId);
+        closeAgentTab(source.tabId).catch(() => {});
+      }
     } else if (method === 'Page.windowOpen' && adopter(source.tabId)) {
       armPopup(source.tabId, params?.url ?? '');
     }
@@ -872,13 +893,10 @@ export function createCore({ chrome, send, timers = globalThis }) {
     const pairs = [];
     for (const signal of signals) {
       const matches = strays.filter(([, stray]) => near(signal, stray));
-      if (matches.length !== 1 || pairs.some(([id]) => id === matches[0][0])) continue;
-      // Several signals of one client for one download (tabs.openChild's, then the child's own event) are no rivals.
-      const rivals = signals.filter((s) => near(s, matches[0][1]));
-      if (rivals.every((s) => s.client === signal.client)) pairs.push([matches[0][0], signal, rivals]);
+      if (matches.length === 1 && signals.filter((s) => near(s, matches[0][1])).length === 1) pairs.push([matches[0][0], signal]);
     }
-    for (const [id, signal, rivals] of pairs) {
-      for (const s of rivals) s.claimed = true;
+    for (const [id, signal] of pairs) {
+      signal.claimed = true;
       strayDownloads.delete(id);
       await attributeDownload(id, signal.client, signal.tabId, gen);
     }
@@ -952,6 +970,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
   async function onNavigationCommitted({ tabId, frameId, url, transitionType, transitionQualifiers }) {
     await ready;
     const owner = owners.get(tabId);
+    if (frameId === 0 && url !== 'about:blank') openedFor.delete(tabId);
     if (frameId !== 0 || !owner || owner.parked) return;
     emitToOwner(owner, 'tabs.committed', { tabId, url, transitionType, transitionQualifiers });
   }
@@ -962,9 +981,12 @@ export function createCore({ chrome, send, timers = globalThis }) {
     childTargets.delete(tabId);
     expectations.delete(tabId);
     windowOf.delete(tabId);
+    openedFor.delete(tabId);
     const owner = owners.get(tabId);
     if (!owner) return;
     owners.delete(tabId);
+    for (const [id, { at }] of lastOwned) if (Date.now() - at > LAST_OWNED_MS) lastOwned.delete(id);
+    lastOwned.set(tabId, { owner, windowId: removeInfo?.windowId, at: Date.now() });
     await persist();
     emitToOwner(owner, 'chrome.tabs.onRemoved', [tabId, removeInfo]);
   }
@@ -1044,19 +1066,27 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // webNavigation names the claimed tab as the source.
   function adopter(openerTabId) {
     const opener = owners.get(openerTabId);
+    return passesOn(opener, openerTabId) ? opener : null;
+  }
+
+  function passesOn(opener, openerTabId) {
     // A parked tab is the user's for now: what opens from it is theirs, even inside an expectChild window.
-    if (!opener || opener.releasing || opener.parked) return null;
+    if (!opener || opener.releasing || opener.parked) return false;
     // A tab already handed to the user (for_user, tab_keep) is theirs like a claimed one: its children are theirs too.
-    if (opener.origin === 'agent' && !opener.handedOver) return opener;
+    if (opener.origin === 'agent' && !opener.handedOver) return true;
     const expected = expectations.get(openerTabId);
-    return expected?.client === opener.client && Date.now() <= expected.until ? opener : null;
+    return expected?.client === opener.client && Date.now() <= expected.until;
+  }
+
+  function adoptChild(tabId, openerTabId) {
+    const opener = adopter(openerTabId);
+    if (!opener || owners.has(tabId) || closing.has(tabId)) return;
+    return reserveChild(tabId, opener, openerTabId);
   }
 
   // Reserves the child for the opener's client synchronously (so a disconnect meanwhile cleans it up), then
   // backgrounds, mutes and groups it and tells the client, in the tab's queue.
-  function adoptChild(tabId, openerTabId) {
-    const opener = adopter(openerTabId);
-    if (!opener || owners.has(tabId) || closing.has(tabId)) return;
+  function reserveChild(tabId, opener, openerTabId) {
     const { client } = opener;
     // A child of the user's claimed or handed-over tab may be their own Cmd-click inside the expectChild window, and a child
     // of a kept tab is kept too: handed back to them when the session ends, never closed.

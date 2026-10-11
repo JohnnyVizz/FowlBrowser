@@ -231,8 +231,9 @@ test('tabs.openChild opens a popup without an opener in the background next to i
   sent.length = 0;
   const { result, error } = await call(1, 'tabs.openChild', { tabId: opener.id, url: 'https://example.com/next' });
   assert.equal(error, undefined);
-  const create = chrome.calls.find((c) => c[0] === 'tabs.create' && c[1].url === 'https://example.com/next');
-  assert.deepEqual(create[1], { windowId: 1, index: chrome.tabsById.get(opener.id).index + 1, url: 'https://example.com/next', active: false, openerTabId: opener.id });
+  // Blank: the client navigates it once attached (popups.mjs), so a download shows on its own session.
+  const create = chrome.calls.filter((c) => c[0] === 'tabs.create').at(-1);
+  assert.deepEqual(create[1], { windowId: 1, index: chrome.tabsById.get(opener.id).index + 1, url: 'about:blank', active: false, openerTabId: opener.id });
   assert.deepEqual(core.owners.get(result.tabId), { client: 1, origin: 'agent', group: 'Claude', kept: false });
   assert.equal(chrome.tabsById.get(result.tabId).mutedInfo.muted, true);
   assert.equal(chrome.tabsById.get(result.tabId).groupId, chrome.tabsById.get(opener.id).groupId);
@@ -244,7 +245,46 @@ test('tabs.openChild opens a popup without an opener in the background next to i
   assert.ok((await call(2, 'tabs.openChild', { tabId: opener.id, url: 'https://example.com/x' })).error);
   await call(1, 'tabs.keep', { tabId: opener.id });
   assert.match((await call(1, 'tabs.openChild', { tabId: opener.id, url: 'https://example.com/x' })).error.message, /no children/);
-  assert.equal(chrome.calls.filter((c) => c[0] === 'tabs.create' && c[1].url === 'https://example.com/x').length, 0);
+  assert.equal(chrome.calls.filter((c) => c[0] === 'tabs.create').length, 2);
+});
+
+test('tabs.openChild: a child created while its opener changed hands, or its client left, is closed, never another client\'s or unowned', async () => {
+  const changes = {
+    'released, then claimed by another client that expects a child': async (call, opener) => {
+      await call(1, 'tabs.release', { tabId: opener });
+      await call(2, 'tabs.claim', { tabId: opener });
+      await call(2, 'tabs.expectChild', { tabId: opener, ms: 3000 });
+    },
+    'kept (handed to the user)': (call, opener) => call(1, 'tabs.keep', { tabId: opener }),
+    'its client disconnected': (call, opener, core) => core.handleMessage({ method: 'host.clientDisconnected', params: { client: 1 } }),
+  };
+  for (const [change, run] of Object.entries(changes)) {
+    const { core, call, start, chrome } = setup();
+    const { result: opener } = await call(1, 'tabs.open', { url: 'https://example.com' });
+    const open = gate(chrome, 'tabs.create');
+    const request = start(1, 'tabs.openChild', { tabId: opener.id, url: 'https://example.com/next' });
+    await tick();
+    await run(call, opener.id, core);
+    open();
+    await request.done;
+    const child = [...chrome.tabsById.values()].find((t) => t.id > opener.id && t.url === 'about:blank');
+    assert.equal(child, undefined, `${change}: the child is closed`);
+    assert.deepEqual([...core.owners.keys()].filter((id) => id !== opener.id), [], `${change}: nobody owns a child`);
+    if (change !== 'its client disconnected') assert.match(request.reply().error.message, /no longer this client's/, change);
+  }
+});
+
+test('tabs.openChild: an opener that closed itself right after asking still gets its child, in its last window, for its client only', async () => {
+  const { core, call, chrome } = setup();
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  chrome.tabsById.get(opener.id).windowId = 3;
+  await chrome.tabs.remove(opener.id); // window.open(url, '_blank', 'noopener'); window.close()
+  assert.ok((await call(2, 'tabs.openChild', { tabId: opener.id, url: 'https://example.com/next' })).error, 'another client');
+  const { result, error } = await call(1, 'tabs.openChild', { tabId: opener.id, url: 'https://example.com/next' });
+  assert.equal(error, undefined);
+  assert.deepEqual(chrome.calls.filter((c) => c[0] === 'tabs.create').at(-1)[1], { windowId: 3, url: 'about:blank', active: false });
+  assert.equal(core.owners.get(result.tabId)?.client, 1);
+  assert.equal(chrome.tabsById.get(result.tabId).mutedInfo.muted, true);
 });
 
 test('a popup Chrome activates after Page.windowOpen is switched back inside the onCreated listener, once', async () => {

@@ -7,12 +7,12 @@ import vm from 'node:vm';
 
 const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 import { Browser, Tab } from '../src/browsers.mjs';
-import { BACKGROUND_CLICK_FN, backgroundClick, backgroundClickDone, installPopups, pageScripts, uninstallPopups } from '../src/popups.mjs';
+import { BACKGROUND_CLICK_FN, backgroundClick, installPopups, pageScripts, uninstallPopups } from '../src/popups.mjs';
 import { registerTools } from '../src/tools.mjs';
 
 // A window with a native-looking open/close, and an isolated world that takes every open it is handed (unless
 // `take` is false). Returns the vm context plus what reached the isolated world and the native functions.
-function page({ active = true, take = true, frames = [] } = {}) {
+function page({ active = true, take = true, frames = [], origin = 'https://site.example' } = {}) {
   const handed = [];
   const native = [];
   const order = []; // both, in turn
@@ -34,6 +34,7 @@ function page({ active = true, take = true, frames = [] } = {}) {
     record: (...call) => { native.push(call); order.push(`native ${call[0]}`); }, // arrays and objects of this realm, for deepEqual
     newWindow: () => ({ closed: false }),
     setTimeout, clearTimeout,
+    origin,
   });
   vm.runInContext(`
     globalThis.window = globalThis; globalThis.parent = globalThis; globalThis.top = globalThis; globalThis.name = '';
@@ -44,7 +45,7 @@ function page({ active = true, take = true, frames = [] } = {}) {
     globalThis.addEventListener = EventTarget.prototype.addEventListener; globalThis.removeEventListener = EventTarget.prototype.removeEventListener;
     document.dispatchEvent = EventTarget.prototype.dispatchEvent;
     globalThis.CustomEvent = class { constructor(type, init) { this.type = type; Object.assign(this, init); } };
-    globalThis.Event = class { stopImmediatePropagation() { this.stopped = true; } };
+    globalThis.Event = class { stopImmediatePropagation() { this.stopped = true; } composedPath() { return this.path ?? []; } };
     // Modifiers behind native-like accessors, as in Blink (instances have no own metaKey).
     globalThis.MouseEvent = class extends Event {
       #keys;
@@ -79,12 +80,19 @@ function page({ active = true, take = true, frames = [] } = {}) {
     for (const { fn } of listeners.filter((l) => l.type === init.type && l.capture)) if (!event.stopped) fn(event);
     return !event.stopped;
   };
-  return { context, run, handed, native, order, clickLink, key };
+  // A trusted input event of another type (mousedown, pointerup...) through the window capture listeners.
+  const input = (type, init = {}) => {
+    const event = run('(init) => new MouseEvent(init)')({ type, isTrusted: true, ...init });
+    for (const { fn } of listeners.filter((l) => l.type === type && l.capture)) fn(event);
+    return event;
+  };
+  return { context, run, handed, native, order, clickLink, key, input };
 }
 
 test('opens that need no opener go to the isolated world and the page gets null, as natively', () => {
   const p = page();
   assert.equal(p.run(`window.open('next.html', '_blank', 'noopener')`), null);
+  p.input('mousedown'); // a new activation
   assert.equal(p.run(`window.open('https://other.example/', 'x', 'width=300, noreferrer')`), null);
   assert.deepEqual(p.handed, [
     { type: 'open', url: 'https://site.example/dir/next.html', noreferrer: false },
@@ -198,39 +206,92 @@ test('window.close is reported once it ran; the wrappers look native and the off
   assert.equal(p.run('window.open === nativeOpen'), false);
 });
 
-test('hidden-modifier window: the page reads no Cmd or Ctrl on trusted mouse events and never gets the key itself', async () => {
+test('one open through the extension per activation, as the browser consumes it; an opaque origin is left to the browser', () => {
   const p = page();
-  const read = () => JSON.parse(p.run(`JSON.stringify([true, false].map((isTrusted) => {
-    const e = Object.assign(new MouseEvent({ metaKey: true, ctrlKey: true }), { isTrusted });
-    return [e.metaKey, e.ctrlKey, e.getModifierState('Meta'), e.getModifierState('Control')];
-  }))`));
+  const open = () => p.run(`window.open('next.html', '_blank', 'noopener')`);
+  open();
+  open(); // same activation: the browser's own (which would have used it up natively)
+  assert.equal(p.handed.length, 1);
+  assert.deepEqual(p.native, [['open', 'next.html', '_blank', 'noopener']]);
+  p.input('click'); // not activation-triggering
+  p.input('pointerup', { pointerType: 'mouse' });
+  p.input('mousedown', { isTrusted: false });
+  open();
+  assert.equal(p.handed.length, 1);
+  for (const [type, init] of [['mousedown'], ['pointerdown'], ['keydown'], ['pointerup', { pointerType: 'touch' }], ['touchend']]) {
+    p.input(type, init);
+    open();
+  }
+  assert.equal(p.handed.length, 6, 'each activation-triggering input allows one more');
+
+  // A sandbox without allow-same-origin may also lack allow-popups: the browser decides, for opens and links.
+  const sandboxed = page({ origin: 'null' });
+  sandboxed.run(`window.open('next.html', '_blank', 'noopener')`);
+  assert.deepEqual([sandboxed.handed, sandboxed.native], [[], [['open', 'next.html', '_blank', 'noopener']]]);
+  assert.equal(sandboxed.clickLink({ href: 'target.html', target: '_blank' }), false);
+});
+
+test('hidden-modifier window: the page reads no Cmd or Ctrl on the agent\'s trusted mouse events and never gets the key itself', async () => {
+  const p = page();
+  p.run(`globalThis.target = { id: 'button' }; globalThis.elsewhere = { id: 'other' };`);
+  const control = (call) => p.run(`window[Symbol.for('fowlbrowser.popups')].${call}`);
+  // A Cmd-click as the browser dispatches it: the window capture listeners see it first, then the page reads it.
+  const dispatch = (on, { isTrusted = true, metaKey = true, type = 'mousedown' } = {}) => {
+    const e = p.input(type, { metaKey, ctrlKey: metaKey, isTrusted, path: p.run(on) ? [{ id: 'child' }, p.run(on), p.context] : [] });
+    e.path = []; // composedPath() is empty once dispatch is over
+    return e;
+  };
+  const read = (e) => p.run('(e) => [e.metaKey, e.ctrlKey, e.getModifierState("Meta"), e.getModifierState("Control")]')(e);
   const meta = (type, isTrusted = true) => p.key({ type, key: 'Meta', isTrusted });
-  assert.deepEqual(read(), [[true, true, true, true], [true, true, true, true]], 'closed: everything as is');
+  const plain = [false, false, false, false];
+  const held = [true, true, true, true];
+  assert.deepEqual([...read(dispatch('target'))], held, 'closed: everything as is');
   assert.equal(meta('keydown'), true);
 
-  assert.equal(p.run(`window[Symbol.for('fowlbrowser.popups')].hide(10000)`), true);
-  assert.deepEqual(read(), [[false, false, false, false], [true, true, true, true]], 'open: trusted events only');
-  assert.equal(p.run(`new MouseEvent({ metaKey: true }).getModifierState('Shift')`), false);
+  assert.equal(control(`hide(10000, target, 't1')`), true);
+  const agents = dispatch('target');
+  assert.deepEqual([...read(agents)], plain, 'the agent\'s click on its element');
+  assert.deepEqual([...read(dispatch('target', { type: 'click' }))], plain);
+  assert.deepEqual([...read(dispatch('elsewhere'))], held, 'the user\'s own Cmd-click elsewhere');
+  assert.deepEqual([...read(dispatch('target', { isTrusted: false }))], held, 'synthetic');
+  assert.equal(p.run(`(e) => e.getModifierState('Shift')`)(agents), false);
   assert.deepEqual([meta('keydown'), meta('keyup'), p.key({ type: 'keydown', key: 'Control' })], [false, false, false], 'the modifier key is stopped');
   assert.deepEqual([p.key({ type: 'keydown', key: 'a' }), meta('keydown', false)], [true, true], 'other keys and synthetic events pass');
   // Their own window.open still takes the opener-keeping path (the page script reads the masked event too).
-  p.run(`window.event = Object.assign(new MouseEvent({ metaKey: true }), { isTrusted: true }); window.open('https://idp.example/auth', 'idp', 'popup')`);
+  p.run('(e) => { window.event = e; }')(dispatch('target', { type: 'click' }));
+  p.run(`window.open('https://idp.example/auth', 'idp', 'popup')`);
   assert.deepEqual(p.native.at(-1), ['open', 'https://idp.example/auth', 'idp', '']);
 
-  p.run(`window[Symbol.for('fowlbrowser.popups')].show()`);
-  assert.deepEqual(read()[0], [true, true, true, true], 'closed again');
+  control(`show('t1')`);
+  assert.deepEqual([...read(agents)], plain, 'an event the page kept reads the same after the window closed');
+  assert.deepEqual([...read(dispatch('target'))], held, 'closed again');
   assert.equal(meta('keydown'), true);
 
   // Never left open: it closes by itself after capMs (a detach mid-click), and on the off-switch.
-  p.run(`window[Symbol.for('fowlbrowser.popups')].hide(20)`);
-  assert.deepEqual(read()[0], [false, false, false, false]);
+  control(`hide(20, target, 't2')`);
+  assert.deepEqual([...read(dispatch('target'))], plain);
   await sleepMs(40);
-  assert.deepEqual(read()[0], [true, true, true, true]);
-  p.run(`window[Symbol.for('fowlbrowser.popups')].hide(10000)`);
-  p.run(`window[Symbol.for('fowlbrowser.popups')].off()`);
-  assert.deepEqual(read()[0], [true, true, true, true]);
-  assert.equal(p.run(`window[Symbol.for('fowlbrowser.popups')].hide(10000)`), false, 'off: no window');
+  assert.deepEqual([...read(dispatch('target'))], held);
+  control(`hide(10000, target, 't3')`);
+  control('off()');
+  assert.deepEqual([...read(dispatch('target'))], held);
+  assert.equal(control(`hide(10000, target, 't4')`), false, 'off: no window');
   assert.equal(meta('keydown'), true);
+});
+
+test('hidden-modifier window: a probe that lands after its window was closed never opens it again', () => {
+  const p = page();
+  p.run(`globalThis.target = {};`);
+  const control = (call) => p.run(`window[Symbol.for('fowlbrowser.popups')].${call}`);
+  control(`show('late')`); // the click gave up on its probe and closed the window first
+  assert.equal(control(`hide(10000, target, 'late')`), false);
+  assert.equal(p.key({ type: 'keydown', key: 'Meta' }), true, 'nothing masked');
+  // A stale close leaves the current click's window open.
+  control(`hide(10000, target, 'now')`);
+  control(`show('late')`);
+  assert.equal(p.key({ type: 'keydown', key: 'Meta' }), false);
+  control(`show('now')`);
+  assert.equal(p.key({ type: 'keydown', key: 'Meta' }), true);
 });
 
 test('hidden-modifier window: the patched getters look native and the off-switch puts the originals back', () => {
@@ -246,9 +307,11 @@ test('hidden-modifier window: the patched getters look native and the off-switch
   assert.equal(p.run('mouseNow().every((fn, i) => fn !== mouseNatives[i])'), true, 'on again');
 });
 
-// BACKGROUND_CLICK_FN on stand-in elements: the decision table, and the hidden-modifier window it opens.
-function probe(tree, { focused = null, control = { hide: () => true } } = {}) {
-  const context = vm.createContext({});
+// BACKGROUND_CLICK_FN on stand-in elements: the decision table, and the hidden-modifier window it opens. `tree` runs
+// from the outside in; the click's target is tree[target] (default the last), and the element at the click point is
+// the last one unless `covered` names another.
+function probe(tree, { focused = null, control = { hide: () => true }, target = tree.length - 1, covered, box = { left: 10, top: 10, right: 30, bottom: 20 }, seen = {} } = {}) {
+  const context = vm.createContext({ innerWidth: 800, innerHeight: 600 });
   vm.runInContext('globalThis.window = globalThis;', context);
   const make = (spec, parent = null) => {
     const { tag, attrs = {}, type, form = null, editable = false, root = false, shadowHost = null } = spec;
@@ -258,11 +321,14 @@ function probe(tree, { focused = null, control = { hide: () => true } } = {}) {
       hasAttribute: (n) => n in attrs, getAttribute: (n) => attrs[n] ?? null,
     };
   };
-  let node = null;
-  for (const spec of tree) node = make(spec, spec.root ? null : node);
-  context.document = { activeElement: focused };
+  const nodes = [];
+  for (const spec of tree) nodes.push(make(spec, spec.root ? null : nodes.at(-1)));
+  const el = nodes[target];
+  Object.assign(el, { scrollIntoViewIfNeeded: () => { seen.scrolled = true; }, getClientRects: () => [box] });
+  const hit = covered ?? nodes.at(-1);
+  context.document = { activeElement: focused, elementFromPoint: (x, y) => { seen.point = [x, y]; return hit; } };
   if (control) context[Symbol.for('fowlbrowser.popups')] = control;
-  return vm.runInContext(`(${BACKGROUND_CLICK_FN})`, context)(node, 10000);
+  return vm.runInContext(`(${BACKGROUND_CLICK_FN})`, context)(el, { capMs: 10000, token: 'tok' });
 }
 
 test('background click probe: plain buttons and click-handler elements qualify; links, submits, fields, labels, toggles and rows do not', () => {
@@ -308,26 +374,76 @@ test('background click probe: plain buttons and click-handler elements qualify; 
   assert.equal(probe([{ tag: 'button', type: 'button' }], { focused: { localName: 'input' } }), true);
   assert.equal(probe([{ tag: 'button', type: 'button' }], { control: null }), false);
   assert.equal(probe([{ tag: 'button', type: 'button' }], { control: { hide: () => false } }), false);
-  let cap;
-  probe([{ tag: 'button', type: 'button' }], { control: { hide: (ms) => { cap = ms; return true; } } });
-  assert.equal(cap, 10000, 'the window is opened with the cap it was given');
+  let asked;
+  probe([{ tag: 'button', type: 'button' }], { control: { hide: (...args) => { asked = args; return true; } } });
+  assert.deepEqual([asked[0], asked[1].localName, asked[2]], [10000, 'button', 'tok'], 'the window is opened for this element, with its cap and token');
 });
 
-test('background click: only in tabs with the scripts; the window is closed in the main frame afterwards', async () => {
+test('background click probe: judged on the element the click really hits, which must be the target or inside it', () => {
+  const seen = {};
+  // Playwright clicks the middle of the first box, clipped to the viewport, after scrolling it into view.
+  assert.equal(probe([{ tag: 'body' }, { tag: 'div', attrs: { role: 'button' } }, { tag: 'span' }], { target: 1, box: { left: -10, top: 0, right: 30, bottom: 20 }, seen }), true);
+  assert.deepEqual(seen, { scrolled: true, point: [15, 10] });
+  // A link (or a field, a toggle...) inside the target, where the click lands: it would follow the link with the modifier.
+  assert.equal(probe([{ tag: 'body' }, { tag: 'div', attrs: { role: 'button' } }, { tag: 'a', attrs: { href: '/next' } }], { target: 1 }), false);
+  assert.equal(probe([{ tag: 'body' }, { tag: 'div' }, { tag: 'input', type: 'checkbox' }], { target: 1 }), false);
+  // Something else on top, or nothing in the viewport: no modifier.
+  assert.equal(probe([{ tag: 'body' }, { tag: 'button', type: 'button' }], { covered: { localName: 'div', parentElement: null, getRootNode: () => ({}) } }), false);
+  assert.equal(probe([{ tag: 'body' }, { tag: 'button', type: 'button' }], { box: { left: -40, top: 0, right: -10, bottom: 20 } }), false);
+  assert.equal(probe([{ tag: 'body' }, { tag: 'div' }, { tag: 'span', editable: true }], { target: 1 }), false);
+});
+
+test('background click: only in tabs with the scripts; the modifier is lifted and the window closed afterwards, whatever happened', async () => {
   const { tab, commands } = fakeTab();
+  const keys = [];
+  tab.page.keyboard = { up: async (key) => keys.push(key) };
   const asked = [];
-  const loc = { evaluate: async (fn, arg) => { asked.push(arg); return true; } };
-  assert.equal(await backgroundClick(tab, loc, 15000), false, 'no scripts: never');
-  assert.deepEqual(asked, []);
+  const loc = (answer) => ({ evaluate: async (fn, arg) => { asked.push(arg); return answer(); } });
+  const clicks = [];
+  const click = async (modifiers) => { clicks.push(modifiers); return 'clicked'; };
+  const shown = () => commands.filter(([m]) => m === 'Runtime.evaluate').map(([, p]) => p.expression);
+
+  assert.equal(await backgroundClick(tab, loc(() => true), 15000, click), 'clicked');
+  assert.deepEqual([asked, clicks], [[], [undefined]], 'no scripts: no probe, no modifier');
   await installPopups(tab);
-  assert.equal(await backgroundClick(tab, loc, 15000), true);
-  assert.deepEqual(asked, [15000]);
-  assert.equal(await backgroundClick(tab, { evaluate: async () => { throw new Error('Timeout 300ms exceeded'); } }, 15000), false);
   commands.length = 0;
-  await backgroundClickDone(tab);
-  assert.deepEqual(commands, [['Runtime.evaluate', { expression: `window[Symbol.for('fowlbrowser.popups')]?.show()` }]]);
+
+  assert.equal(await backgroundClick(tab, loc(() => true), 15000, click), 'clicked');
+  const { token } = asked.at(-1);
+  assert.deepEqual([asked.at(-1).capMs, clicks.at(-1), keys], [15000, ['ControlOrMeta'], ['ControlOrMeta']]);
+  assert.deepEqual(shown(), [`window[Symbol.for('fowlbrowser.popups')]?.show(${JSON.stringify(token)})`]);
+
+  // A probe that timed out (its window may be open in the page): no modifier, but the window is closed for good.
+  commands.length = 0;
+  keys.length = 0;
+  await backgroundClick(tab, loc(() => { throw new Error('Timeout 300ms exceeded'); }), 15000, click);
+  assert.notEqual(asked.at(-1).token, token, 'a token per click');
+  assert.deepEqual([clicks.at(-1), keys, shown()], [undefined, [], [`window[Symbol.for('fowlbrowser.popups')]?.show(${JSON.stringify(asked.at(-1).token)})`]]);
+
+  // A click that failed after the modifier went down (Playwright lifts it only on success): lifted here, then closed.
+  commands.length = 0;
+  const order = [];
+  tab.page.keyboard = { up: async (key) => order.push(`up ${key}`) };
+  const failing = async () => { throw new Error('Timeout 1000ms exceeded'); };
+  await assert.rejects(backgroundClick(tab, loc(() => true), 15000, failing), /Timeout 1000ms/);
+  order.push(...shown().map(() => 'show'));
+  assert.deepEqual(order, ['up ControlOrMeta', 'show']);
+
+  // The page said no: it opened nothing, so nothing to close.
+  commands.length = 0;
+  await backgroundClick(tab, loc(() => false), 15000, click);
+  assert.deepEqual([clicks.at(-1), shown()], [undefined, []]);
+
+  // A hung keyboard or page never holds the action up.
+  tab.page.keyboard = { up: () => new Promise(() => {}) };
+  const started = Date.now();
+  await backgroundClick(tab, loc(() => true), 15000, click);
+  assert.ok(Date.now() - started < 1000);
+
   await uninstallPopups(tab);
-  assert.equal(await backgroundClick(tab, loc, 15000), false, 'given back: never');
+  asked.length = 0;
+  await backgroundClick(tab, loc(() => true), 15000, click);
+  assert.deepEqual([asked, clicks.at(-1)], [[], undefined], 'given back: never');
 });
 
 // The isolated world with a stand-in DOM: `attached` says whether a new context of the world gets the binding (only
@@ -458,6 +574,35 @@ test('installed over raw CDP: the binding first (isolated world only), then both
     ['evaluate', `window[Symbol.for('fowlbrowser.popups')]?.off()`],
     ['evaluate', `window[Symbol.for('fowlbrowser.popups')]?.off()`],
   ].sort());
+});
+
+test('a popup without an opener: the extension opens a blank child, which goes to the URL with the opener as referrer; a failure reaches the action', async () => {
+  const { tab, browser, commands } = fakeTab();
+  const child = { tabId: 9, browser };
+  browser.waitForTab = async (tabId) => (tabId === 9 ? child : null);
+  const request = browser.host.request;
+  browser.host.request = async (method, params) => {
+    if (method === 'tabs.openChild') { commands.push([method, params]); return { tabId: 9 }; }
+    if (method === 'chrome.debugger.sendCommand' && params[0].tabId === 9) { commands.push(['child', params[1], params[2]]); return {}; }
+    return request(method, params);
+  };
+  await installPopups(tab);
+  const opens = [];
+  tab.on('windowopen', (url, opening) => opens.push(opening));
+  tab.emit('binding', '__fowlbrowserPopup', '{"type":"open","url":"https://site.example/next","noreferrer":false}');
+  tab.emit('binding', '__fowlbrowserPopup', '{"type":"open","url":"https://other.example/","noreferrer":true}');
+  assert.deepEqual(await Promise.all(opens), [{ tabId: 9, url: 'https://site.example/next' }, { tabId: 9, url: 'https://other.example/' }]);
+  assert.deepEqual(commands.filter(([m]) => m === 'tabs.openChild' || m === 'child'), [
+    ['tabs.openChild', { tabId: 7, url: 'https://site.example/next' }],
+    ['tabs.openChild', { tabId: 7, url: 'https://other.example/' }],
+    ['child', 'Page.navigate', { url: 'https://site.example/next', referrer: 'https://site.example/' }],
+    ['child', 'Page.navigate', { url: 'https://other.example/', referrer: '' }],
+  ]);
+
+  // Refused (the opener changed hands meanwhile): the action that caused it is told, not only the log.
+  browser.host.request = async (method, params) => (method === 'tabs.openChild' ? Promise.reject(new Error('Tab 7 is no longer this client\'s to open from')) : request(method, params));
+  tab.emit('binding', '__fowlbrowserPopup', '{"type":"open","url":"https://site.example/lost"}');
+  await assert.rejects(opens.at(-1), /no longer this client/);
 });
 
 test('an unanswered uninstall (debugger gone, page hung) never holds up the release', async () => {

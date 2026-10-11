@@ -7,6 +7,9 @@
 <button id="record">Record modifiers</button>
 <button id="in-place">Go in place</button>
 <button id="cmd-tab">Cmd-click opens new tab</button>
+<div id="card" role="button" aria-label="Card" style="display: inline-block; padding: 4px; border: 1px solid">
+  <a id="card-link" href="popup-target.html">Card link</a>
+</div>
 <div id="result" role="status" aria-label="Result"></div>
 <script>
   const tag = new URLSearchParams(location.search).get('tag') || '';
@@ -24,6 +27,7 @@
   for (const where of [window, document]) {
     for (const type of ['keydown', 'keyup']) where.addEventListener(type, (e) => { seen.keys.push([type, e.key]); show(); }, true);
   }
+  document.getElementById('card-link').href = target('card-link');
   document.getElementById('in-place').onclick = () => { location.href = target('in-place'); };
   // A page that opens a new tab itself on Cmd/Ctrl-click (as some SPAs do) and navigates otherwise.
   document.getElementById('cmd-tab').onclick = (e) => {

@@ -8,7 +8,7 @@ import * as cursor from './cursor/index.mjs';
 import { debug } from './debug.mjs';
 import { EXPORT_DESCRIPTION, exportShape, exportTab } from './exports.mjs';
 import { registerPerf } from './perf.mjs';
-import { backgroundClick, backgroundClickDone, uninstallPopups } from './popups.mjs';
+import { backgroundClick, uninstallPopups } from './popups.mjs';
 import * as record from './record.mjs';
 import * as takeover from './takeover.mjs';
 import { callsByTab } from './turns.mjs';
@@ -342,19 +342,20 @@ async function committed(tab, request, generation, timeout) {
 // as children of it (the extension stamps the authoritative source tab as openerTabId; Helium's own openerTabId
 // is unreliable). The extension announces a child as soon as it exists, while Playwright's popup event waits for
 // the child's first response, so on slow sites a child is reported while still loading.
-async function openedTabs(tab, popupIds, mapping, knownBefore, opens) {
+async function openedTabs(tab, popupIds, mapping, knownBefore, opens, urls) {
   const { browser } = tab;
   const children = () => [...browser.relay.model._knownTabs.values()].filter((t) => !knownBefore.has(t.id)
     && t.openerTabId === tab.tabId);
   const found = () => new Set([...popupIds, ...children().map((t) => t.id)]);
   const deadline = Date.now() + POPUP_WAIT_MS;
-  while (found().size < opens.length && Date.now() < deadline) await sleep(100);
+  while (found().size < opens && Date.now() < deadline) await sleep(100);
   await Promise.all(mapping);
   const info = new Map(children().map((t) => [t.id, t]));
   return [...found()].map((tabId) => {
     const id = `${browser.key}:${tabId}`;
     const mapped = browser.tabs.get(tabId);
-    if (mapped) return { id, url: mapped.page.url() };
+    // A popup the extension opened for the page starts blank (popups.mjs openChild).
+    if (mapped) return { id, url: mapped.page.url() === 'about:blank' ? urls.get(tabId) ?? 'about:blank' : mapped.page.url() };
     const child = info.get(tabId);
     return { id, url: child?.pendingUrl || child?.url || '', loading: true };
   });
@@ -378,9 +379,17 @@ async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenT
   const knownBefore = new Set(tab.browser.relay.model._knownTabs.keys());
   const generation = tab.documentGeneration;
   const opens = []; // URLs the page asked to open in a new tab or window during this action
+  const openings = []; // of those, the ones the extension opens (popups.mjs): an error line, or null once under way
+  const urls = new Map(); // tab id -> URL of a popup the extension opened
   const popupIds = new Set();
   const requests = [];
-  const onOpen = (url) => opens.push(url);
+  const onOpen = (url, opening) => {
+    opens.push(url);
+    if (opening) {
+      openings.push(opening.then(({ tabId }) => { urls.set(tabId, url); return null; },
+        (error) => `The page opened ${url} in a new tab, which failed: ${error.message}`));
+    }
+  };
   const mapping = []; // popups being mapped to their tabs
   const onPopup = (page) => mapping.push(tab.browser.tabFor(page).then((t) => t && popupIds.add(t.tabId)));
   const onRequest = (r) => requests.push(r);
@@ -401,7 +410,11 @@ async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenT
     // Returning early for a dialog: the action goes on once it is resolved, so later calls on this tab
     // wait for it (the dialog tool itself skips the queue).
     if (tab.dialog) tab.keepBusy(work.catch(() => {}));
-    newTabs = await openedTabs(tab, popupIds, mapping, knownBefore, opens);
+    let timer;
+    const failed = (await Promise.race([Promise.all(openings), new Promise((resolve) => { timer = setTimeout(resolve, POPUP_WAIT_MS, []); })])
+      .finally(() => clearTimeout(timer))).filter(Boolean);
+    lines = [...(lines ?? []), ...failed];
+    newTabs = await openedTabs(tab, popupIds, mapping, knownBefore, opens.length - failed.length, urls);
     // kept: the extension hands it back at session end, never closes it (a child of a claimed, kept or for_user tab:
     // it may be the user's own Cmd-click).
     const all = record.recording && newTabs.length ? await tab.browser.host.request('tabs.listAll', {}).catch(() => []) : [];
@@ -1109,16 +1122,11 @@ export function registerTools(server, manager) {
       else if (args.ref) {
         const loc = locator(tab, args.ref);
         const plain = !args.double && (args.button ?? 'left') === 'left' && !args.modifiers?.length;
-        return pointed(tab, refPoint(tab, args.ref), async () => {
+        return pointed(tab, refPoint(tab, args.ref), () => {
+          const click = (modifiers = args.modifiers) => onRef(tab, args.ref, loc, (timeout) => (args.double
+            ? loc.dblclick({ ...options, modifiers, timeout }) : loc.click({ ...options, modifiers, timeout })), args.timeout_ms, plain ? 'toggle' : undefined);
           // A popup it opens is a background tab with its opener, never activated (SPEC "Popups (session 5)").
-          const background = plain && mayOpenPopup(tab, args.ref) && await backgroundClick(tab, loc, (args.timeout_ms ?? ACTION_TIMEOUT_MS) + 5000);
-          if (background) options.modifiers = ['ControlOrMeta'];
-          try {
-            return await onRef(tab, args.ref, loc,
-              (timeout) => (args.double ? loc.dblclick({ ...options, timeout }) : loc.click({ ...options, timeout })), args.timeout_ms, plain ? 'toggle' : undefined);
-          } finally {
-            if (background) await backgroundClickDone(tab);
-          }
+          return plain && mayOpenPopup(tab, args.ref) ? backgroundClick(tab, loc, (args.timeout_ms ?? ACTION_TIMEOUT_MS) + 5000, click) : click();
         });
       }
       if (x === undefined || y === undefined) throw new Error('Pass ref, or both x and y.');

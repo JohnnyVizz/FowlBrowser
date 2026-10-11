@@ -242,17 +242,38 @@ test('two clients downloading the same URL never get each other\'s download, in 
   }
 });
 
-test('a popup the extension opened (tabs.openChild) that turns out to be a download is the opener\'s, even with the child\'s own event', async () => {
-  for (const childEvent of [false, true]) {
-    const { chrome, core, call, timers } = setup();
-    const { result: opener } = await call(1, 'tabs.open', {});
-    const { result: child } = await call(1, 'tabs.openChild', { tabId: opener.id, url: FILE });
-    if (childEvent) await core.onDebuggerEvent({ tabId: child.tabId }, 'Page.downloadWillBegin', { url: FILE });
-    const item = chrome.addDownload({ url: FILE }); // no referrer: tabs.create sets none
-    await core.onDownloadCreated(item);
-    await timers.fire(800);
-    assert.deepEqual((await call(1, 'downloads.list', {})).result.map((d) => [d.id, d.tabId]), [[item.id, opener.id]], `child event: ${childEvent}`);
-  }
+test('a download a tabs.openChild child starts in its first navigation is the opener\'s, however late, and the blank child closes', async () => {
+  const { chrome, core, call, timers } = setup();
+  const { result: opener } = await call(1, 'tabs.open', {});
+  const { result: child } = await call(1, 'tabs.openChild', { tabId: opener.id, url: FILE });
+  await timers.fire(800); // long before the response: nothing was signalled for the mere open
+  await core.onDebuggerEvent({ tabId: child.tabId }, 'Page.downloadWillBegin', { url: FILE });
+  const item = chrome.addDownload({ url: FILE, referrer: 'http://127.0.0.1:5411/download.html' });
+  await core.onDownloadCreated(item);
+  await timers.fire(800);
+  assert.deepEqual((await call(1, 'downloads.list', {})).result.map((d) => [d.id, d.tabId]), [[item.id, opener.id]]);
+  assert.equal(chrome.tabsById.has(child.tabId), false, 'closed, as Chrome closes a new tab that turned into a download');
+
+  // Once a page committed in it, the child is a tab like any other: its downloads are its own.
+  const { result: other } = await call(1, 'tabs.openChild', { tabId: opener.id, url: 'http://127.0.0.1:5411/page.html' });
+  await core.onNavigationCommitted({ tabId: other.tabId, frameId: 0, url: 'about:blank' });
+  await core.onNavigationCommitted({ tabId: other.tabId, frameId: 0, url: 'http://127.0.0.1:5411/page.html' });
+  await core.onDebuggerEvent({ tabId: other.tabId }, 'Page.downloadWillBegin', { url: FILE });
+  const later = chrome.addDownload({ url: FILE });
+  await core.onDownloadCreated(later);
+  await timers.fire(800);
+  assert.deepEqual((await call(1, 'downloads.list', {})).result.map((d) => [d.id, d.tabId]).at(-1), [later.id, other.tabId]);
+  assert.equal(chrome.tabsById.has(other.tabId), true);
+});
+
+test("a tabs.openChild page that loads is no claim on the user's download of the same URL", async () => {
+  const { chrome, core, call, timers } = setup();
+  const { result: opener } = await call(1, 'tabs.open', {});
+  await call(1, 'tabs.openChild', { tabId: opener.id, url: FILE });
+  const users = chrome.addDownload({ url: FILE }); // the user's own <a download> in another tab, a moment later
+  await core.onDownloadCreated(users);
+  await timers.fire(800);
+  assert.deepEqual(await listOf(call, 1), []);
 });
 
 test("a downloads.start in flight neither hides another client's download nor lets its signal take a later one", async () => {
