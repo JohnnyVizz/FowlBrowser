@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import { chromium } from 'playwright-core';
+import { isOwnBinding } from './cdp.mjs';
 import { watchClosedShadow } from './closedShadow.mjs';
 import { prepare as prepareCursor } from './cursor/index.mjs';
 import { HostClient, listSockets } from './hostClient.mjs';
@@ -145,8 +146,8 @@ export class Browser {
     this.relay.setUserAgent(extension.userAgent);
   }
 
-  // Raw CDP events of the tab's own session (not workers or frames): new documents, and 'windowopen' (url)
-  // when the page asks for a new tab or window.
+  // Raw CDP events of the tab's own session (not workers or frames): new documents, 'windowopen' (url) when the
+  // page asks for a new tab or window, and 'binding' (name, payload) when one of FowlBrowser's page scripts reports.
   _onDebuggerEvent([source, method, params] = []) {
     if (source?.sessionId) return;
     const tab = this.tabs.get(source?.tabId);
@@ -155,6 +156,7 @@ export class Browser {
       tab._newDocument();
       prepareCursor(tab);
     } else if (method === 'Page.windowOpen') tab.emit('windowopen', params?.url ?? '');
+    else if (isOwnBinding(method, params)) tab.emit('binding', params.name, params.payload);
   }
 
   // The tab is no longer ours (released or closed) even if the extension's event never came.

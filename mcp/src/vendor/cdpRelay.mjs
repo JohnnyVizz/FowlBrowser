@@ -19,12 +19,14 @@
 // side is our host socket (passed in as `sendToExtension`) instead of a second WebSocket, the ws endpoint is
 // guarded by a random path token, and `newCDPSession(page)` is answered locally so the server can ask
 // which chrome tab a Playwright page is (`FowlBrowser.getTabId`). Page.bringToFront and page emulation
-// (color scheme, user agent, locale, timezone, metrics, touch) are swallowed.
+// (color scheme, user agent, locale, timezone, metrics, touch) are swallowed, and so are Runtime.bindingCalled
+// events of FowlBrowser's own page scripts.
 // Browser.getVersion reports the real browser user agent (Playwright picks macOS key handling from it), and
 // when Playwright disconnects, the debugger is detached from its tabs (attached or still attaching) before
 // another connection is served. Wrong paths are refused before the upgrade, and no socket or frame a local
 // peer sends can throw out of the server.
 
+import { isOwnBinding } from '../cdp.mjs';
 import { debug } from '../debug.mjs';
 import crypto from 'node:crypto';
 import { WebSocketServer } from 'ws';
@@ -81,6 +83,7 @@ export class CDPRelay {
     switch (method) {
       case 'chrome.debugger.onEvent': {
         const [source, cdpMethod, cdpParams] = params;
+        if (isOwnBinding(cdpMethod, cdpParams)) break; // FowlBrowser's page scripts, not Playwright's
         this.model.onDebuggerEvent(source, cdpMethod, cdpParams);
         break;
       }

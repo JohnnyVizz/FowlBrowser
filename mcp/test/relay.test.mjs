@@ -113,3 +113,17 @@ test('page emulation is answered by the relay, focus emulation goes through', as
 });
 
 test.after(() => relay.stop());
+
+test("FowlBrowser's own binding calls never reach Playwright; other events do", () => {
+  const seen = [];
+  const original = relay.model.onDebuggerEvent;
+  relay.model.onDebuggerEvent = (source, method, params) => seen.push(params?.name ?? method);
+  try {
+    relay.handleExtensionEvent('chrome.debugger.onEvent', [{ tabId: 5 }, 'Runtime.bindingCalled', { name: '__fowlbrowserUserInput', payload: 'x' }]);
+    relay.handleExtensionEvent('chrome.debugger.onEvent', [{ tabId: 5 }, 'Runtime.bindingCalled', { name: '__playwright__binding__', payload: '{}' }]);
+    relay.handleExtensionEvent('chrome.debugger.onEvent', [{ tabId: 5 }, 'Page.loadEventFired', {}]);
+  } finally {
+    relay.model.onDebuggerEvent = original;
+  }
+  assert.deepEqual(seen, ['__playwright__binding__', 'Page.loadEventFired']);
+});
