@@ -229,12 +229,15 @@ const UNITS = { ms: { ms: 1, s: 1000 }, mb: { mb: 1, kb: 1 / 1024, b: 1 / 104857
 export function gradeNumbers({ task, run }) {
   if (!task.numbers?.length) return { ok: true, cell: 'n/a', problems: [] };
   const text = String(run.result?.result ?? '');
+  // The numbers the agent quotes are the ones on its RESULT line (the task's `result` format); the prose before it
+  // may mention others (a trace taken under tracing overhead beside the clean load it reports).
+  const scope = /^.*\bRESULT:.*$/m.exec(text)?.[0] ?? text;
   const problems = [];
   for (const n of task.numbers) {
-    const m = new RegExp(n.pattern, 'i').exec(text);
-    if (!m) { problems.push(`no ${n.name} in the answer (nothing matches /${n.pattern}/)`); continue; }
+    const m = new RegExp(n.pattern, 'i').exec(scope);
+    if (!m) { problems.push(`no ${n.name} in the answer (nothing matches /${n.pattern}/${scope === text ? '' : ' on the RESULT line'})`); continue; }
     const unit = (m[2] || n.unit || '').toLowerCase();
-    const value = Number(m[1].replace(/,/g, '')) * (UNITS[(n.unit || '').toLowerCase()]?.[unit] ?? 1);
+    const value = Number(m[1].replace(/,/g, '').replace(/\.$/, '')) * (UNITS[(n.unit || '').toLowerCase()]?.[unit] ?? 1); // "0.34." ends a sentence
     if (!(value >= n.min && value <= n.max)) problems.push(`${n.name} quoted as ${m[0].trim()} (${+value.toFixed(2)} ${n.unit || ''}), measured ${n.min} to ${n.max}`);
   }
   return { ok: problems.length === 0, cell: `${task.numbers.length - problems.length}/${task.numbers.length} right`, problems };

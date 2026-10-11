@@ -540,7 +540,8 @@ Lighthouse runs of one server take turns (`tracingSlot`, process-wide; a holder 
   that, the error says so. The empty trace failing to end is an error (it may record until the tab's session ends); its
   stream not completing within 10 s is left to Chrome. A takeover recorded while the slot, the wait, the start or the
   set-up was pending ends the call with the takeover notice before anything touches the page (a recording already
-  started is ended). Traces come back as gzipped streams (`Tracing.start` with
+  started is ended; one that could not be stays tracked with its slot, for `trace_stop` or the tab's close, and the
+  error says so). Traces come back as gzipped streams (`Tracing.start` with
   `ReturnAsStream` and `streamCompression: gzip`, `IO.read` 1 MB at a time, `readStream`): about 14x fewer bytes through
   the extension, the host and the client than the plain events (a 39 MB trace of a busy page is 2.8 MB), which had one
   Lighthouse run drop its client at the host's 64 MB write backlog and stall the browser's other sessions meanwhile. A
@@ -611,7 +612,8 @@ the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements 
   over; a failed load is a warning line, and the reports of a run that produced a result are written before it), so the
   document the agent goes on with has none of Lighthouse's init scripts (one wraps `window.requestIdleCallback` in every
   frame). If the user took the tab over during the run (`takeover.notice`, asked right before each step), neither the
-  viewport nor the reload touches their page. Lighthouse records a trace, so a run takes the tracing slot like
+  restore, nor the viewport, nor the reload touches their page (the takeover parks the tab, and the session's overrides
+  end with it). Lighthouse records a trace, so a run takes the tracing slot like
   `trace_start` (this server's runs queue; a navigation run waits for another session's or DevTools' recording as above
   before it starts, its own `Tracing.start` then retries for up to 25 s more, under Lighthouse's 30 s protocol timeout,
   and a wait of 1 s or more is a warning line; still busy, the run fails saying so). Its trace comes back as a gzipped

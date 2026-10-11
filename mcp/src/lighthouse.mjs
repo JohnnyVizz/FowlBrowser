@@ -223,12 +223,12 @@ async function run(tab, lh, { device, mode, categories }) {
     const url = await page.url();
     await root.send('Network.enable');
     await root.send('Network.setCacheDisabled', { cacheDisabled: true });
+    takenOver(); // the set-up above awaited the browser: a navigation run would otherwise replace the user's page
     // Lighthouse waits for trace and page events that never come once the browser's connection is gone.
     let onClose;
     const closed = new Promise((_, reject) => { onClose = () => reject(new Error('The browser\'s FowlBrowser connection closed during the audit (the tab is no longer controlled).')); tab.browser.host.once('close', onClose); });
     closed.catch(() => {});
     let result;
-    takenOver(); // the set-up above awaited the browser: a navigation run would otherwise replace the user's page
     running = mode === 'navigation' ? lh.navigation(page, url, { flags, config }) : lh.snapshot(page, { flags, config });
     running.catch(() => {});
     try {
@@ -244,9 +244,9 @@ async function run(tab, lh, { device, mode, categories }) {
     root.close();
     await root.settled(45_000); // a host request can take that long to time out
     if (root.waited() >= 1000) warnings.push(`Waited ${Math.round(root.waited() / 1000)} s for another session's trace to end before recording.`);
-    await restore(tab, root.scripts);
     // The user took the tab over meanwhile (asked right before each step: a takeover lands at any time): it is theirs
-    // now, and nothing more is done to its page.
+    // now, and nothing more is done to its page (the takeover parks the tab, and the session's overrides end with it).
+    if (!notice(tab.id)) await restore(tab, root.scripts);
     if (viewport && !notice(tab.id)) await setViewport(tab, viewport).catch((error) => warnings.push(`The viewport you had set (${viewport.width}x${viewport.height}) could not be put back: ${error.message}. Set it again with viewport.`));
     // Lighthouse's init scripts ran in the audited document and its frames (one wraps requestIdleCallback): after a
     // navigation run, whatever its outcome, the page loads once more, so the agent goes on with a clean document

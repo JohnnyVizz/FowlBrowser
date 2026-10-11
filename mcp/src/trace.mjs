@@ -413,8 +413,13 @@ export function registerTrace(tool, manager, { withTab, header, text, tabArg }) 
         takenOver(); // during the start: the recording ends, the user's page is left alone
         if (reload) await tab.page.goto(url, { waitUntil: 'load' });
       } catch (error) {
-        await stopRecording(tab).catch(() => {});
-        endRecording(tab);
+        // A recording that could not be ended stays tracked, with the slot: trace_stop ends it (or its tab's close).
+        try {
+          await stopRecording(tab);
+          endRecording(tab);
+        } catch (stopError) {
+          error.message += `\nThe recording could not be ended (${stopError.message}): call trace_stop to end it.`;
+        }
         throw error;
       }
       if (!autoStop) {

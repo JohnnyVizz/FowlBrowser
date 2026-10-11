@@ -33,6 +33,9 @@ test('numbers: in range, converted units, out of range and missing', () => {
   const run = (text) => ({ result: { result: text } });
   assert.deepEqual(gradeNumbers({ task, run: run('RESULT: LCP=1,460 ms, CLS=0.32, heap growth=9.5 MB') }), { ok: true, cell: '3/3 right', problems: [] });
   assert.equal(gradeNumbers({ task, run: run('RESULT: LCP: 1.5 s, CLS 0.3, heap growth 10240 KB') }).ok, true);
+  // The RESULT line is what counts: the prose may quote a trace taken under tracing overhead, and a sentence's full stop is not part of a number.
+  assert.deepEqual(gradeNumbers({ task, run: run('The trace was worse: LCP 2,922 ms and CLS 0.51. That one shift caused it.\n\nRESULT: LCP=1600 ms, CLS=0.34., heap growth=9.1 MB') }), { ok: true, cell: '3/3 right', problems: [] });
+  assert.match(gradeNumbers({ task, run: run('LCP 1600 ms, CLS 0.34\nRESULT: fix first: the hero') }).problems[0], /no LCP in the answer .* on the RESULT line/);
   const bad = gradeNumbers({ task, run: run('RESULT: LCP=4.2 s, CLS=0.05') });
   assert.equal(bad.cell, '0/3 right');
   assert.deepEqual(bad.problems, [
