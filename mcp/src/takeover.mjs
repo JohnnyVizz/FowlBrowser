@@ -46,7 +46,9 @@ export const USER_SCRIPT = `(() => {
   const report = (type, event, what = '') => {
     if (!event.isTrusted || performance.now() - (last[type] ?? -1e9) < ${THROTTLE_MS}) return;
     last[type] = performance.now();
-    globalThis.${USER_BINDING}?.(JSON.stringify({ type, at: performance.timeOrigin + event.timeStamp, what }));
+    // Some synthesized OS events arrive with timeStamp 0 (the page's start): then the handler's own time is the event's.
+    const at = event.timeStamp > 0 ? performance.timeOrigin + event.timeStamp : Date.now();
+    globalThis.${USER_BINDING}?.(JSON.stringify({ type, at, what }));
   };
   const modifiers = new Set(['Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'Fn', 'OS']);
   const options = { capture: true, passive: true };

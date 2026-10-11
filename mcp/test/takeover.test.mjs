@@ -400,3 +400,19 @@ test('a replaced parked tab keeps its record and notice under the new id; a plai
   assert.match(claim.text, new RegExp(`The user took over ${browser.key}:12 .*resume: true`));
   assert.ok(!browser.requests.some(([m]) => m === 'tabs.claim'));
 });
+
+test('the page listener dates an event with timeStamp 0 (some synthesized OS clicks) at its handler, not the page start', async () => {
+  const vm = await import('node:vm');
+  const { USER_SCRIPT, USER_BINDING } = await import('../src/takeover.mjs');
+  const listeners = {};
+  const reports = [];
+  const context = { addEventListener: (type, fn) => { listeners[type] = fn; }, performance: { timeOrigin: 1000, now: () => 5000 },
+    [USER_BINDING]: (payload) => reports.push(JSON.parse(payload)) };
+  context.window = context.globalThis = context.top = context;
+  vm.runInNewContext(USER_SCRIPT, context);
+  const before = Date.now();
+  listeners.pointerdown({ isTrusted: true, timeStamp: 0, target: null });
+  listeners.wheel({ isTrusted: true, timeStamp: 250 });
+  assert.ok(reports[0].at >= before, 'timeStamp 0: the handler time');
+  assert.equal(reports[1].at, 1250, 'otherwise the event time');
+});
