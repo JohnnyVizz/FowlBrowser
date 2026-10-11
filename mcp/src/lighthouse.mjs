@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { cdp, clearEmulation, fileTab, isUsersTab, onCdpEvent, outputDir, stamp, tracingSlot } from './perf.mjs';
 import { debug } from './debug.mjs';
 import { POPUP_BINDING, POPUP_WORLD, popupsInstalled } from './popups.mjs';
-import { USER_BINDING, USER_WORLD } from './takeover.mjs';
+import { notice, USER_BINDING, USER_WORLD } from './takeover.mjs';
 import { resetEngine } from './trace.mjs';
 import { clearViewport, setViewport } from './viewport.mjs';
 
@@ -141,26 +141,37 @@ async function run(tab, lh, { device, mode, categories }) {
   // The tab's own recording holds the slot this run needs, and trace_stop would queue behind this call: say so instead.
   if (tab.trace?.startedAt) throw new Error('A trace is recording in this tab: call trace_stop first, then lighthouse.');
   const release = await tracingSlot(); // Lighthouse records and parses a trace: one at a time
-  // In navigation mode a viewport the agent set (viewport tool) makes way for Lighthouse's emulation and comes back
-  // afterwards, whatever happened; a snapshot audits the page as it is, at that viewport.
-  const viewport = mode === 'navigation' ? tab.viewport : null;
+  // A viewport the agent set (viewport tool) is set again after the run in both modes (the clean-up clears every
+  // override); in navigation mode it first makes way for Lighthouse's emulation, a snapshot audits the page at it.
+  const viewport = tab.viewport;
   const warnings = [];
+  let failure = null;
   const root = rootSession(tab);
   const page = { url: async () => (await root.send('Target.getTargetInfo')).targetInfo.url, target: () => ({ createCDPSession: async () => root }) };
   try {
-    if (viewport) await clearViewport(tab, 'lighthouse');
+    if (viewport && mode === 'navigation') await clearViewport(tab, 'lighthouse');
     const url = await page.url();
     await root.send('Network.enable');
     await root.send('Network.setCacheDisabled', { cacheDisabled: true });
     const result = mode === 'navigation' ? await lh.navigation(page, url, { flags, config }) : await lh.snapshot(page, { flags, config });
     return { lhr: result.lhr, warnings };
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
     root.close();
     await root.settled(45_000); // a host request can take that long to time out
     await restore(tab, root.scripts);
-    if (viewport) await setViewport(tab, viewport).catch((error) => warnings.push(`The viewport you had set (${viewport.width}x${viewport.height}) could not be put back: ${error.message}. Set it again with viewport.`));
+    // The user took the tab over meanwhile: it is theirs now, and nothing more is done to its page.
+    const takenOver = !!notice(tab.id);
+    if (viewport && !takenOver) await setViewport(tab, viewport).catch((error) => warnings.push(`The viewport you had set (${viewport.width}x${viewport.height}) could not be put back: ${error.message}. Set it again with viewport.`));
+    // Lighthouse's init scripts ran in the audited document and its frames (one wraps requestIdleCallback): after a
+    // navigation run, whatever its outcome, the page loads once more, so the agent goes on with a clean document
+    // (Playwright's reload: refs start over).
+    if (mode === 'navigation' && !takenOver) await tab.page.reload({ waitUntil: 'load' }).catch((error) => warnings.push(`The page could not be loaded again after the audit (${error.message.split('\n')[0]}): navigate to it before going on.`));
     await resetEngine().catch(() => {}); // Lighthouse parsed its trace with the shared engine
     release();
+    if (failure && warnings.length) failure.message += `\n${warnings.join('\n')}`;
   }
 }
 
@@ -232,17 +243,15 @@ export function registerLighthouse(tool, manager, { withTab, header, text, tabAr
       const { lhr, warnings } = await run(tab, lh, { device, mode, categories });
       const seconds = (Date.now() - started) / 1000;
       // Tracing is one per browser: a trace_start recording or DevTools' Performance panel in any tab blocks it.
-      if (lhr.runtimeError?.code === 'TRACING_ALREADY_STARTED') throw new Error('Lighthouse could not trace the page: a trace is already recording in this browser (another session\'s trace or Lighthouse run, or DevTools\' Performance panel). Stop it, then run lighthouse again.');
-      if (lhr.runtimeError) throw new Error(`Lighthouse could not audit the page: ${lhr.runtimeError.message} (${lhr.runtimeError.code})`);
+      const tail = warnings.length ? `\n${warnings.join('\n')}` : '';
+      if (lhr.runtimeError?.code === 'TRACING_ALREADY_STARTED') throw new Error(`Lighthouse could not trace the page: a trace is already recording in this browser (another session's trace or Lighthouse run, or DevTools' Performance panel). Stop it, then run lighthouse again.${tail}`);
+      if (lhr.runtimeError) throw new Error(`Lighthouse could not audit the page: ${lhr.runtimeError.message} (${lhr.runtimeError.code})${tail}`);
       const dir = path.join(outputDir('lighthouse'), `${stamp()}-${fileTab(tab)}`);
       fs.mkdirSync(dir, { recursive: true });
       const html = path.join(dir, 'report.html');
       const json = path.join(dir, 'report.json');
       fs.writeFileSync(html, lh.generateReport(lhr, 'html'));
       fs.writeFileSync(json, JSON.stringify(lhr));
-      // Lighthouse's init scripts ran in the audited document and its frames (one wraps requestIdleCallback): after a
-      // navigation run the page loads once more, so the agent goes on with a clean document (refs start over).
-      if (mode === 'navigation') await tab.page.reload({ waitUntil: 'load' }).catch((error) => warnings.push(`The page could not be loaded again after the audit (${error.message.split('\n')[0]}): navigate to it before going on.`));
       return text([await header(tab), formatResult(lhr, { device, mode, seconds, html, json }), ...warnings].join('\n'));
     }));
 }
