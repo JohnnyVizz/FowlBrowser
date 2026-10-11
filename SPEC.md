@@ -537,8 +537,9 @@ Lighthouse runs of one server take turns (`tracingSlot`, process-wide; a holder 
   ends an empty trace on the page as it is, so a reload is not left blank meanwhile) and say for how long they waited
   (from 1 s: the retries, not the start that went through; Lighthouse's own start retries count too); still busy after
   that, the error says so. The empty trace failing to end is an error (it may record until the tab's session ends); its
-  stream not completing within 10 s is left to Chrome. A takeover recorded while the slot or the wait was pending ends
-  the call with the takeover notice before anything touches the page. Traces come back as gzipped streams (`Tracing.start` with
+  stream not completing within 10 s is left to Chrome. A takeover recorded while the slot, the wait, the start or the
+  set-up was pending ends the call with the takeover notice before anything touches the page (a recording already
+  started is ended). Traces come back as gzipped streams (`Tracing.start` with
   `ReturnAsStream` and `streamCompression: gzip`, `IO.read` 1 MB at a time, `readStream`): about 14x fewer bytes through
   the extension, the host and the client than the plain events (a 39 MB trace of a busy page is 2.8 MB), which had one
   Lighthouse run drop its client at the host's 64 MB write backlog and stall the browser's other sessions meanwhile. A

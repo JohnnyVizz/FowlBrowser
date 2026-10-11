@@ -198,16 +198,21 @@ async function run(tab, lh, { device, mode, categories }) {
   // override); in navigation mode it first makes way for Lighthouse's emulation, a snapshot audits the page at it.
   const viewport = tab.viewport;
   const warnings = [];
-  // The slot and the wait below can take a while: a user who took the tab over meanwhile keeps it as it is.
-  const takenOver = () => { const n = notice(tab.id); if (n) { release(); throw new Error(n); } };
-  takenOver();
-  // Another session's recording would fail the run's own Tracing.start (Chrome records one trace per browser): it ends
-  // first, waited for on the page as it is (up to TRACE_WAIT), and the result says for how long.
-  if (mode === 'navigation') {
-    let waitedMs;
-    try { waitedMs = await waitForTracing(tab); } catch (error) { release(); throw traceBusy(error) ? new Error(TRACE_BUSY) : error; }
+  // The slot, the wait below and the set-up can take a while: a user who took the tab over meanwhile keeps it as it is.
+  const takenOver = () => { const n = notice(tab.id); if (n) throw new Error(n); };
+  try {
     takenOver();
-    if (waitedMs >= 1000) warnings.push(`Waited ${Math.round(waitedMs / 1000)} s for another session's trace to end before the run.`);
+    // Another session's recording would fail the run's own Tracing.start (Chrome records one trace per browser): it
+    // ends first, waited for on the page as it is (up to TRACE_WAIT), and the result says for how long.
+    if (mode === 'navigation') {
+      let waitedMs;
+      try { waitedMs = await waitForTracing(tab); } catch (error) { throw traceBusy(error) ? new Error(TRACE_BUSY) : error; }
+      takenOver();
+      if (waitedMs >= 1000) warnings.push(`Waited ${Math.round(waitedMs / 1000)} s for another session's trace to end before the run.`);
+    }
+  } catch (error) {
+    release();
+    throw error;
   }
   let failure = null;
   let running = null; // the Lighthouse run itself
@@ -223,6 +228,7 @@ async function run(tab, lh, { device, mode, categories }) {
     const closed = new Promise((_, reject) => { onClose = () => reject(new Error('The browser\'s FowlBrowser connection closed during the audit (the tab is no longer controlled).')); tab.browser.host.once('close', onClose); });
     closed.catch(() => {});
     let result;
+    takenOver(); // the set-up above awaited the browser: a navigation run would otherwise replace the user's page
     running = mode === 'navigation' ? lh.navigation(page, url, { flags, config }) : lh.snapshot(page, { flags, config });
     running.catch(() => {});
     try {

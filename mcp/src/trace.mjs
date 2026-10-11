@@ -409,14 +409,13 @@ export function registerTrace(tool, manager, { withTab, header, text, tabArg }) 
       }
       tab.trace = { ...tab.trace, startedAt: Date.now(), url, release, waitedMs };
       tab.page.on('close', release); // a closed tab ends Chrome's recording too; endRecording removes it
-      if (reload) {
-        try {
-          await tab.page.goto(url, { waitUntil: 'load' });
-        } catch (error) {
-          await stopRecording(tab).catch(() => {});
-          endRecording(tab);
-          throw error;
-        }
+      try {
+        takenOver(); // during the start: the recording ends, the user's page is left alone
+        if (reload) await tab.page.goto(url, { waitUntil: 'load' });
+      } catch (error) {
+        await stopRecording(tab).catch(() => {});
+        endRecording(tab);
+        throw error;
       }
       if (!autoStop) {
         return text(`${await header(tab)}\nTrace recording${reload ? ' (page reloaded)' : ''}. Do what you want to measure, then call trace_stop.`);
