@@ -489,7 +489,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
     },
 
     // A popup the page opens without an opener (mcp/src/popups.mjs): a blank tab in the background right after its
-    // opener, adopted like any child of it, which the client then navigates (with the opener's referrer). A tab the
+    // opener, adopted like any child of it, which the client then navigates (no referrer). A tab the
     // page opens itself, with a user gesture, makes Chrome show the opener's window, which brings the browser to the
     // front; tabs.create doesn't. An opener that closed itself right after asking (window.open, then window.close)
     // still gets it, in its last window (also when it closes while the tab is being created). The child is this
