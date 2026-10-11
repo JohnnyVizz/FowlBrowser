@@ -89,9 +89,14 @@ export default {
       t.step('tab_release removes it');
       await t.call('click', { tab, x: 300, y: 200, snapshot: false });
       t.ok(await host(), 'overlay back for the next action');
+      // The evaluate that reads it after the claim shows the cursor again itself, so the page notes when it goes.
+      const watching = await t.eval(tab, `() => { window.__cursorRemoved = null; new MutationObserver((records, observer) => {
+        if (records.some((r) => [...r.removedNodes].some((n) => n.localName === 'fowlbrowser-cursor'))) { window.__cursorRemoved = Date.now(); observer.disconnect(); } })
+        .observe(document.documentElement, { childList: true, subtree: true }); return Date.now(); }`);
       await t.call('tab_release', { tab });
       await t.call('tab_claim', { tab, snapshot: false });
-      t.eq(await host(), null, 'no overlay left after release');
+      const removed = await t.eval(tab, '() => window.__cursorRemoved');
+      t.ok(removed >= watching, `overlay removed by the release: ${removed}`);
       await restoreFocus();
       await t.call('tab_close', { tab, confirm_close_users_tab: true });
       t.closed.add(tab);
