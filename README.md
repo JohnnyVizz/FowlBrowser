@@ -94,7 +94,8 @@ it. Or set it up by hand:
 - **Claude Code:** done by the installer.
 - **Codex:**
   ```sh
-  codex mcp add fowlbrowser --env FOWLBROWSER_LABEL=Codex -- "$HOME/Library/Application Support/FowlBrowser/mcp/bin/fowlbrowser-mcp"
+  codex mcp add fowlbrowser --env FOWLBROWSER_LABEL=Codex -- \
+    "$HOME/Library/Application Support/FowlBrowser/mcp/bin/fowlbrowser-mcp"
   ```
 - **Any other MCP client:** add a stdio server with the command
   `~/Library/Application Support/FowlBrowser/mcp/bin/fowlbrowser-mcp` (no arguments). Set `FOWLBROWSER_LABEL` to the
