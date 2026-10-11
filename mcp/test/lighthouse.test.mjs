@@ -2,7 +2,9 @@
 import assert from 'node:assert/strict';
 import EventEmitter from 'node:events';
 import { test } from 'node:test';
+import zlib from 'node:zlib';
 import { formatResult, restore, rootSession } from '../src/lighthouse.mjs';
+import { TRACE_WAIT } from '../src/perf.mjs';
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.7000.1 Safari/537.36';
 
@@ -250,4 +252,50 @@ test('formatResult: a category of weight-0 audits (performance in snapshot mode)
   const lines = formatResult(fakeLhr({ performance: 'snapshot' }), { ...paths, mode: 'snapshot' }).split('\n');
   assert.equal(lines[1], 'Scores: accessibility 95 · best practices 100 · SEO 90 · agentic browsing n/a · performance n/a (1 of 2 audits pass)');
   assert.ok(!lines.some((l) => l.startsWith('Metrics:')));
+});
+
+// --- The run's trace as a gzipped stream ---
+
+const BUSY = 'Tracing has already been started (possibly in another tab).';
+
+test('Tracing.start goes out as a gzipped stream and waits for a busy browser; the stream comes back as dataCollected chunks', async () => {
+  Object.assign(TRACE_WAIT, { waitMs: 500, retryMs: 5 });
+  const trace = { traceEvents: Array.from({ length: 25_000 }, (_, i) => ({ name: 'e', ts: i })), metadata: { v: 1 } };
+  const gz = zlib.gzipSync(JSON.stringify(trace));
+  let starts = 0;
+  let offset = 0;
+  const tab = fakeTab((method) => {
+    if (method === 'Tracing.start' && ++starts < 3) throw new Error(BUSY);
+    if (method === 'IO.read') { const chunk = gz.subarray(offset, offset + 1024); offset += 1024; return { data: chunk.toString('base64'), base64Encoded: true, eof: offset >= gz.length }; }
+    return {};
+  });
+  const root = rootSession(tab);
+  const seen = [];
+  root.on('*', (method) => seen.push(method));
+  root.on('Tracing.dataCollected', (p) => seen.push(p.value.length));
+  const complete = new Promise((resolve) => root.once('Tracing.tracingComplete', resolve));
+  await root.send('Tracing.start', { categories: '-*,devtools.timeline', options: 'sampling-frequency=10000' });
+  assert.equal(starts, 3, 'retried while busy');
+  assert.deepEqual(tab.browser.host.calls.at(-1).params, { categories: '-*,devtools.timeline', options: 'sampling-frequency=10000', transferMode: 'ReturnAsStream', streamCompression: 'gzip' });
+  event(tab, 'Tracing.tracingComplete', { stream: 's1', dataLossOccurred: false });
+  assert.deepEqual(await complete, { dataLossOccurred: false });
+  assert.deepEqual(seen, ['Tracing.dataCollected', 10_000, 'Tracing.dataCollected', 10_000, 'Tracing.dataCollected', 5_000, 'Tracing.tracingComplete']);
+  const methods = tab.browser.host.calls.map((c) => c.method);
+  assert.ok(methods.filter((m) => m === 'IO.read').length >= 2, 'read in chunks');
+  assert.equal(methods.at(-1), 'IO.close');
+  assert.deepEqual(tab.browser.host.calls.at(-1).params, { handle: 's1' });
+  root.close();
+});
+
+test('a failed stream read still completes the trace, with no events, and closes the stream', async () => {
+  const tab = fakeTab((method) => { if (method === 'IO.read') throw new Error('gone'); return {}; });
+  const root = rootSession(tab);
+  const seen = [];
+  root.on('Tracing.dataCollected', (p) => seen.push(p));
+  const complete = new Promise((resolve) => root.once('Tracing.tracingComplete', resolve));
+  event(tab, 'Tracing.tracingComplete', { stream: 's2', dataLossOccurred: true });
+  assert.deepEqual(await complete, { dataLossOccurred: true });
+  assert.deepEqual(seen, []);
+  assert.deepEqual(tab.browser.host.calls.map((c) => c.method), ['IO.read', 'IO.close']);
+  root.close();
 });

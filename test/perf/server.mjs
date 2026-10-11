@@ -99,7 +99,7 @@ export function logLines(events) {
 }
 
 const tags = new Map(); // tag -> { events }
-createServer(async (req, res) => {
+const handler = async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const send = (body, type, status = 200) => { res.writeHead(status, { 'content-type': types[type], 'cache-control': 'no-store' }); res.end(body); };
   const delay = Math.min(Number(url.searchParams.get('ms')) || 0, 10_000);
@@ -124,4 +124,11 @@ createServer(async (req, res) => {
   if (rest === 'slow.html') return send(slowPage(), 'html');
   if (rest === 'app.html') return send(appPage(), 'html');
   return send('not found', 'html', 404);
-}).listen(port, '127.0.0.1', () => console.log(`perf pages on http://127.0.0.1:${port}/t/<tag>/slow.html and app.html`));
+};
+// 127.0.0.1 and localhost (::1 too): two origins, so two pages need not share one renderer (Chrome puts same-site tabs
+// in one process once over its process limit, and one page's long tasks or a run's CPU throttling then slow the other).
+for (const host of ['127.0.0.1', '::1']) {
+  const shown = host.includes(':') ? `[${host}]` : host;
+  createServer(handler).on('error', (error) => console.warn(`perf pages: not on ${shown} (${error.code})`))
+    .listen(port, host, () => console.log(`perf pages on http://${shown}:${port}/t/<tag>/slow.html and app.html`));
+}

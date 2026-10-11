@@ -59,6 +59,52 @@ export async function tracingSlot() {
   return release;
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Chrome records one trace per browser: while another session records (a sibling agent's trace or Lighthouse run,
+// DevTools' Performance panel), Tracing.start fails with "Tracing has already been started". startTracing sends it
+// (`send`) again every retryMs until it goes through, up to waitMs (TRACE_WAIT; tests shorten it), then throws the
+// last error. Resolves with the result and how long it waited.
+export const TRACE_WAIT = { waitMs: 90_000, retryMs: 2000 };
+export const traceBusy = (error) => /already (been )?started/i.test(error?.message ?? '');
+export async function startTracing(send, { waitMs = TRACE_WAIT.waitMs, retryMs = TRACE_WAIT.retryMs } = {}) {
+  const started = Date.now();
+  for (;;) {
+    try { return { result: await send(), waitedMs: Date.now() - started }; }
+    catch (error) { if (!traceBusy(error) || Date.now() - started + retryMs > waitMs) throw error; }
+    await sleep(retryMs);
+  }
+}
+
+// Waits for the browser's tracing to be free (up to the wait above): starts an empty trace on the tab's session (busy:
+// retried like any start) and ends it at once. Resolves with how long it waited, so the tool can say so.
+export async function waitForTracing(tab, options) {
+  const { waitedMs } = await startTracing(() => cdp(tab, 'Tracing.start', { transferMode: 'ReturnAsStream', traceConfig: { includedCategories: ['__metadata'], excludedCategories: ['*'] } }), options);
+  const waiting = new AbortController();
+  const complete = cdpEvent(tab, 'Tracing.tracingComplete', { timeoutMs: 10_000, signal: waiting.signal });
+  complete.catch(() => {});
+  try { await cdp(tab, 'Tracing.end'); } catch { waiting.abort(); return waitedMs; }
+  const { stream } = await complete.catch(() => ({}));
+  if (stream) await cdp(tab, 'IO.close', { handle: stream }).catch(() => {});
+  return waitedMs;
+}
+
+// Reads a Tracing.tracingComplete stream to its end through `send` (method, params): IO.read 1 MB at a time, IO.close
+// whatever happens. Chrome writes it gzipped when the trace started with streamCompression gzip: the caller gunzips.
+export async function readStream(send, stream) {
+  const chunks = [];
+  try {
+    for (let eof = false; !eof;) {
+      const r = await send('IO.read', { handle: stream, size: 1 << 20 });
+      chunks.push(Buffer.from(r.data, r.base64Encoded ? 'base64' : 'utf8'));
+      eof = r.eof;
+    }
+  } finally {
+    await send('IO.close', { handle: stream }).catch(() => {});
+  }
+  return Buffer.concat(chunks);
+}
+
 // A claimed or handed-over tab (for_user, tab_keep) is the user's own page: reloading it for a measurement would throw
 // their state away.
 export async function isUsersTab(tab) {

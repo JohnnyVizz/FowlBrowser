@@ -5,7 +5,7 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import { test } from 'node:test';
 import zlib from 'node:zlib';
-import { tracingSlot } from '../src/perf.mjs';
+import { TRACE_WAIT, tracingSlot } from '../src/perf.mjs';
 import { insightText, parseTrace, registerTrace, summaryText } from '../src/trace.mjs';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -111,39 +111,74 @@ const tools = {};
 registerTrace((name, description, shape, handler) => { tools[name] = handler; }, null,
   { withTab: (handler) => handler, header: async () => 'Tab: chrome:1', text: (body) => body, tabArg: undefined });
 
+const clickTraceGz = zlib.gzipSync(clickTrace); // as Chrome streams it (streamCompression gzip)
+const BUSY = 'Tracing has already been started (possibly in another tab).';
+Object.assign(TRACE_WAIT, { waitMs: 100, retryMs: 5 }); // a busy browser is waited for this long here
+
+// `fail`: command -> error message, or a function of the command's 1-based count returning one (or nothing).
 function fakeTab(fail = {}) {
   const host = new EventEmitter();
   const sent = [];
+  const params = [];
+  const counts = {};
   host.request = async (method, args) => {
     if (method === 'tabs.listAll') return [];
-    const [, command] = args;
+    const [, command, p] = args;
     sent.push(command);
-    if (fail[command]) throw new Error(fail[command]);
+    params.push(p);
+    counts[command] = (counts[command] ?? 0) + 1;
+    const message = typeof fail[command] === 'function' ? fail[command](counts[command]) : fail[command];
+    if (message) throw new Error(message);
     if (command === 'Tracing.end') {
       setImmediate(() => host.emit('chrome.debugger.onEvent', [{ tabId: 1 }, 'Tracing.tracingComplete', { stream: 's1', dataLossOccurred: false }]));
     }
-    if (command === 'IO.read') return { data: clickTrace, base64Encoded: false, eof: true };
+    if (command === 'IO.read') return { data: clickTraceGz.toString('base64'), base64Encoded: true, eof: true };
     return {};
   };
   const page = new EventEmitter();
   page.gotos = [];
   page.url = () => 'http://127.0.0.1/perf.html';
   page.goto = async (u) => { page.gotos.push(u); };
-  return { id: 'chrome:1', tabId: 1, page, browser: { host }, sent };
+  return { id: 'chrome:1', tabId: 1, page, browser: { host }, sent, params };
 }
 
 const slotIsFree = async () => (await Promise.race([tracingSlot(), sleep(500).then(() => null)]))?.();
 
-test('trace_start takes the slot before blanking the page; a failing Tracing.start releases it and goes back', async () => {
-  const tab = fakeTab({ 'Tracing.start': 'Tracing has already been started (possibly in another tab).' });
+test('trace_start takes the slot first; a busy browser is waited for on the page as it is, then given up on', async () => {
+  const tab = fakeTab({ 'Tracing.start': BUSY });
   const held = await tracingSlot();
   const started = tools.trace_start(tab, { reload: true, auto_stop: false }).then(() => null, (e) => e.message);
   await sleep(20);
-  assert.deepEqual(tab.page.gotos, []);
+  assert.deepEqual(tab.sent, [], 'nothing is sent while the slot is held');
   held();
-  assert.match(await started, /^Chrome records one trace at a time and something else is recording now/);
-  assert.deepEqual(tab.page.gotos, ['about:blank', 'http://127.0.0.1/perf.html']);
+  assert.match(await started, /^Chrome records one trace at a time and something else kept recording/);
+  assert.ok(tab.sent.filter((c) => c === 'Tracing.start').length >= 3, `retried (${tab.sent.length} sends)`);
+  assert.deepEqual(tab.page.gotos, [], 'the page was never blanked');
   assert.equal(tab.page.listenerCount('close'), 0);
+  assert.ok(!tab.trace?.startedAt);
+  assert.notEqual(await slotIsFree(), null, 'slot released');
+});
+
+test('trace_start: busy at first, then free: the empty probe trace ends, the page is blanked and the recording starts gzipped', async () => {
+  const tab = fakeTab({ 'Tracing.start': (n) => (n < 3 ? BUSY : undefined) });
+  assert.match(await tools.trace_start(tab, { reload: true, auto_stop: false }), /Trace recording \(page reloaded\)\./);
+  assert.deepEqual(tab.sent, ['Tracing.start', 'Tracing.start', 'Tracing.start', 'Tracing.end', 'IO.close', 'Tracing.start']);
+  assert.deepEqual(tab.params[0].traceConfig, { includedCategories: ['__metadata'], excludedCategories: ['*'] });
+  assert.equal(tab.params[5].streamCompression, 'gzip');
+  assert.deepEqual(tab.page.gotos, ['about:blank', 'http://127.0.0.1/perf.html']);
+  tab.trace.waitedMs = 3000;
+  const out = await tools.trace_stop(tab);
+  const file = /^File: (\S+)/m.exec(out)[1];
+  assert.equal(zlib.gunzipSync(fs.readFileSync(file)).toString('utf8'), clickTrace, 'saved as Chrome wrote it');
+  fs.rmSync(file);
+  assert.match(out, /^Waited 3 s for another session's trace to end before recording\.$/m);
+  assert.notEqual(await slotIsFree(), null, 'slot released');
+});
+
+test('trace_start: a start failing after the page was blanked releases the slot and goes back', async () => {
+  const tab = fakeTab({ 'Tracing.start': (n) => (n === 2 ? 'boom' : undefined) });
+  await assert.rejects(tools.trace_start(tab, { reload: true, auto_stop: false }), /boom/);
+  assert.deepEqual(tab.page.gotos, ['about:blank', 'http://127.0.0.1/perf.html']);
   assert.ok(!tab.trace?.startedAt);
   assert.notEqual(await slotIsFree(), null, 'slot released');
 });

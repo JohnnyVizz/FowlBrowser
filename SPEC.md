@@ -532,7 +532,16 @@ and insights, BSD-3-Clause, the version Lighthouse pins) and `lighthouse` (Apach
 by `install.sh --lite`: the `lighthouse` tool then errors saying how to add it, the other tools are unaffected). Chrome records one trace per
 browser and the trace engine parses one trace at a time per process (its handlers are module state), so recordings and
 Lighthouse runs of one server take turns (`tracingSlot`, process-wide; a holder that never releases is skipped after 10
-  min); a recording of another session or of DevTools makes `Tracing.start` fail and the tool says so. A tab the user owns
+  min); a recording of another session or of DevTools makes `Tracing.start` fail with "already been started": the tools
+  wait for it to end (`startTracing`: retried every 2 s, up to 90 s, `TRACE_WAIT`; `waitForTracing` first starts and
+  ends an empty trace on the page as it is, so a reload is not left blank meanwhile) and say for how long they waited
+  (from 1 s); still busy after that, the error says so. Traces come back as gzipped streams (`Tracing.start` with
+  `ReturnAsStream` and `streamCompression: gzip`, `IO.read` 1 MB at a time, `readStream`): about 14x fewer bytes through
+  the extension, the host and the client than the plain events (a 39 MB trace of a busy page is 2.8 MB), which had one
+  Lighthouse run drop its client at the host's 64 MB write backlog and stall the browser's other sessions meanwhile. A
+  page's main-thread work and a run's CPU throttling are shared by every tab in its renderer process, and Chrome puts
+  same-site tabs in one process once over its process limit: another tab on the same site (the user's, another agent's)
+  slows while one is measured (DevTools has the same). A tab the user owns
 (claimed, `for_user`, kept) is never reloaded for a measurement (`isUsersTab`). File names carry a millisecond stamp and
 the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements never share one.
 
@@ -543,13 +552,14 @@ the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements 
   without it tracing starts on the page as it is (for interactions: click, type and the other tools work while recording;
   pointer actions skip their 1 s quick verdict then, since a slow handler is the point). `reload` is refused on a claimed
   tab (the user's page), like Lighthouse's navigation mode. Chrome records one trace at a time per browser (a trace, a
-  Lighthouse run or DevTools in any tab): a second `Tracing.start` errors and the tool says so. The tracing slot is taken
-  before the page is blanked; if `Tracing.start` fails, the slot is released and the page loaded again before the error.
+  Lighthouse run or DevTools in any tab): another session's is waited for as above (with `reload`, before the page is
+  blanked; the start itself retries for 10 s more), then the tool errors saying so. The tracing slot is taken before the
+  page is blanked; if the start fails after that, the slot is released and the page loaded again before the error.
   With `auto_stop` it waits `seconds` after the load (or after the start) and returns what `trace_stop` returns; without it
   the result says the trace is recording and `trace_stop` ends it. One recording per tab; a second `trace_start` meanwhile
   errors, a `trace_stop` without a recording errors.
-- `trace_stop {tab}`: `Tracing.end` (a failed one stops the wait for `tracingComplete` at once), reads the stream
-  (`IO.read`, 1 MB chunks; `IO.close` whatever happens), saves it gzipped to
+- `trace_stop {tab}`: `Tracing.end` (a failed one stops the wait for `tracingComplete` at once), reads the gzipped
+  stream (`IO.read`, 1 MB chunks; `IO.close` whatever happens), saves it as Chrome wrote it to
   `os.tmpdir()/fowlbrowser-traces/trace-<stamp>-<tab>.json.gz` (loads in DevTools' Performance panel), parses it with the
   trace engine (then resets the engine's module state, which otherwise keeps the raw events; the parsed data kept per tab
   is untouched) and returns the summary: the URL, the trace length and event count, the file path, CPU and network
@@ -559,7 +569,8 @@ the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements 
   (count over 50 ms, the longest), then the insights that fail or inform (name, title, estimated metric savings, wasted
   bytes), on one line the names that pass, `Not computed (needs source maps, which are not fetched): DuplicatedJavaScript`
   (no source maps are resolved, so that insight would always pass), and `Could not compute:` for insights whose generator
-  failed (`modelErrors`, with the message). No field (CrUX) data. The parsed trace is kept per tab (the last one only;
+  failed (`modelErrors`, with the message). No field (CrUX) data. When the recording waited for another session's
+  trace (1 s or more), a `Waited N s ...` line comes first. The parsed trace is kept per tab (the last one only;
   dropped with the tab) for `trace_insight`, which reports a failed generator's error and the source-map note the same way.
 - `trace_insight {tab, name, set?}`: details of one insight (`name` as listed, e.g. `LCPBreakdown`, `RenderBlocking`,
   `DocumentLatency`, `ImageDelivery`, `INPBreakdown`, `CLSCulprits`, `ThirdParties`, `DOMSize`, `ForcedReflow`,
@@ -596,7 +607,12 @@ the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements 
   over; a failed load is a warning line, the reports are written in any case), so the document the agent goes on with
   has none of Lighthouse's init scripts (one wraps `window.requestIdleCallback` in every frame). If the user took the
   tab over during the run (`takeover.notice`), neither the viewport nor the reload touches their page. Lighthouse records a trace, so a run takes the tracing slot like
-  `trace_start` (this server's runs queue; another session's or DevTools' recording makes it fail, saying so). Result:
+  `trace_start` (this server's runs queue; a navigation run waits for another session's or DevTools' recording as above
+  before it starts, its own `Tracing.start` then retries for up to 25 s more, under Lighthouse's 30 s protocol timeout,
+  and a wait of 1 s or more is a warning line; still busy, the run fails saying so). Its trace comes back as a gzipped
+  stream too: the session turns Lighthouse's `Tracing.start` into one and, on `tracingComplete`, reads it, gunzips it
+  and hands the events to Lighthouse as `Tracing.dataCollected` chunks of 10,000, then `tracingComplete`; a failed read
+  completes with no events, and Lighthouse reports that. Result:
   Lighthouse version, device, mode and wall time; scores as 0-100 (a category holding only weight-0 audits, performance in
   snapshot mode, prints `n/a (<passed> of <n> audits pass)` instead of Lighthouse's 0); FCP, LCP, TBT, CLS, Speed Index and
   TTI when the run has them; failed or flagged audits (score under 1; informative, manual and not-applicable ones skipped;

@@ -5,11 +5,11 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import zlib from 'node:zlib';
 import { z } from 'zod';
-import { cdp, cdpEvent, fileTab, isUsersTab, outputDir, stamp, tracingSlot } from './perf.mjs';
+import { cdp, cdpEvent, fileTab, isUsersTab, outputDir, readStream, stamp, startTracing, traceBusy, tracingSlot, waitForTracing } from './perf.mjs';
 import { cap } from './snapshots.mjs';
 
 const INSIGHT_MAX_CHARS = 20_000;
-const gzip = promisify(zlib.gzip);
+const gunzip = promisify(zlib.gunzip);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // DevTools' default timeline categories plus JS sampling and screenshots (what DevTools and chrome-devtools-mcp record).
@@ -332,17 +332,7 @@ async function stopRecording(tab) {
     throw error;
   }
   const { stream, dataLossOccurred } = await complete;
-  const chunks = [];
-  try {
-    for (let eof = false; !eof;) {
-      const r = await cdp(tab, 'IO.read', { handle: stream, size: 1 << 20 });
-      chunks.push(Buffer.from(r.data, r.base64Encoded ? 'base64' : 'utf8'));
-      eof = r.eof;
-    }
-  } finally {
-    await cdp(tab, 'IO.close', { handle: stream }).catch(() => {});
-  }
-  return { data: Buffer.concat(chunks), dataLoss: dataLossOccurred };
+  return { gz: await readStream((method, params) => cdp(tab, method, params), stream), dataLoss: dataLossOccurred };
 }
 
 async function stop(tab, header, text) {
@@ -350,12 +340,13 @@ async function stop(tab, header, text) {
   // A tab closing from here on ends the recording through this stop (endRecording releases): never mid-parse.
   tab.page.off('close', tab.trace.release);
   try {
-    const { data, dataLoss } = await stopRecording(tab);
+    const { gz, dataLoss } = await stopRecording(tab);
     const file = path.join(outputDir('traces'), `trace-${stamp()}-${fileTab(tab)}.json.gz`);
-    await fs.writeFile(file, await gzip(data));
-    const parsed = await parseTrace(JSON.parse(data.toString('utf8')));
+    await fs.writeFile(file, gz); // as Chrome wrote it: gzipped
+    const parsed = await parseTrace(JSON.parse((await gunzip(gz)).toString('utf8')));
     tab.trace.last = { parsed, file };
-    return text(`${await header(tab)}\n${summaryText(parsed, { file, dataLoss })}`);
+    const waited = tab.trace.waitedMs >= 1000 ? `Waited ${Math.round(tab.trace.waitedMs / 1000)} s for another session's trace to end before recording.\n` : '';
+    return text(`${await header(tab)}\n${waited}${summaryText(parsed, { file, dataLoss })}`);
   } finally {
     endRecording(tab);
   }
@@ -387,21 +378,31 @@ export function registerTrace(tool, manager, { withTab, header, text, tabArg }) 
         throw new Error('This is the user\'s own tab, so it was not reloaded. Open the URL in your own tab (tab_open) and trace there, or pass reload false to record the page as it is.');
       }
       const release = await tracingSlot();
+      let blanked = false;
+      let waitedMs = 0;
       try {
-        if (reload) await tab.page.goto('about:blank', { waitUntil: 'load' });
+        // Chrome records one trace per browser (this server's own runs take turns; another session's or DevTools'
+        // recording is waited for, on the page as it is, so a reload does not leave the tab blank meanwhile; the start
+        // itself retries a little for one that began just now).
+        if (reload) {
+          waitedMs = await waitForTracing(tab);
+          await tab.page.goto('about:blank', { waitUntil: 'load' });
+          blanked = true;
+        }
         // As puppeteer records (what chrome-devtools-mcp uses): a 1.2 GB buffer, so a busy page's load is not cut short.
-        await cdp(tab, 'Tracing.start', { transferMode: 'ReturnAsStream', traceConfig: {
-          includedCategories: CATEGORIES.filter((c) => !c.startsWith('-')), excludedCategories: ['*'], traceBufferSizeInKb: 1_200_000 } });
+        // Gzipped by Chrome: many times fewer bytes through the extension and the host (a 39 MB trace is 2.8 MB).
+        waitedMs += (await startTracing(() => cdp(tab, 'Tracing.start', { transferMode: 'ReturnAsStream', streamCompression: 'gzip', traceConfig: {
+          includedCategories: CATEGORIES.filter((c) => !c.startsWith('-')), excludedCategories: ['*'], traceBufferSizeInKb: 1_200_000 } }),
+        reload ? { waitMs: 10_000 } : {})).waitedMs;
       } catch (error) {
         release();
-        if (reload) await tab.page.goto(url, { waitUntil: 'load' }).catch(() => {});
-        // Chrome traces one thing at a time across the whole browser (this server's own runs take turns; others don't).
-        if (/already been started/.test(error?.message)) {
-          throw new Error('Chrome records one trace at a time and something else is recording now (a trace or Lighthouse run of another session, or DevTools). Try again when it ends.');
+        if (blanked) await tab.page.goto(url, { waitUntil: 'load' }).catch(() => {});
+        if (traceBusy(error)) {
+          throw new Error('Chrome records one trace at a time and something else kept recording (a trace or Lighthouse run of another session, or DevTools) for as long as this call waited. Try again when it ends.');
         }
         throw error;
       }
-      tab.trace = { ...tab.trace, startedAt: Date.now(), url, release };
+      tab.trace = { ...tab.trace, startedAt: Date.now(), url, release, waitedMs };
       tab.page.on('close', release); // a closed tab ends Chrome's recording too; endRecording removes it
       if (reload) {
         try {

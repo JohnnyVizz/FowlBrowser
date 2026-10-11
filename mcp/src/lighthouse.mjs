@@ -4,8 +4,10 @@
 import EventEmitter from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
+import { promisify } from 'node:util';
+import zlib from 'node:zlib';
 import { z } from 'zod';
-import { cdp, clearEmulation, fileTab, isUsersTab, onCdpEvent, outputDir, stamp, tracingSlot } from './perf.mjs';
+import { cdp, clearEmulation, fileTab, isUsersTab, onCdpEvent, outputDir, readStream, stamp, startTracing, traceBusy, tracingSlot, waitForTracing } from './perf.mjs';
 import { debug } from './debug.mjs';
 import { POPUP_BINDING, POPUP_WORLD, popupsInstalled } from './popups.mjs';
 import { notice, USER_BINDING, USER_WORLD } from './takeover.mjs';
@@ -19,6 +21,12 @@ const MOBILE_SCREEN = { mobile: true, width: 412, height: 823, deviceScaleFactor
 // Domains an extension's debugger session doesn't have; Lighthouse only enables and disables them.
 const STUBBED = new Set(['Animation.enable', 'Animation.disable']);
 const MAX_IN_FLIGHT = 64; // the host refuses a client with over 256; Lighthouse's AnchorElements fires hundreds at once
+// The run's own Tracing.start retries this long for another session's trace to end: under Lighthouse's 30 s protocol
+// timeout (run() waited the long wait before starting, so this covers one that began meanwhile).
+const LH_TRACE_WAIT_MS = 25_000;
+const TRACE_CHUNK = 10_000; // trace events per Tracing.dataCollected handed to Lighthouse
+const TRACE_BUSY = 'Lighthouse could not trace the page: something else kept recording a trace in this browser (another session\'s trace or Lighthouse run, or DevTools\' Performance panel) for as long as this call waited. Stop it, then run lighthouse again.';
+const gunzip = promisify(zlib.gunzip);
 const MAX_FLAGGED = 20;
 const METRICS = [['FCP', 'first-contentful-paint'], ['LCP', 'largest-contentful-paint'], ['TBT', 'total-blocking-time'],
   ['CLS', 'cumulative-layout-shift'], ['Speed Index', 'speed-index'], ['TTI', 'interactive']];
@@ -41,10 +49,21 @@ export class Session extends EventEmitter {
     await this.slot();
     if (this.shared.closed) { this.release(); throw closedError(); }
     let result;
-    const sent = cdp(tab, method, params, this.sessionId);
-    this.shared.inFlightSends.add(sent);
+    const call = () => {
+      const sent = cdp(tab, method, params, this.sessionId);
+      this.shared.inFlightSends.add(sent);
+      return sent.finally(() => this.shared.inFlightSends.delete(sent));
+    };
     const started = Date.now();
-    try { result = await sent; } catch (error) { debug('lh err', method, String(error?.message).slice(0, 120)); throw error; } finally { this.shared.inFlightSends.delete(sent); this.release(); debug('lh', method, `${Date.now() - started} ms`); }
+    try {
+      // The run's trace comes back as a gzipped stream (many times fewer bytes through the extension and the host than
+      // its Tracing.dataCollected events; collectTrace hands the events over), and its start waits a little for another
+      // session's trace to end.
+      if (method === 'Tracing.start') {
+        params = { ...params, transferMode: 'ReturnAsStream', streamCompression: 'gzip' };
+        ({ result } = await startTracing(call, { waitMs: LH_TRACE_WAIT_MS }));
+      } else result = await call();
+    } catch (error) { debug('lh err', method, String(error?.message).slice(0, 120)); throw error; } finally { this.release(); debug('lh', method, `${Date.now() - started} ms`); }
     if (method === 'Page.addScriptToEvaluateOnNewDocument' && result?.identifier) this.shared.scripts.push({ sessionId: this.sessionId, identifier: result.identifier });
     return result;
   }
@@ -61,12 +80,23 @@ export class Session extends EventEmitter {
     else s.inFlight--;
   }
   dispatch(method, params) {
+    // The run's trace, as a stream (send above): read, gunzipped and handed over as dataCollected events, then complete.
+    if (method === 'Tracing.tracingComplete' && params?.stream) { this.collectTrace(params); return; }
     let child;
     if (method === 'Target.attachedToTarget' && params?.sessionId) this.shared.children.set(params.sessionId, child = new Session(this.shared, params.sessionId));
     if (method === 'Target.detachedFromTarget') this.shared.children.delete(params?.sessionId);
     this.emitSafe('*', method, params);
     this.emitSafe(method, params);
     if (child) this.emitSafe('sessionattached', child);
+  }
+  async collectTrace({ stream, dataLossOccurred }) {
+    try {
+      const { traceEvents } = JSON.parse((await gunzip(await readStream((m, p) => this.send(m, p), stream))).toString('utf8'));
+      for (let i = 0; i < traceEvents.length; i += TRACE_CHUNK) this.dispatch('Tracing.dataCollected', { value: traceEvents.slice(i, i + TRACE_CHUNK) });
+    } catch (error) {
+      debug('lh trace', String(error?.message).slice(0, 120)); // Lighthouse then has no trace events, and says so
+    }
+    this.dispatch('Tracing.tracingComplete', { dataLossOccurred });
   }
   // Lighthouse's listeners are partly async (TargetManager's sessionattached and frameNavigated) and their promises
   // reach nobody: a rejection there (a child target gone before its answer) would be unhandled and end the process.
@@ -145,6 +175,13 @@ async function run(tab, lh, { device, mode, categories }) {
   // override); in navigation mode it first makes way for Lighthouse's emulation, a snapshot audits the page at it.
   const viewport = tab.viewport;
   const warnings = [];
+  // Another session's recording would fail the run's own Tracing.start (Chrome records one trace per browser): it ends
+  // first, waited for on the page as it is (up to TRACE_WAIT), and the result says for how long.
+  if (mode === 'navigation') {
+    let waitedMs;
+    try { waitedMs = await waitForTracing(tab); } catch (error) { release(); throw traceBusy(error) ? new Error(TRACE_BUSY) : error; }
+    if (waitedMs >= 1000) warnings.push(`Waited ${Math.round(waitedMs / 1000)} s for another session's trace to end before the run.`);
+  }
   let failure = null;
   const root = rootSession(tab);
   const page = { url: async () => (await root.send('Target.getTargetInfo')).targetInfo.url, target: () => ({ createCDPSession: async () => root }) };
@@ -253,7 +290,7 @@ export function registerLighthouse(tool, manager, { withTab, header, text, tabAr
       const seconds = (Date.now() - started) / 1000;
       // Tracing is one per browser: a trace_start recording or DevTools' Performance panel in any tab blocks it.
       const tail = warnings.length ? `\n${warnings.join('\n')}` : '';
-      if (lhr.runtimeError?.code === 'TRACING_ALREADY_STARTED') throw new Error(`Lighthouse could not trace the page: a trace is already recording in this browser (another session's trace or Lighthouse run, or DevTools' Performance panel). Stop it, then run lighthouse again.${tail}`);
+      if (lhr.runtimeError?.code === 'TRACING_ALREADY_STARTED') throw new Error(`${TRACE_BUSY}${tail}`);
       if (lhr.runtimeError) throw new Error(`Lighthouse could not audit the page: ${lhr.runtimeError.message} (${lhr.runtimeError.code})${tail}`);
       const dir = path.join(outputDir('lighthouse'), `${stamp()}-${fileTab(tab)}`);
       fs.mkdirSync(dir, { recursive: true });
