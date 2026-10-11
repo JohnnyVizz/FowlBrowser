@@ -41,7 +41,7 @@ function setup({ origin = 'agent', kept = false } = {}) {
       return {};
     },
   };
-  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), relay: { model: { hasTab: () => true }, viewports: new Map() } };
+  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), adopting: new Map(), relay: { model: { hasTab: () => true }, viewports: new Map() } };
   browser.waitForTab = async (id) => browser.tabs.get(id);
   browser.forget = (id) => { browser.tabs.delete(id); browser.relay.viewports.delete(id); };
   const tab = new Tab(browser, tabId, page);

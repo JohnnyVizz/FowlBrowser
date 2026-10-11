@@ -265,9 +265,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
     delete owner.agentMuted;
     await persist();
     try {
-      // Unmuted before the detach, as in cleanUp: Helium can lose an unmute sent right after one.
-      await chrome.tabs.update(tabId, { autoDiscardable: true, ...(owner.parked.muted && { muted: false }) });
-      if (grouped) await chrome.tabs.ungroup(tabId);
+      await quiet(tabId, owner.parked);
     } finally {
       await chrome.debugger.detach({ tabId }).catch(() => {});
       childTargets.delete(tabId);
@@ -275,26 +273,48 @@ export function createCore({ chrome, send, timers = globalThis }) {
     }
   }
 
-  // tabs.claim of a parked tab: back into the client's group and its mute as it was; the claim then re-attaches.
-  // It stays parked (kept, handed over: a disconnect never closes it) until that worked; a failed step is rolled back.
+  // A parked tab out of the client's group, discardable, this extension's mute ended. Unmuted before any detach, as in
+  // cleanUp: Helium can lose an unmute sent right after one.
+  async function quiet(tabId, parked) {
+    await chrome.tabs.update(tabId, { autoDiscardable: true, ...(parked.muted && { muted: false }) });
+    if (parked.grouped) await ungroup(tabId);
+  }
+
+  // tabs.claim {resume} of a parked tab: back into the client's group and its mute as it was; the claim then
+  // re-attaches. It stays parked (kept, handed over: a disconnect never closes it) until that attach worked (resumed);
+  // a failed step, a failed attach, a tabs.park meanwhile or the client leaving rolls it back (rollBack).
   async function unpark(tabId, owner, tab) {
     const url = tab.pendingUrl || tab.url || '';
     if (isRestricted(url)) throw new Error(`Tab ${tabId} shows ${url}, which can't be controlled`);
     const { parked } = owner;
+    parked.resuming = true;
     try {
       if (parked.grouped) await addToGroup(owner.client, owner.group ?? labelFor(owner.client), tabId, tab.windowId);
       const restore = { ...(parked.muted && { muted: true }), ...(owner.origin === 'agent' && !parked.handedOver && { autoDiscardable: false }) };
       if (Object.keys(restore).length) await chrome.tabs.update(tabId, restore);
+      await persist();
     } catch (error) {
-      if (parked.grouped) await ungroup(tabId).catch(() => {});
+      await rollBack(tabId, owner).catch(() => {});
       throw error;
     }
+    return chrome.tabs.get(tabId);
+  }
+
+  async function rollBack(tabId, owner) {
+    if (!owner.parked?.resuming) return; // rolled back already (a release, a tabs.park)
+    delete owner.parked.resuming;
+    await persist();
+    await quiet(tabId, owner.parked);
+    await chrome.debugger.detach({ tabId }).catch(() => {});
+  }
+
+  // The resume's attach worked: the tab is the client's again, as it was before parking.
+  function resumed(owner) {
+    const { parked } = owner;
     delete owner.parked;
     owner.kept = parked.kept;
     owner.handedOver = parked.handedOver;
     if (parked.agentMuted) owner.agentMuted = true;
-    await persist();
-    return chrome.tabs.get(tabId);
   }
 
   // The owner record stays (releasing) until cleanup is done, so nobody can claim the tab mid-cleanup. A failed
@@ -303,6 +323,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
   async function cleanUp(tabId, owner) {
     for (let attempt = 0; owners.get(tabId) === owner; attempt++) {
       try {
+        await rollBack(tabId, owner); // the client left mid-resume: still the user's
         if (owner.origin === 'agent' && !owner.kept) await closeAgentTab(tabId);
         else {
           // Handed over already (tab_keep, forUser): the user may have muted it since; never undo their changes.
@@ -400,16 +421,19 @@ export function createCore({ chrome, send, timers = globalThis }) {
       return tracked(() => openTab(ctx, { url: createProperties.url }));
     },
 
-    async 'chrome.tabs.remove'([tabIds], { client }) {
+    // A parked tab is the user's for now: it closes only with usersTab (they asked for it: tab_close confirm_close_users_tab).
+    async 'chrome.tabs.remove'([tabIds, { usersTab = false } = {}], { client }) {
       const ids = [tabIds].flat();
       for (const id of ids) requireOwner(client, id);
       await Promise.all(ids.map((id) => serialize(id, async () => {
-        if (requireOwner(client, id).origin === 'agent') await closeAgentTab(id);
+        const owner = requireOwner(client, id);
+        if (owner.parked && !usersTab) throw new Error(`Tab ${id} is the user's for now (parked), so it was not closed`);
+        if (owner.origin === 'agent') await closeAgentTab(id);
         else await chrome.tabs.remove(id);
       })));
     },
 
-    async 'tabs.claim'({ tabId }, { client, live, emit: emitBack }) {
+    async 'tabs.claim'({ tabId, resume = false }, { client, live, emit: emitBack }) {
       if (owners.get(tabId)?.releasing) throw new Error(`Tab ${tabId} is being released`); // refuse, don't queue
       return tracked(() => serialize(tabId, async () => {
         const owner = owners.get(tabId);
@@ -417,7 +441,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
         if (owner && owner.client !== client) throw new Error(`Tab ${tabId} is owned by another client`);
         let tab = await chrome.tabs.get(tabId);
         if (owner) {
-          if (owner.parked) tab = await unpark(tabId, owner, tab);
+          if (owner.parked && !resume) throw new Error(`Tab ${tabId} is parked (the user has it); only a resume takes it back`);
+          if (owner.parked && !owner.parked.resuming) tab = await unpark(tabId, owner, tab);
           // The debugger was taken away (DevTools, "Cancel" on the bar): this explicit claim lets the client
           // re-attach. `detached` clears only once chrome.debugger.attach succeeds, so a failed one can be retried.
           if (owner.detached) emitBack('chrome.tabs.onCreated', [tab]);
@@ -484,7 +509,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
     async 'tabs.park'({ tabId, kind }, { client }) {
       return serialize(tabId, async () => {
         const owner = requireOwner(client, tabId);
-        if (!owner.parked) await park(tabId, owner, kind === 'handoff' ? 'handoff' : 'takeover');
+        if (owner.parked?.resuming) await rollBack(tabId, owner); // a resume that did not get the tab back
+        else if (!owner.parked) await park(tabId, owner, kind === 'handoff' ? 'handoff' : 'takeover');
         return { ok: true };
       });
     },
@@ -541,20 +567,30 @@ export function createCore({ chrome, send, timers = globalThis }) {
 
     async 'chrome.debugger.attach'([target, version = '1.3'], { client }) {
       const { tabId } = target;
-      if (requireOwner(client, tabId).parked) throw new Error(`Tab ${tabId} is parked (the user has it); claim it to resume`);
+      const owner = requireOwner(client, tabId);
+      const refused = () => new Error(`Tab ${tabId} is parked (the user has it); claim it to resume`);
+      // A parked tab attaches only during a resume (tabs.claim resume), and that attach is what ends its parking.
+      if (owner.parked && !owner.parked.resuming) throw refused();
       try {
-        await chrome.debugger.attach({ tabId }, version);
+        try {
+          await chrome.debugger.attach({ tabId }, version);
+        } catch (error) {
+          if (!/already attached/i.test(error.message)) throw error;
+        }
+        // Background tabs stop painting and running rAF without focus emulation.
+        await chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+        await chrome.debugger.sendCommand({ tabId }, 'Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
       } catch (error) {
-        if (!/already attached/i.test(error.message)) throw error;
+        if (owner.parked?.resuming) await serialize(tabId, () => rollBack(tabId, owner)).catch(() => {});
+        throw error;
       }
-      // Background tabs stop painting and running rAF without focus emulation.
-      await chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true });
-      await chrome.debugger.sendCommand({ tabId }, 'Page.setWebLifecycleState', { state: 'active' }).catch(() => {});
-      const owner = owners.get(tabId);
-      if (owner?.detached) {
-        delete owner.detached;
-        await persist();
+      if (owner.parked && !owner.parked.resuming) { // called off meanwhile (tabs.park)
+        await chrome.debugger.detach({ tabId }).catch(() => {});
+        throw refused();
       }
+      if (owner.parked) resumed(owner);
+      delete owner.detached;
+      await persist();
     },
 
     async 'chrome.debugger.detach'([target], { client }) {

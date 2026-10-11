@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 import vm from 'node:vm';
-import { Tab } from '../src/browsers.mjs';
+
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+import { Browser, Tab } from '../src/browsers.mjs';
 import { installPopups, pageScripts, uninstallPopups } from '../src/popups.mjs';
 import { registerTools } from '../src/tools.mjs';
 
@@ -266,7 +268,7 @@ function fakeTab() {
       return method === 'tabs.listAll' ? [] : { ok: true };
     },
   };
-  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), forget(id) { this.tabs.delete(id); } };
+  const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), adopting: new Map(), forget(id) { this.tabs.delete(id); } };
   const tab = new Tab(browser, 7, page);
   browser.tabs.set(7, tab);
   return { tab, browser, commands };
@@ -329,5 +331,47 @@ test('tab_release and tab_keep take the scripts out before the tab goes back to 
     const order = commands.map(([m]) => m);
     assert.ok(order.includes('Runtime.removeBinding'), `${tool}: ${order}`);
     assert.ok(order.indexOf('Runtime.removeBinding') < order.indexOf(method), `${tool}: ${order}`);
+  }
+});
+
+test('a tab kept while it is being adopted never keeps popup scripts: adoption sees the keep, or keep waits and takes them out', async () => {
+  for (const keepFirst of [true, false]) {
+    let kept = false;
+    const commands = [];
+    let tabIdAsked;
+    const tabIdReady = new Promise((resolve) => { tabIdAsked = resolve; });
+    const host = {
+      hello: { extension: { userAgent: 'Chrome/150.0.0.0' } },
+      on() {},
+      async request(method, params) {
+        commands.push(method === 'chrome.debugger.sendCommand' ? `${params[1]} ${params[2]?.name ?? ''}`.trim() : method);
+        if (method === 'tabs.listAll') return [{ id: 7, owner: 'you', origin: 'agent', kept, handedOver: kept, parked: null }];
+        if (method === 'tabs.keep') { await sleepMs(20); kept = true; return { ok: true }; }
+        if (method === 'tabs.isShown') return { shown: false };
+        return method === 'chrome.debugger.sendCommand' && params[1] === 'Page.addScriptToEvaluateOnNewDocument' ? { identifier: '1' } : {};
+      },
+    };
+    const browser = new Browser('chrome', host);
+    const page = Object.assign(new EventEmitter(), {
+      setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'https://site.example/', isClosed: () => false, frames: () => [],
+      context: () => ({ newCDPSession: async () => ({ send: async () => { await tabIdReady; return { tabId: 7 }; }, detach: async () => {} }) }),
+    });
+    const handlers = {};
+    registerTools({ registerTool: (name, meta, handler) => { handlers[name] = handler; } }, { get: async () => browser });
+    const adopted = browser.tabFor(page);
+    if (keepFirst) {
+      await handlers.tab_keep({ tab: 'chrome:7' });
+      tabIdAsked();
+    } else {
+      const keeping = handlers.tab_keep({ tab: 'chrome:7' }); // sent before the adoption knows the tab id, lands after its lookup
+      await sleepMs(1);
+      tabIdAsked();
+      await keeping;
+    }
+    await adopted;
+    const installed = commands.indexOf('Runtime.addBinding __fowlbrowserPopup');
+    const removed = commands.indexOf('Runtime.removeBinding __fowlbrowserPopup');
+    assert.ok(keepFirst ? installed === -1 : removed > installed, `keepFirst ${keepFirst}: ${commands}`);
+    browser.stop();
   }
 });

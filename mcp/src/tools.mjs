@@ -912,12 +912,19 @@ export function registerTools(server, manager) {
     async ({ tab: value, snapshot, resume }) => {
       const { key, tabId } = parseTabId(value);
       const id = `${key}:${tabId}`;
-      await takeover.settled(id); // a takeover still parking the tab: resume what it parked, not before
-      const parked = takeover.parked(id);
-      if (parked && (!resume || parked.gone)) throw new Error(takeover.notice(id));
+      // A takeover still parking the tab: resume what it parked, not before. Checked again after the setup (a takeover
+      // meanwhile); one after that is refused by the extension, which un-parks only with resume.
+      const check = async () => {
+        await takeover.settled(id);
+        const parked = takeover.parked(id);
+        if (parked && (!resume || parked.gone)) throw new Error(takeover.notice(id));
+        return parked;
+      };
+      await check();
       const browser = await manager.get(key);
       await browser.playwright();
-      const claimed = await browser.host.request('tabs.claim', { tabId });
+      const parked = await check();
+      const claimed = await browser.host.request('tabs.claim', { tabId, resume: resume === true });
       // If the debugger isn't attached (an earlier attach failed), announce the tab again so a retry really retries.
       if (!browser.relay.model.isAttached(tabId)) browser.relay.model.onTabCreated(claimed);
       let tab;
@@ -946,16 +953,21 @@ export function registerTools(server, manager) {
   const simpleTabCall = (method, params, done, { ends = false, check, fadeCursor = false, event, toUser = false } = {}) => async (args) => {
     const { key, tabId } = parseTabId(args.tab);
     const browser = await manager.get(key);
-    await check?.(browser, tabId, args);
+    await browser.adopting.get(tabId); // a tab still being set up: its popup scripts are in before toUser takes them out
     const tab = browser.tabs.get(tabId);
     const url = tab?.page.url();
     const call = async () => {
+      await check?.(browser, tabId, args); // in the tab's queue: a takeover or handover while earlier calls ran counts
       if (ends) takeover.markEnding(`${key}:${tabId}`); // its removal is ours, not the user closing it
       if (ends && tab) tab.ending = true; // its page closing now is ours, not "found gone" (record mode)
       if (event === 'release' && tab) await clearViewport(tab, 'release').catch(() => {});
       if (ends && tab) await cursor.remove(tab, { wait: fadeCursor });
       if (toUser && tab) await uninstallPopups(tab);
-      return browser.host.request(method, params(tabId, args));
+      const result = await browser.host.request(method, params(tabId, args));
+      // An adoption that started meanwhile may have looked the tab up before this request took effect.
+      const late = toUser && ((await browser.adopting.get(tabId)) ?? browser.tabs.get(tabId));
+      if (late) await uninstallPopups(late);
+      return result;
     };
     try {
       await (tab ? tab.run(call) : call());
@@ -974,19 +986,20 @@ export function registerTools(server, manager) {
     return text(`Browser: ${browser.name} · Tab: ${key}:${tabId}\n${typeof done === 'function' ? done(args) : done}`);
   };
 
-  // A claimed tab is the user's own: closing it needs their explicit request.
+  // A claimed tab is the user's own, and so is one handed over or taken over: closing it needs their explicit request.
   const refuseUsersTab = async (browser, tabId, args) => {
     if (args.confirm_close_users_tab === true) return;
     const info = (await browser.host.request('tabs.listAll', {})).find((t) => t.id === tabId);
-    if (info?.owner === 'you' && (info.origin === 'user' || info.handedOver)) {
-      throw new Error(`Tab ${browser.key}:${tabId} is the user's own tab (you claimed it), so it was not closed. Give it back with tab_release. ` +
+    if (takeover.parked(`${browser.key}:${tabId}`) || (info?.owner === 'you' && (info.origin === 'user' || info.handedOver))) {
+      throw new Error(`Tab ${browser.key}:${tabId} is the user's own tab (you claimed it, handed it to them, or they took it over), so it was not closed. Give it back with tab_release. ` +
         'Close it only if the user asked you to close it: call tab_close again with confirm_close_users_tab: true.');
     }
   };
 
   tool('tab_release', 'Give a claimed or opened tab back to the user: stop controlling it and leave it open.',
     { tab: tabArg }, simpleTabCall('tabs.release', byId, 'Released. The tab stays open and is no longer controlled.', { ends: true, fadeCursor: true, event: 'release', toUser: true }));
-  const closeOwned = simpleTabCall('chrome.tabs.remove', (tabId) => [tabId], 'Closed.', { ends: true, check: refuseUsersTab, event: 'close' });
+  // usersTab: the extension closes a parked tab only with it.
+  const closeOwned = simpleTabCall('chrome.tabs.remove', (tabId, args) => (args.confirm_close_users_tab === true ? [tabId, { usersTab: true }] : [tabId]), 'Closed.', { ends: true, check: refuseUsersTab, event: 'close' });
   tool('tab_close',
     'Close a tab. Your own tabs close directly. The user\'s tabs (claimed or not) close only when the user asked for it, with confirm_close_users_tab: true; ' +
     'to close the user\'s tabs, do not claim them first (claiming wakes them and starts their media): call tab_close on the ids from tab_list. ' +

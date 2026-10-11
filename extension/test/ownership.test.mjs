@@ -1015,15 +1015,15 @@ test('tabs.park hands the tab to the user for now; tabs.claim resumes it as it w
   assert.match((await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error.message, /parked/, 'no re-attach while parked');
 
   sent.length = 0;
-  assert.ok(!(await call(1, 'tabs.claim', { tabId: tab.id })).error);
+  assert.ok(!(await call(1, 'tabs.claim', { tabId: tab.id, resume: true })).error);
   const resumed = chrome.tabsById.get(tab.id);
   assert.equal(resumed.groupId, groupId, 'back in its group');
   assert.equal(resumed.mutedInfo.muted, true, 'muted again');
   assert.equal(resumed.autoDiscardable, false);
-  assert.deepEqual([owner.parked, owner.kept, owner.handedOver], [undefined, false, false]);
   assert.ok(sent.some((m) => m.method === 'chrome.tabs.onCreated' && m.params[0].id === tab.id), 'the claim re-attaches');
-  assert.equal((await call(1, 'tabs.listAll', {})).result.find((t) => t.id === tab.id).parked, null);
   assert.ok(!(await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error);
+  assert.deepEqual([owner.parked, owner.kept, owner.handedOver], [undefined, false, false]);
+  assert.equal((await call(1, 'tabs.listAll', {})).result.find((t) => t.id === tab.id).parked, null);
   assert.equal(owner.detached, undefined);
 });
 
@@ -1034,7 +1034,7 @@ test('a parked claimed tab keeps the user\'s group and mute; a parked tab is han
   await call(1, 'tabs.park', { tabId: gmail.id, kind: 'takeover' });
   assert.equal(chrome.tabsById.get(gmail.id).groupId, 42);
   assert.deepEqual(chrome.tabsById.get(gmail.id).mutedInfo, { muted: true, reason: 'user' });
-  await call(1, 'tabs.claim', { tabId: gmail.id });
+  await call(1, 'tabs.claim', { tabId: gmail.id, resume: true });
   assert.equal(chrome.tabsById.get(gmail.id).groupId, 42);
   assert.deepEqual(chrome.tabsById.get(gmail.id).mutedInfo, { muted: true, reason: 'user' });
 
@@ -1054,10 +1054,10 @@ test('a parked tab can be released or closed by its owner, and resuming a tab no
   for (const t of [a, b, c]) await call(1, 'tabs.park', { tabId: t.id, kind: 'takeover' });
   assert.ok(!(await call(1, 'tabs.release', { tabId: a.id })).error);
   assert.ok(chrome.tabsById.has(a.id) && !core.owners.has(a.id));
-  assert.ok(!(await call(1, 'chrome.tabs.remove', [b.id])).error);
+  assert.ok(!(await call(1, 'chrome.tabs.remove', [b.id, { usersTab: true }])).error);
   assert.ok(!chrome.tabsById.has(b.id));
   chrome.tabsById.get(c.id).url = 'chrome://settings';
-  assert.match((await call(1, 'tabs.claim', { tabId: c.id })).error.message, /can't be controlled/);
+  assert.match((await call(1, 'tabs.claim', { tabId: c.id, resume: true })).error.message, /can't be controlled/);
   assert.equal(core.owners.get(c.id).parked.kind, 'takeover');
 });
 
@@ -1094,7 +1094,7 @@ test('a resume that fails partway leaves the tab parked and protected: the disco
   const { result: tab } = await call(1, 'tabs.open', {});
   await call(1, 'tabs.park', { tabId: tab.id, kind: 'handoff' });
   chrome.hooks.groupError = 'Tabs cannot be edited right now (user may be dragging a tab).';
-  assert.match((await call(1, 'tabs.claim', { tabId: tab.id })).error.message, /dragging/);
+  assert.match((await call(1, 'tabs.claim', { tabId: tab.id, resume: true })).error.message, /dragging/);
   const owner = core.owners.get(tab.id);
   assert.deepEqual([owner.parked?.kind, owner.kept, owner.handedOver], ['handoff', true, true]);
   assert.equal(chrome.session.owners[tab.id].parked?.kind, 'handoff', 'persisted as parked');
@@ -1129,4 +1129,65 @@ test('a replaced parked tab stays parked under its new id and is not announced f
   await core.onTabReplaced(replacement.id, tab.id);
   assert.equal(core.owners.get(replacement.id).parked.kind, 'handoff');
   assert.deepEqual(sent.map((m) => [m.method, m.params[1]?.replacedBy]), [['chrome.tabs.onRemoved', replacement.id]]);
+});
+
+test('a resume stays parked until its attach worked: a failed attach or a client gone meanwhile leaves the tab parked and open', async () => {
+  const { core, chrome, call } = setup();
+  const { result: tab } = await call(1, 'tabs.open', {});
+  await call(1, 'tabs.park', { tabId: tab.id, kind: 'handoff' });
+  assert.ok(!(await call(1, 'tabs.claim', { tabId: tab.id, resume: true })).error);
+  const owner = core.owners.get(tab.id);
+  assert.deepEqual([owner.parked?.kind, owner.kept, owner.handedOver], ['handoff', true, true], 'still parked until attached');
+  assert.notEqual(chrome.tabsById.get(tab.id).groupId, -1, 'back in its group meanwhile');
+  chrome.hooks.attachError = 'Cannot access a chrome-extension:// URL of different extension';
+  assert.ok((await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error);
+  assert.deepEqual([owner.parked?.kind, owner.parked?.resuming, owner.kept], ['handoff', undefined, true], 'rolled back');
+  assert.equal(chrome.tabsById.get(tab.id).groupId, -1, 'out of the group again');
+  assert.equal(chrome.tabsById.get(tab.id).mutedInfo.muted, false, 'our mute ended again');
+
+  delete chrome.hooks.attachError;
+  assert.ok(!(await call(1, 'tabs.claim', { tabId: tab.id, resume: true })).error);
+  await core.handleMessage({ method: 'host.clientDisconnected', params: { client: 1 } });
+  await tick();
+  assert.ok(chrome.tabsById.has(tab.id), 'a client gone mid-resume never closes it');
+  assert.equal(chrome.tabsById.get(tab.id).groupId, -1);
+  assert.equal(chrome.tabsById.get(tab.id).mutedInfo.muted, false);
+});
+
+test('a resume ends its parking only once the attach worked; tabs.park meanwhile calls it off', async () => {
+  const { core, chrome, call } = setup();
+  const { result: tab } = await call(1, 'tabs.open', {});
+  await call(1, 'tabs.park', { tabId: tab.id, kind: 'takeover' });
+  await call(1, 'tabs.claim', { tabId: tab.id, resume: true });
+  assert.ok(!(await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error);
+  const owner = core.owners.get(tab.id);
+  assert.deepEqual([owner.parked, owner.kept, owner.handedOver], [undefined, false, false]);
+
+  await call(1, 'tabs.park', { tabId: tab.id, kind: 'takeover' });
+  await call(1, 'tabs.claim', { tabId: tab.id, resume: true });
+  await call(1, 'tabs.park', { tabId: tab.id, kind: 'takeover' });
+  assert.match((await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error.message, /parked/);
+  assert.deepEqual([owner.parked?.kind, owner.parked?.resuming], ['takeover', undefined]);
+  assert.equal(chrome.tabsById.get(tab.id).groupId, -1);
+});
+
+test('a plain tabs.claim never un-parks a tab: only resume does', async () => {
+  const { core, chrome, call, sent } = setup();
+  const { result: tab } = await call(1, 'tabs.open', {});
+  await call(1, 'tabs.park', { tabId: tab.id, kind: 'takeover' });
+  sent.length = 0;
+  assert.match((await call(1, 'tabs.claim', { tabId: tab.id })).error.message, /parked/);
+  assert.equal(core.owners.get(tab.id).parked.kind, 'takeover');
+  assert.equal(chrome.tabsById.get(tab.id).groupId, -1);
+  assert.ok(!sent.some((m) => m.method === 'chrome.tabs.onCreated'));
+});
+
+test('a parked tab closes only with the user\'s confirmation', async () => {
+  const { chrome, call } = setup();
+  const { result: tab } = await call(1, 'tabs.open', {});
+  await call(1, 'tabs.park', { tabId: tab.id, kind: 'takeover' });
+  assert.match((await call(1, 'chrome.tabs.remove', [tab.id])).error.message, /user's/);
+  assert.ok(chrome.tabsById.has(tab.id));
+  assert.ok(!(await call(1, 'chrome.tabs.remove', [tab.id, { usersTab: true }])).error);
+  assert.ok(!chrome.tabsById.has(tab.id));
 });
