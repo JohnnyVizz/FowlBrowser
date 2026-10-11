@@ -40,7 +40,7 @@ try {
       fs.writeFileSync(path.join(args.record, `${String(Math.round(params.metadata.timestamp * 1000)).padStart(14, '0')}.jpg`), Buffer.from(params.data, 'base64'));
       send('Page.screencastFrameAck', { sessionId: params.sessionId }).catch(() => {});
     });
-    await send('Page.startScreencast', { format: 'jpeg', quality: 85, maxWidth: 2048, maxHeight: 2048, everyNthFrame: 2 });
+    await send('Page.startScreencast', { format: 'jpeg', quality: 90, maxWidth: 4096, maxHeight: 4096, everyNthFrame: 1 });
   }
   const move = async (name, x, y) => {
     const started = Date.now();
@@ -55,6 +55,11 @@ try {
     await move('appear + travel', 300, 450);
     await sleep(800);
     await move('short', 420, 520);
+    await sleep(800);
+    // Form-field nudges (under 50 px), as filling a form makes them.
+    await move('nudge', 420, 556);
+    await sleep(500);
+    await move('nudge', 452, 556);
     await sleep(800);
     await move('long curved', 1200, 620);
     await sleep(400);
@@ -74,11 +79,11 @@ try {
     await move('long back', 200, 420);
     cursor.click(tab);
     await sleep(900);
-    // Each action cue, as the tools play them (looping cues end after 1.6 s).
+    // Each action cue, as the tools play them (held cues end after 1.6 s; "Typing" holds 5 s for its light's second pass).
     for (const kind of ['observe', 'scroll', 'text', 'key', 'navigate', 'drag', 'transfer']) {
       cursor.cue(tab, kind);
       log('cue', kind);
-      await sleep(1600);
+      await sleep(kind === 'text' ? 5000 : 1600);
       cursor.cueEnd(tab);
       await sleep(900);
     }

@@ -29,16 +29,22 @@
   const IDLE_MS = 15_000; // the cursor fades this long after the last action
   const TIMING = 0.9; // Fitts' law durations, a little quick: agents wait for arrival
   const MAX_MOVE_MS = 850;
+  const SHORT_MS = 140; // a move's time grows from this by 1.6 ms a px while that is quicker than Fitts' (under ~220 px)
   const MIN_MOVE_MS = 120; // less time left than this before the action: the cursor appears at the target
   const TIP_ANGLE = -0.63 * Math.PI; // where the tip points at rest (up and a little to the left)
   const LEAN = 0.5; // at most this far (radians) the tip leans into the direction of travel
   const BADGE = { x: 12 * SCALE + 2, y: 18 * SCALE + 2 }; // the label, from the tip
   const PAD = 7; // the label's text inset
   const MAX_PILL = 200;
+  const RING_R = 22; // the click ring's radius when it has spread
+  const WORD_MS = 180; // a word change: the next word in, the pill to its width
   const SHIMMER_MS = 1500; // one pass of the light over an action word
+  const SHIMMER_EVERY_MS = 4000; // and the next pass this long after the last one began
   const MIN_CUE_MS = 600; // an action word for a quick action stays long enough to be read
   const ONE_SHOT_MS = 1200; // a key press or a page load: its word shows this long
-  const reduced = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const motionQuery = matchMedia('(prefers-reduced-motion: reduce)');
+  let still = motionQuery.matches;
+  const reduced = () => still;
 
   // Actions shown as a word in place of the label. Held words stay while the action runs; the others show for a moment.
   const VERBS = { observe: 'Reading', scroll: 'Scrolling', text: 'Typing', key: 'Pressing keys', navigate: 'Loading',
@@ -61,7 +67,8 @@
     :host { all: initial !important; position: fixed !important; inset: 0 !important; pointer-events: none !important;
       z-index: 2147483647 !important; contain: strict !important; display: block !important; }
     @media print { :host { display: none !important; } }
-    .cursor, .fx { position: absolute; left: 0; top: 0; will-change: transform; }
+    .cursor, .fx { position: absolute; left: 0; top: 0; }
+    .cursor { will-change: transform; } /* not .fx: in a layer of its own, a click ring spreads blurred */
     .body, .art, .press { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
     svg { position: absolute; overflow: visible; }
     .pointer { left: ${(-4 - TIP.x) * SCALE}px; top: ${(-4 - TIP.y) * SCALE}px; width: ${24 * SCALE}px; height: ${28 * SCALE}px;
@@ -75,6 +82,8 @@
       font: 600 10.5px/17px -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
     .word { max-width: ${MAX_PILL - 2 * PAD}px; overflow: hidden; text-overflow: ellipsis; transform-origin: 0 50%; }
     .word.busy { color: var(--dim); }
+    .ring { position: absolute; left: ${-RING_R}px; top: ${-RING_R}px; width: ${2 * RING_R}px; height: ${2 * RING_R}px;
+      box-sizing: border-box; border: 2px solid; border-radius: 50%; }
     .measure { left: 0; visibility: hidden; }
     .glint { position: absolute; left: 0; top: 0; height: 100%; overflow: hidden;
       -webkit-mask-image: linear-gradient(90deg, transparent, #000, transparent); mask-image: linear-gradient(90deg, transparent, #000, transparent); }
@@ -176,8 +185,7 @@
   // Back on top when something entered the top layer after the cursor (a dialog or popover opened later).
   function raise() {
     if (!host?.isConnected || !host.matches(':popover-open')) return;
-    const others = document.querySelectorAll(':modal, :popover-open, :fullscreen');
-    if (![...others].some((el) => el !== host)) return;
+    if (!document.querySelector(':modal, :popover-open:not(fowlbrowser-cursor), :fullscreen')) return;
     try {
       host.hidePopover();
       host.showPopover();
@@ -210,7 +218,7 @@
     const ink = luminance(fill) > 0.4;
     style.setProperty('--fill', rgb(fill));
     style.setProperty('--text', ink ? '#131110' : '#fff');
-    style.setProperty('--dim', ink ? 'rgba(19, 17, 16, 0.5)' : 'rgba(255, 255, 255, 0.6)');
+    style.setProperty('--dim', ink ? 'rgba(19, 17, 16, 0.65)' : 'rgba(255, 255, 255, 0.8)');
     parts.fill = fill;
     showWord(force);
   }
@@ -242,7 +250,6 @@
     badge.style.display = text ? '' : 'none';
     if (shown === parts.shown && !instant) return;
     const morph = !instant && parts.shown !== undefined;
-    const still = reduced();
     parts.shown = shown;
     parts.measure.textContent = text;
     const textWidth = parts.measure.getBoundingClientRect().width;
@@ -258,7 +265,7 @@
       old.classList.add('out');
       const at = stopAt(old);
       old.animate([at, still ? { ...at, opacity: 0 } : { opacity: 0, transform: 'scale(0.96)', filter: 'blur(4px)' }],
-        { duration: still ? 120 : 200, easing: CURVE, fill: 'forwards' }).finished.then(() => {
+        { duration: still ? 120 : WORD_MS - 40, easing: CURVE, fill: 'forwards' }).finished.then(() => {
         for (const a of old.getAnimations({ subtree: true })) a.cancel(); // its light, endless otherwise
         old.remove();
       }, () => {});
@@ -268,37 +275,50 @@
     if (morph) {
       word.animate(still ? [{ opacity: 0 }, { opacity: 1 }]
         : [{ opacity: 0, transform: 'scale(1.04)', filter: 'blur(4px)' }, { opacity: 1, transform: 'scale(1)', filter: 'blur(0px)' }],
-      { duration: still ? 120 : 280, delay: still ? 0 : 40, easing: CURVE, fill: 'backwards' });
+      { duration: still ? 120 : WORD_MS - 20, delay: still ? 0 : 20, easing: CURVE, fill: 'backwards' });
     }
-    // The light: a soft-edged window sweeping across the word, holding a full-strength copy that stays in place.
+    // The light: a soft-edged window sweeping across the word once as it arrives, then again every few seconds while
+    // the action lasts, holding a full-strength copy that stays in place.
     if (action && !still) {
       const band = Math.max(24, Math.round(textWidth * 0.7));
       const lit = node('span', {}, [text]);
       const glint = node('span', { class: 'glint' }, [lit]);
       glint.style.width = `${band}px`;
       word.appendChild(glint);
-      const pass = { duration: SHIMMER_MS, delay: morph ? 250 : 0, iterations: Infinity, easing: 'cubic-bezier(0.45, 0, 0.55, 1)', fill: 'backwards' };
-      glint.animate([{ transform: `translateX(${-band}px)` }, { transform: `translateX(${textWidth}px)` }], pass);
-      lit.animate([{ transform: `translateX(${band}px)` }, { transform: `translateX(${-textWidth}px)` }], pass);
+      const swept = SHIMMER_MS / SHIMMER_EVERY_MS;
+      const pass = { duration: SHIMMER_EVERY_MS, delay: morph ? WORD_MS : 0, iterations: Infinity, fill: 'backwards' };
+      const sweep = (a, b) => [{ transform: `translateX(${a}px)`, easing: 'cubic-bezier(0.45, 0, 0.55, 1)' },
+        { transform: `translateX(${b}px)`, offset: swept }, { transform: `translateX(${b}px)` }];
+      glint.animate(sweep(-band, textWidth), pass);
+      lit.animate(sweep(band, -textWidth), pass);
     }
     for (const a of pill.getAnimations()) a.cancel();
     pill.style.width = `${badgeWidth}px`;
-    if (Math.abs(from - badgeWidth) > 0.5) pill.animate([{ width: `${from}px` }, { width: `${badgeWidth}px` }], { duration: 300, easing: CURVE });
+    if (Math.abs(from - badgeWidth) > 0.5) pill.animate([{ width: `${from}px` }, { width: `${badgeWidth}px` }], { duration: WORD_MS, easing: CURVE });
     // Against the viewport's right edge the label moves as it grows or shrinks: it glides there with the width.
     for (const a of badge.getAnimations()) a.cancel();
     badge.style.transform = badgeAt();
     if (placed !== 'none' && placed !== getComputedStyle(badge).transform) {
-      badge.animate([{ transform: placed }, { transform: badge.style.transform }], { duration: 300, easing: CURVE });
+      badge.animate([{ transform: placed }, { transform: badge.style.transform }], { duration: WORD_MS, easing: CURVE });
     }
   }
 
+  // The viewport's size and the page scale, read once and kept until the window or the visual viewport changes, so a
+  // frame never forces a layout.
+  let view = null;
   function viewport() {
+    if (view) return view;
     // In quirks mode <html>'s client size is the content's, not the viewport's.
     const el = document.compatMode === 'BackCompat' ? null : document.documentElement;
-    return { w: el?.clientWidth || innerWidth, h: el?.clientHeight || innerHeight };
+    view = { w: el?.clientWidth || innerWidth, h: el?.clientHeight || innerHeight, zoom: 1 / (globalThis.visualViewport?.scale || 1) };
+    return view;
   }
+  const forget = () => { view = null; };
+  addEventListener('resize', forget);
+  globalThis.visualViewport?.addEventListener('resize', forget);
+  globalThis.visualViewport?.addEventListener('scroll', forget);
 
-  const zoom = () => 1 / (globalThis.visualViewport?.scale || 1);
+  const zoom = () => viewport().zoom;
 
   // A point inside the viewport: an element taller than it, or not scrolled into view, still gets a visible cursor.
   function inside(point) {
@@ -369,13 +389,11 @@
       travel = null;
     } else if (!host.isConnected && document.documentElement) {
       attach(); // the page replaced its document element (document.open, a rebuilt <html>)
-    } else {
-      raise();
     }
     setLabel(opts.label);
     if (fresh || exiting) {
       exiting = null;
-      animateBody(1, 1, 220, fresh ? { opacity: 0, scale: 0.85 } : undefined);
+      animateBody(1, 1, 220, fresh ? { opacity: 0, scale: still ? 1 : 0.85 } : undefined);
     }
     render();
     resetIdle();
@@ -428,7 +446,9 @@
     const near = point(1 - 1e-3);
     const tail = Math.hypot(to.x - near.x, to.y - near.y) || 1;
     const width = Math.max(Math.min(box?.w ?? 24, box?.h ?? 24), 4);
-    const ms = Math.min(Math.min(Math.max(150 + 120 * Math.log2(d / width + 1), 300), 1000) * TIMING, MAX_MOVE_MS, left);
+    // Short hops (a form's next field) are quicker than Fitts' floor: about 160 ms at 10 px, 220 ms at 50 px.
+    const fitts = Math.min(Math.max(150 + 120 * Math.log2(d / width + 1), 300), 1000) * TIMING;
+    const ms = Math.min(fitts, SHORT_MS + 1.6 * d, MAX_MOVE_MS, left);
     return {
       to, ms, over: Math.min(0.018, 6 / d), start: performance.now(), arrived: false,
       // The point `frac` of the way along by distance; past 1 it carries on along the end tangent.
@@ -506,9 +526,11 @@
     stopFrames();
     travel = null;
     rot = 0;
+    // The ghost starts as visible as the cursor is (a cursor still fading in leaves no flash where it was).
+    const { opacity } = current(parts.body);
     const ghost = parts.cursor.cloneNode(true);
     parts.root.appendChild(ghost);
-    ghost.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 120, easing: CURVE, fill: 'forwards' }).finished
+    ghost.animate([{ opacity }, { opacity: 0 }], { duration: 120, easing: CURVE, fill: 'forwards' }).finished
       .then(() => ghost.remove(), () => ghost.remove());
     pos = { ...to };
     render();
@@ -546,6 +568,7 @@
   function move(x, y, opts = {}) {
     if (!Number.isFinite(Number(x)) || !Number.isFinite(Number(y))) return Promise.resolve(false);
     ensure(opts);
+    raise();
     const to = inside({ x: Number(x), y: Number(y) });
     settle(false); // an earlier target was not reached
     let resolveOwn;
@@ -626,19 +649,22 @@
       if (Math.hypot(at.x - pos.x, at.y - pos.y) > 12) snap(at); // (a few px off is the follow-through settling)
     }
     if (reduced()) return;
-    // The pointer presses in around its tip, and a ring of the session's colour spreads from the point.
+    // The pointer presses in around its tip (a press that interrupts the last one goes on from where it is), and a
+    // ring of the session's colour spreads from the point: drawn at its full size and scaled down, so it stays sharp.
+    const { scale } = current(parts.press);
     for (const a of parts.press.getAnimations()) a.cancel();
     parts.press.animate([
-      { transform: 'scale(1)', easing: 'ease-out' },
-      { transform: 'scale(0.86)', offset: 0.35 },
-      { transform: 'scale(1)', easing: 'cubic-bezier(0.34, 1.56, 0.64, 1)' },
+      { transform: `scale(${scale})`, easing: CURVE },
+      { transform: 'scale(0.86)', offset: 0.35, easing: 'cubic-bezier(0.34, 1.56, 0.64, 1)' },
+      { transform: 'scale(1)' },
     ], { duration: 220 });
-    const circle = svgNode('circle', { cx: 0, cy: 0, r: 5, fill: 'none', stroke: rgb(parts.fill), 'stroke-width': 2.4 });
-    const ring = svgNode('svg', { width: 1, height: 1 }, [circle]);
+    const circle = node('div', { class: 'ring' });
+    circle.style.borderColor = rgb(parts.fill);
+    const ring = node('div', { class: 'fx' }, [circle]);
     ring.style.transform = `translate(${pos.x}px, ${pos.y}px) scale(${zoom()})`;
     parts.fx.appendChild(ring);
-    circle.animate([{ r: '5px' }, { r: '22px' }], { duration: 420, easing: 'cubic-bezier(0.33, 1, 0.68, 1)', fill: 'forwards' });
-    circle.animate([{ strokeWidth: '2.4px', opacity: 0.85 }, { strokeWidth: '0.6px', opacity: 0 }], { duration: 420, fill: 'forwards' })
+    circle.animate([{ transform: 'scale(0.3)', opacity: 0.85 }, { opacity: 0.55, offset: 0.8 }, { transform: 'scale(1)', opacity: 0 }],
+      { duration: 420, easing: 'cubic-bezier(0.33, 1, 0.68, 1)', fill: 'forwards' })
       .finished.then(() => ring.remove(), () => ring.remove());
   }
 
@@ -671,7 +697,7 @@
     stopFrames();
     travel = null;
     settle(false);
-    const anim = animateBody(0, 0.9, 200);
+    const anim = animateBody(0, still ? current(parts.body).scale : 0.9, 200);
     const done = anim.finished.then(() => true, () => false).then((finished) => {
       if (exiting === done && finished) {
         exiting = null;
@@ -713,6 +739,21 @@
     scriptClicks = [];
     return drained;
   }
+
+  // Reduced motion turned on or off while the cursor shows: a travel under way crossfades to its target, an appear or
+  // exit ends at once, and the word is drawn again with or without its light.
+  motionQuery.addEventListener('change', (event) => {
+    still = event.matches;
+    if (!parts) return;
+    if (still) {
+      for (const a of parts.body.getAnimations()) a.finish();
+      if (travel) {
+        jump(travel.to);
+        settle(true);
+      }
+    }
+    showWord(true);
+  });
 
   // A page going into the back/forward cache drops its cursor, so a restored page never brings back a stale one
   // (the server tracks the cursor per document and would not hide it for screenshots).

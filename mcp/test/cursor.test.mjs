@@ -118,24 +118,30 @@ test('a target found after the budget is shown at once while the action runs, ne
 
 // The overlay in a vm: every DOM call answers with a stub (callable, every property another stub).
 // opacity: what getComputedStyle reports (the appear fade not yet run on a busy page: '0').
+// The returned overlay carries the test's handles: reads (layout reads of the viewport and top-layer queries so far)
+// and setReduced(on) (the reduced motion preference changing).
 function overlay({ opacity = '1' } = {}) {
   const stub = new Proxy(function () {}, {
-    get: (_, key) => (key === Symbol.toPrimitive ? () => 0 : key === 'then' ? undefined : key === Symbol.iterator ? [][Symbol.iterator] : stub),
+    get: (_, key) => (key === Symbol.toPrimitive ? () => 0 : key === 'then' ? undefined : key === Symbol.iterator ? [][Symbol.iterator]
+      : key === 'finished' ? Promise.resolve() : stub),
     apply: () => stub,
     construct: () => stub,
   });
-  const html = { clientWidth: 1000, clientHeight: 800, appendChild() {}, querySelector: () => null };
-  const document = new Proxy({ hidden: false, compatMode: 'CSS1Compat', documentElement: html, querySelectorAll: () => [] }, { get: (t, k) => (k in t ? t[k] : stub) });
+  const reads = { layout: 0, topLayer: 0 };
+  const html = { get clientWidth() { reads.layout++; return 1000; }, clientHeight: 800, appendChild() {}, querySelector: () => null };
+  const document = new Proxy({ hidden: false, compatMode: 'CSS1Compat', documentElement: html, querySelectorAll: () => [],
+    querySelector: () => { reads.topLayer++; return null; } }, { get: (t, k) => (k in t ? t[k] : stub) });
   const later = (fn, ms) => setTimeout(fn, ms).unref(); // the idle timer must not keep the test running
+  const media = { matches: false, addEventListener: (_, fn) => { media.onchange = fn; } };
   const context = vm.createContext({
-    document, innerWidth: 1000, innerHeight: 800, matchMedia: () => ({ matches: false }),
+    document, innerWidth: 1000, innerHeight: 800, matchMedia: () => media,
     requestAnimationFrame: (fn) => later(() => fn(performance.now()), 16), cancelAnimationFrame: clearTimeout,
     setTimeout: later, clearTimeout, performance, Date, Math, Number, Object, Promise, JSON,
     MutationObserver: function () { return stub; }, CSSStyleSheet: function () { return stub; },
     getComputedStyle: () => ({ opacity, transform: 'none' }), addEventListener() {},
   });
   vm.runInContext(fs.readFileSync(new URL('../src/cursor/overlay.js', import.meta.url), 'utf8'), context);
-  return context.__fbCursor;
+  return { ...context.__fbCursor, reads, setReduced: (on) => media.onchange({ matches: on }) };
 }
 
 test('a travel longer than the time left is made quicker, and still arrives', async () => {
@@ -180,4 +186,35 @@ test('land shows a cursor on the target whose appear fade has not run', async ()
   const c = overlay({ opacity: '0' });
   await c.move(100, 100, { until: Date.now() + 80 });
   assert.equal(c.land(100, 100), true);
+});
+
+test('a short hop is quick, a long move keeps its pace', async () => {
+  const c = overlay();
+  await c.move(100, 100, { until: Date.now() + 80 }); // appears there
+  let started = Date.now();
+  await c.move(130, 100, { w: 24, h: 24 });
+  const hop = Date.now() - started;
+  assert.ok(hop >= 120 && hop <= 200, `a 30 px hop took ${hop} ms`);
+  started = Date.now();
+  await c.move(700, 500, { w: 24, h: 24 });
+  assert.ok(Date.now() - started > 500, `a 700 px move took ${Date.now() - started} ms`);
+});
+
+test('a travel reads the viewport size once, not every frame, and looks for the top layer once', async () => {
+  const c = overlay();
+  c.cue('observe');
+  assert.equal(c.reads.topLayer, 0, 'a cue looked for dialogs above the cursor');
+  const before = c.reads.layout;
+  await c.move(100, 100, { w: 24, h: 24 });
+  assert.ok(c.reads.layout - before <= 1, `${c.reads.layout - before} layout reads during one travel`);
+  assert.equal(c.reads.topLayer, 1);
+});
+
+test('reduced motion turned on mid-travel puts the tip on the target at once', async () => {
+  const c = overlay();
+  const arrived = c.move(100, 100, { w: 24, h: 24 });
+  await sleep(100);
+  c.setReduced(true);
+  assert.deepEqual({ x: c.state().x, y: c.state().y }, { x: 100, y: 100 });
+  assert.equal(await arrived, true);
 });
