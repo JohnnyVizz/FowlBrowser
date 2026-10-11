@@ -56,6 +56,8 @@ test('a frame of several megabytes arriving in small chunks, then two frames in 
       else if (message.method === 'client.hello') { socket.write(frame({ id: message.id, result: { ok: true } })); socket.write(frame({ method: 'extension.initialized', params: [] })); }
     });
   });
+  fs.mkdirSync(dir, { recursive: true }); // the token the client reads (the test above removes its dir at the end)
+  fs.writeFileSync(path.join(dir, 'token'), 'token');
   const sock = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'fb-hostclient-big-')), 'big.sock');
   await new Promise((resolve) => server.listen(sock, resolve));
   const client = new HostClient(sock);
