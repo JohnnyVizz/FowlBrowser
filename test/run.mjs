@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 // Runs the end-to-end scenarios through one FowlBrowser MCP server.
-//   node test/run.mjs --browser chrome|helium|both --parallel N [--only name,name] [--local]
-// --local skips the real-site scenarios. The test site is started if it isn't already up.
+//   node test/run.mjs --browser chrome|helium|both --parallel N [--only name,name] [--local] [--gui]
+// --local skips the real-site scenarios. gui scenarios (real mouse and keyboard on this Mac) run only with --gui, which
+// needs the GUI to itself (mac2's lock). exclusive scenarios run alone after the others. The test site is started if
+// it isn't already up.
 import { browsersFrom, connect, ensureSite, loadScenarios, parseArgs, parseTabs, pool, printTable, runJob, sweepLeaks } from './lib.mjs';
 
 const args = parseArgs(process.argv.slice(2), { browser: 'both', parallel: '2' });
 const browsers = browsersFrom(args.browser);
 let scenarios = await loadScenarios(args.only);
 if (args.local) scenarios = scenarios.filter(s => !s.real);
+if (!args.gui) scenarios = scenarios.filter(s => !s.gui);
 if (!scenarios.length) { console.error(`no scenarios match --only ${args.only}`); process.exit(2); }
 
 const stopSite = await ensureSite();
@@ -16,7 +19,8 @@ let exitCode = 0;
 try {
   const jobs = scenarios.flatMap(s => browsers.map(b => [s, b]));
   const started = Date.now();
-  const rows = await pool(jobs, Number(args.parallel), ([s, b]) => runJob(server, s, b));
+  const rows = await pool(jobs.filter(([s]) => !s.exclusive), Number(args.parallel), ([s, b]) => runJob(server, s, b));
+  for (const [s, b] of jobs.filter(([s]) => s.exclusive)) rows.push(await runJob(server, s, b));
   printTable(rows, `FowlBrowser e2e: ${browsers.join(' + ')}, parallel ${args.parallel}, ${((Date.now() - started) / 1000).toFixed(1)}s total`);
   if (rows.some(r => !r.ok)) exitCode = 1;
 

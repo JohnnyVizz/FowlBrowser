@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Takeover test</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  #box { height: 120px; overflow: auto; border: 1px solid #999; }
+  #box div { height: 400px; }
+  .chip { display: inline-block; padding: 8px 12px; border: 1px solid #999; margin: 4px; }
+  #menu { display: none; }
+  #hover:hover + #menu { display: block; }
+</style>
+<h1>Takeover test</h1>
+<button id="add" type="button">Add to cart</button>
+<label>Search <input id="search" type="text"></label>
+<label>Notes <textarea id="notes" rows="2"></textarea></label>
+<label>Size
+  <select id="size"><option value="s">Small</option><option value="m">Medium</option><option value="l">Large</option></select>
+</label>
+<label><input id="gift" type="checkbox"> Gift wrap</label>
+<p><span id="drag" class="chip" draggable="true">Drag me</span> <span id="drop" class="chip">Drop here</span></p>
+<p><span id="hover" class="chip">Hover me</span></p>
+<p id="menu">Menu shown</p>
+<div id="box"><div>Scroll inside me</div></div>
+<p><a id="next" href="takeover.html?next">Next page</a></p>
+<p id="result">ready</p>
+<div style="height: 1200px"></div>
+<script>
+  let clicks = 0;
+  document.getElementById('add').addEventListener('click', () => { document.getElementById('result').textContent = `added ${++clicks}`; });
+  const drop = document.getElementById('drop');
+  drop.addEventListener('dragover', (e) => e.preventDefault());
+  drop.addEventListener('drop', (e) => { e.preventDefault(); drop.textContent = 'Dropped'; });
+  // When the agent cursor's overlay came and went in this document (the scenario reads it after a resume).
+  window.cursorLog = [];
+  new MutationObserver((records) => {
+    for (const r of records) {
+      for (const n of r.addedNodes) if (n.localName === 'fowlbrowser-cursor') cursorLog.push(['added', Date.now()]);
+      for (const n of r.removedNodes) if (n.localName === 'fowlbrowser-cursor') cursorLog.push(['removed', Date.now()]);
+    }
+  }).observe(document.documentElement, { childList: true });
+</script>

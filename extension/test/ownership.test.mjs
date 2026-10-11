@@ -419,6 +419,7 @@ test('a replaced tab keeps its owner and the client hears about the swap', async
   assert.equal(core.owners.has(tab.id), false);
   assert.equal(core.owners.get(replacement.id).client, 1);
   assert.deepEqual(Object.keys(chrome.session.owners), [String(replacement.id)]);
+  assert.equal(sent[0].params[1].replacedBy, replacement.id, 'a swap, not a close');
   assert.deepEqual(sent.map((m) => [m.method, m.client, m.params[0]?.id ?? m.params[0]]), [
     ['chrome.tabs.onRemoved', 1, tab.id],
     ['chrome.tabs.onCreated', 1, replacement.id],
@@ -451,8 +452,13 @@ test('a debugger taken away by the user stays owned and re-attaches only on an e
   assert.ok(!(await call(1, 'tabs.claim', { tabId: tab.id })).error);
   assert.equal(createdEvents(), 3);
 
+  // target_closed while the tab still exists (a chrome:// page, a crash) detaches it too; for a closing tab it does not.
   await core.onDebuggerDetach({ tabId: tab.id }, 'target_closed');
-  assert.ok(!core.owners.get(tab.id).detached);
+  assert.equal(core.owners.get(tab.id).detached, true);
+  const { result: closing } = await call(1, 'tabs.open', {});
+  chrome.tabsById.delete(closing.id);
+  await core.onDebuggerDetach({ tabId: closing.id }, 'target_closed');
+  assert.ok(!core.owners.get(closing.id).detached);
 });
 
 test('CDP commands that reach beyond the tab are refused for every client', async () => {
@@ -892,20 +898,23 @@ test('a tab adopted from a claimed tab is handed back to the user, never closed,
   assert.ok(chrome.tabsById.has(gmail.id));
 });
 
-test('tabs.isShown: only an active tab in a normal, app or popup window that is not minimized, and only for its owner', async () => {
+test('tabs.isShown: only an active tab in a normal, app or popup window that is not minimized, and only for its owner; focused when that window has focus', async () => {
   const { chrome, call } = setup();
   const { result: tab } = await call(1, 'tabs.open', {});
-  assert.deepEqual((await call(1, 'tabs.isShown', { tabId: tab.id })).result, { shown: false }, 'background tab');
+  const shown = async () => (await call(1, 'tabs.isShown', { tabId: tab.id })).result;
+  assert.deepEqual(await shown(), { shown: false, focused: false }, 'background tab');
   chrome.tabsById.get(tab.id).active = true;
-  assert.deepEqual((await call(1, 'tabs.isShown', { tabId: tab.id })).result, { shown: true }, 'active tab');
-  chrome.hooks.windows = { 1: { state: 'minimized' } };
-  assert.deepEqual((await call(1, 'tabs.isShown', { tabId: tab.id })).result, { shown: false }, 'minimized window');
+  assert.deepEqual(await shown(), { shown: true, focused: false }, 'active tab, window without focus');
+  chrome.hooks.windows = { 1: { focused: true } };
+  assert.deepEqual(await shown(), { shown: true, focused: true }, 'active tab of the focused window');
+  chrome.hooks.windows = { 1: { state: 'minimized', focused: true } };
+  assert.deepEqual(await shown(), { shown: false, focused: false }, 'minimized window');
   chrome.hooks.windows = { 1: { type: 'popup' } };
-  assert.deepEqual((await call(1, 'tabs.isShown', { tabId: tab.id })).result, { shown: true }, 'popup window');
+  assert.equal((await shown()).shown, true, 'popup window');
   chrome.hooks.windows = { 1: { type: 'app' } };
-  assert.deepEqual((await call(1, 'tabs.isShown', { tabId: tab.id })).result, { shown: true }, 'app window');
-  chrome.hooks.windows = { 1: { type: 'devtools' } };
-  assert.deepEqual((await call(1, 'tabs.isShown', { tabId: tab.id })).result, { shown: false }, 'devtools window');
+  assert.equal((await shown()).shown, true, 'app window');
+  chrome.hooks.windows = { 1: { type: 'devtools', focused: true } };
+  assert.deepEqual(await shown(), { shown: false, focused: false }, 'devtools window');
   assert.match((await call(2, 'tabs.isShown', { tabId: tab.id })).error.message, /not owned by this client/);
 });
 
@@ -949,4 +958,101 @@ test('a tab the user opens from a tab already handed to them stays theirs', asyn
   await core.handleMessage({ method: 'host.clientDisconnected', params: { client: 1 } });
   await tick();
   assert.ok(chrome.tabsById.has(child.id) && chrome.tabsById.has(agentChild.id) && chrome.tabsById.has(kept.id));
+});
+
+test('tabs.park hands the tab to the user for now; tabs.claim resumes it as it was', async () => {
+  const { core, chrome, call, sent } = setup();
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://shop.example/checkout' });
+  await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3']);
+  const groupId = chrome.tabsById.get(tab.id).groupId;
+  assert.notEqual(groupId, -1);
+  sent.length = 0;
+  assert.match((await call(2, 'tabs.park', { tabId: tab.id, kind: 'handoff' })).error.message, /not owned/);
+  assert.deepEqual((await call(1, 'tabs.park', { tabId: tab.id, kind: 'handoff' })).result, { ok: true });
+
+  const parked = chrome.tabsById.get(tab.id);
+  assert.equal(parked.groupId, -1, 'out of the group');
+  assert.equal(parked.mutedInfo.muted, false, 'our mute ended');
+  assert.equal(parked.autoDiscardable, true);
+  assert.ok(chrome.calls.some((c) => c[0] === 'debugger.detach' && c[1] === tab.id));
+  assert.ok(!chrome.calls.some((c) => c[0] === 'tabs.update' && c[2].active), 'never focused');
+  const owner = core.owners.get(tab.id);
+  assert.deepEqual([owner.client, owner.kept, owner.handedOver, owner.detached, owner.parked.kind], [1, true, true, true, 'handoff']);
+  assert.deepEqual(sent.filter((m) => m.method), [{ method: 'chrome.debugger.onDetach', params: [{ tabId: tab.id }, 'parked'], client: 1 }]);
+  assert.equal((await call(1, 'tabs.listAll', {})).result.find((t) => t.id === tab.id).parked, 'handoff');
+  assert.match((await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error.message, /parked/, 'no re-attach while parked');
+
+  sent.length = 0;
+  assert.ok(!(await call(1, 'tabs.claim', { tabId: tab.id })).error);
+  const resumed = chrome.tabsById.get(tab.id);
+  assert.equal(resumed.groupId, groupId, 'back in its group');
+  assert.equal(resumed.mutedInfo.muted, true, 'muted again');
+  assert.equal(resumed.autoDiscardable, false);
+  assert.deepEqual([owner.parked, owner.kept, owner.handedOver], [undefined, false, false]);
+  assert.ok(sent.some((m) => m.method === 'chrome.tabs.onCreated' && m.params[0].id === tab.id), 'the claim re-attaches');
+  assert.equal((await call(1, 'tabs.listAll', {})).result.find((t) => t.id === tab.id).parked, null);
+  assert.ok(!(await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3'])).error);
+  assert.equal(owner.detached, undefined);
+});
+
+test('a parked claimed tab keeps the user\'s group and mute; a parked tab is handed over at disconnect, never closed', async () => {
+  const { core, chrome, call } = setup();
+  const gmail = chrome.addTab({ url: 'https://mail.example', groupId: 42, mutedInfo: { muted: true, reason: 'user' } });
+  await call(1, 'tabs.claim', { tabId: gmail.id });
+  await call(1, 'tabs.park', { tabId: gmail.id, kind: 'takeover' });
+  assert.equal(chrome.tabsById.get(gmail.id).groupId, 42);
+  assert.deepEqual(chrome.tabsById.get(gmail.id).mutedInfo, { muted: true, reason: 'user' });
+  await call(1, 'tabs.claim', { tabId: gmail.id });
+  assert.equal(chrome.tabsById.get(gmail.id).groupId, 42);
+  assert.deepEqual(chrome.tabsById.get(gmail.id).mutedInfo, { muted: true, reason: 'user' });
+
+  const { result: work } = await call(1, 'tabs.open', {});
+  await call(1, 'tabs.park', { tabId: work.id, kind: 'takeover' });
+  await core.handleMessage({ method: 'host.clientDisconnected', params: { client: 1 } });
+  await tick();
+  assert.ok(chrome.tabsById.has(work.id) && chrome.tabsById.has(gmail.id), 'both stay open');
+  assert.equal(core.owners.size, 0);
+});
+
+test('a parked tab can be released or closed by its owner, and resuming a tab now on a browser page fails and keeps it parked', async () => {
+  const { core, chrome, call } = setup();
+  const { result: a } = await call(1, 'tabs.open', {});
+  const { result: b } = await call(1, 'tabs.open', {});
+  const { result: c } = await call(1, 'tabs.open', {});
+  for (const t of [a, b, c]) await call(1, 'tabs.park', { tabId: t.id, kind: 'takeover' });
+  assert.ok(!(await call(1, 'tabs.release', { tabId: a.id })).error);
+  assert.ok(chrome.tabsById.has(a.id) && !core.owners.has(a.id));
+  assert.ok(!(await call(1, 'chrome.tabs.remove', [b.id])).error);
+  assert.ok(!chrome.tabsById.has(b.id));
+  chrome.tabsById.get(c.id).url = 'chrome://settings';
+  assert.match((await call(1, 'tabs.claim', { tabId: c.id })).error.message, /can't be controlled/);
+  assert.equal(core.owners.get(c.id).parked.kind, 'takeover');
+});
+
+test('tabs.committed goes to the owner for main-frame commits of its tabs only, never for parked ones', async () => {
+  const { core, chrome, call, sent } = setup();
+  const { result: tab } = await call(1, 'tabs.open', {});
+  const stranger = chrome.addTab({ url: 'https://user.example' });
+  sent.length = 0;
+  const commit = (tabId, frameId, transitionType = 'typed', transitionQualifiers = ['from_address_bar']) =>
+    core.onNavigationCommitted({ tabId, frameId, url: 'https://next.example/', transitionType, transitionQualifiers, timeStamp: 1 });
+  await commit(tab.id, 0);
+  await commit(tab.id, 7, 'auto_subframe', []);
+  await commit(stranger.id, 0);
+  assert.deepEqual(sent, [{ method: 'tabs.committed', params: { tabId: tab.id, url: 'https://next.example/', transitionType: 'typed', transitionQualifiers: ['from_address_bar'] }, client: 1 }]);
+  await call(1, 'tabs.park', { tabId: tab.id, kind: 'takeover' });
+  sent.length = 0;
+  await commit(tab.id, 0);
+  assert.deepEqual(sent, []);
+});
+
+test('tabs opened from a parked tab are the user\'s, even inside an expectChild window', async () => {
+  const { core, chrome, call } = setup();
+  const { result: opener } = await call(1, 'tabs.open', {});
+  await call(1, 'tabs.expectChild', { tabId: opener.id, ms: 3000 });
+  await call(1, 'tabs.park', { tabId: opener.id, kind: 'handoff' });
+  const child = chrome.addTab({ openerTabId: opener.id });
+  await core.onNavigationTarget({ sourceTabId: opener.id, tabId: child.id });
+  await tick();
+  assert.equal(core.owners.has(child.id), false);
 });

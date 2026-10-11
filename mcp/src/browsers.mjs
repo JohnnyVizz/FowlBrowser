@@ -8,6 +8,7 @@ import { watchClosedShadow } from './closedShadow.mjs';
 import { prepare as prepareCursor } from './cursor/index.mjs';
 import { HostClient, listSockets } from './hostClient.mjs';
 import { downloadDone, record } from './record.mjs';
+import { Activity, watchTakeovers, watchUserInput } from './takeover.mjs';
 import { CDPRelay } from './vendor/cdpRelay.mjs';
 
 export const LABEL = process.env.FOWLBROWSER_LABEL || 'Claude';
@@ -47,6 +48,7 @@ export class Tab extends EventEmitter {
     this.frameGeneration = 0; // bumped when any iframe navigates (its refs from before are void; snapshots.mjs numberRefs)
     this._queue = Promise.resolve();
     this._calls = 0; // run() calls not yet settled
+    this.activity = new Activity(); // when calls ran on the tab: input in the page then is the agent's (takeover.mjs)
     this._busy = null;
     page.setDefaultTimeout(ACTION_TIMEOUT_MS);
     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
@@ -74,7 +76,8 @@ export class Tab extends EventEmitter {
   // right before each call starts, so work that resumes after its dialog is answered still holds the tab.
   run(fn) {
     this._calls++;
-    const result = this._queue.then(() => this._idle()).then(fn).finally(() => { this._calls--; });
+    const acted = this.activity.begin();
+    const result = this._queue.then(() => this._idle()).then(fn).finally(() => { this._calls--; acted(); });
     this._queue = result.catch(() => {});
     return result;
   }
@@ -126,6 +129,7 @@ export class Browser {
     this.chromiumVersion = hello.extension?.userAgent?.match(/Chrome\/(\S+)/)?.[1] ?? null;
     this.tabs = new Map(); // chrome tab id -> Tab
     this.relay = new CDPRelay((method, params) => host.request(method, params), hello.extension?.userAgent);
+    watchTakeovers(this); // first: it reads which tabs the relay knows before the relay handles the event
     host.on('event', (method, params) => {
       this.relay.handleExtensionEvent(method, params);
       if (method === 'chrome.debugger.onEvent') this._onDebuggerEvent(params);
@@ -212,6 +216,7 @@ export class Browser {
       // The attachShadow hook goes only into agent tabs; the user's claimed tabs get a scan per document instead.
       const info = (await this.host.request('tabs.listAll', {}).catch(() => [])).find((t) => t.id === tabId);
       await watchClosedShadow(tab, info?.origin === 'agent').catch(() => {});
+      await watchUserInput(tab).catch(() => {});
       if (page.isClosed()) return null;
       this.tabs.set(tabId, tab);
       prepareCursor(tab);

@@ -73,7 +73,14 @@ const call = async (name, args = {}) => (await client.callTool({ name, arguments
 test('lists the spec tools', async () => {
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name);
-  for (const name of ['browser_list', 'tab_list', 'tab_open', 'tab_claim', 'tab_mute', 'snapshot', 'click', 'media', 'network']) assert.ok(names.includes(name), name);
+  for (const name of ['browser_list', 'tab_list', 'tab_open', 'tab_claim', 'tab_handoff', 'tab_mute', 'snapshot', 'click', 'media', 'network']) assert.ok(names.includes(name), name);
+  assert.ok(tools.find((t) => t.name === 'tab_claim').inputSchema.properties.resume, 'tab_claim takes resume');
+});
+
+test('the instructions say what to do after a takeover and when to hand a tab over', () => {
+  const instructions = client.getInstructions();
+  assert.match(instructions, /user took over a tab, stop working in it, tell the user where you got to and ask before going on; tab_claim it with resume: true only after they said so/);
+  assert.match(instructions, /logins, codes, CAPTCHAs, payment\), use tab_handoff and repeat its line/);
 });
 
 test('authenticates and says hello with the label', async () => {
