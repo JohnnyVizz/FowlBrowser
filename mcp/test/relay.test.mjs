@@ -17,6 +17,9 @@ const relay = new CDPRelay(async (method, params) => {
   if (method === 'chrome.debugger.sendCommand') commands.push(params[1]);
   if (method === 'chrome.debugger.attach' && holdAttach) await new Promise((resolve) => { releaseAttach = resolve; });
   if (method === 'chrome.debugger.sendCommand' && params[1] === 'Target.getTargetInfo') return { targetInfo: { targetId: 'T5', type: 'page' } };
+  if (method === 'chrome.debugger.sendCommand' && params[1] === 'Page.getLayoutMetrics') {
+    return { contentSize: { x: 0, y: 0, width: 780, height: 3000 }, cssContentSize: { x: 0, y: 0, width: 390, height: 1500 }, visualViewport: { pageX: 0, pageY: 0, scale: 0.4 } };
+  }
   return {};
 }, UA);
 const url = await relay.start();
@@ -108,6 +111,26 @@ test('page emulation is answered by the relay, focus emulation goes through', as
   for (let i = 0; i < swallowed.length; i++) assert.deepEqual((await reply(conn, 10 + i)).result, {});
   await reply(conn, 20);
   assert.deepEqual(commands, ['Emulation.setFocusEmulationEnabled']);
+  conn.ws.close();
+  await closed(conn.ws);
+});
+
+test('under a viewport override, Playwright reads its devicePixelRatio and page scale 1 from the layout metrics', async () => {
+  const conn = await open();
+  conn.ws.send(JSON.stringify({ id: 1, method: 'Target.setAutoAttach', params: { autoAttach: true } }));
+  await reply(conn, 1);
+  const sessionId = conn.messages.find((m) => m.method === 'Target.attachedToTarget').params.sessionId;
+  const metrics = async (id) => {
+    conn.ws.send(JSON.stringify({ id, sessionId, method: 'Page.getLayoutMetrics', params: {} }));
+    const { contentSize, cssContentSize, visualViewport } = (await reply(conn, id)).result;
+    return [contentSize.width / cssContentSize.width, visualViewport.scale];
+  };
+  assert.deepEqual(await metrics(2), [2, 0.4], 'the screen\'s own scale and the page scale without an override');
+  relay.viewports.set(relay.model.tabIdForSession(sessionId), { deviceScaleFactor: 3 });
+  assert.deepEqual(await metrics(3), [3, 1]);
+  relay.viewports.set(relay.model.tabIdForSession(sessionId), { deviceScaleFactor: null });
+  assert.deepEqual(await metrics(4), [2, 1], 'the real devicePixelRatio stays');
+  relay.viewports.clear();
   conn.ws.close();
   await closed(conn.ws);
 });

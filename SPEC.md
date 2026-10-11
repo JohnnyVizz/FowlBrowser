@@ -257,6 +257,8 @@ to give a window back the tab that was active before an agent popup took its pla
   height (80% each, like page scrolls); with no such box, the mouse wheel over the ref; ref alone: into view), `drag {tab, from_ref, to_ref}`, `upload_files {tab, ref, paths}`,
   `dialog {tab, accept, text?}`, `wait_for {tab, text? | text_gone? | url? | seconds?}`,
   `screenshot {tab, full_page?, ref?}` (JPEG q80, CSS-pixel scale so image px == click px),
+  `viewport {tab, width, height, mobile?, device_scale_factor?} | {tab, reset:true}` (raw CDP metrics override, see Viewport
+  below; a user's tab gets a warning that they see it resized),
   `evaluate {tab, function | expression, ref?}` (the source is evaluated as an expression and called, with the element for a ref, if it is a function, so plain expressions work too), `media {tab, action: status|play|pause|toggle|seek|volume|rate|mute|unmute, value?, ref?}`
   (first visible video/audio, or the ref; if play() is refused for lack of a user gesture, click the media element
   and retry; inside YouTube's `#movie_player` it uses the player's own mute/unMute/setVolume/seekTo/playVideo/
@@ -404,6 +406,22 @@ agent tabs; on a claimed tab it works with a warning that the user sees it resiz
 before release, handoff and turn end while the debugger is still attached; a detach (takeover, Cancel, release,
 session end) clears it in Chrome too (`EmulationHandler::Disable`). The override is not re-applied after a resume.
 Screenshots, snapshots, click coordinates and the cursor all work in the emulated CSS px.
+Implemented in `mcp/src/viewport.mjs` (`setViewport`, `clearViewport(tab, reason)`); the override is `tab.viewport`.
+Record mode journals `{type:"viewport", event:"set"|"clear", tab, width, height, mobile, reason}` (reason: tool,
+release, turn end, handoff). Refinements found on Chrome 154 and Helium:
+- Playwright's CSS-px screenshots take the screen's scale from `Page.getLayoutMetrics` (`contentSize / cssContentSize`),
+  which stays the real screen's under an override with another `deviceScaleFactor` (DPR 3 on a 2x screen gave 1.5x
+  images), and clip the viewport with `innerWidth` divided by the page scale. So for a tab with an override the relay
+  answers Playwright's `Page.getLayoutMetrics` with `contentSize = cssContentSize * deviceScaleFactor` (when one was
+  given) and `visualViewport.scale = 1` (`relay.viewports`, set by viewport.mjs, dropped on clear and forget).
+- `mobile` on a page without a viewport meta lays out at 980 px and zooms out (page scale about 0.4 at 390 wide).
+  Clicks by ref and `click x,y` both use layout CSS px there, so the screenshot is in layout px too: 980 px wide,
+  the whole zoomed-out page the phone shows. The cursor overlay undoes the page scale (`scale(1 / visualViewport.scale)`
+  on the pointer, its label and the click ring), so it keeps its usual size on screen.
+- Touch emulation reaches the page after the resize event: a page reading `(pointer: coarse)` in its resize handler
+  still sees the old value.
+- Verified (viewport e2e, both browsers): a detach with no explicit clear (session end while a claimed tab was resized
+  to 500x700) gives the page its real width back, and a fresh claim reads it.
 
 ### Safety instructions
 The server instructions ask the agent to check with the user before sending messages or email, posting, buying or

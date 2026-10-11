@@ -39,7 +39,7 @@ async function fakeBrowser({ ids = [1], seen = { shown: true, focused: true }, l
   const known = new Set(ids);
   const browser = {
     key: `chrome-t${++browsers}`, name: 'Chrome', host, tabs: new Map(), requests,
-    relay: { model: { hasTab: (id) => known.has(id), isAttached: () => true, onTabCreated() {} } },
+    relay: { viewports: new Map(), model: { hasTab: (id) => known.has(id), isAttached: () => true, onTabCreated() {} } },
     async playwright() {}, async waitForTab(id) { return this.tabs.get(id); }, forget(id) { known.delete(id); this.tabs.delete(id); },
   };
   watchTakeovers(browser);
@@ -237,6 +237,7 @@ test('tab_handoff parks the tab and returns the line for the user; calls on it g
   const browser = await fakeBrowser({ ids: [1] });
   const call = toolsFor(browser);
   const id = `${browser.key}:1`;
+  browser.tabs.get(1).viewport = { width: 390, height: 844, mobile: false }; // a phone-size override the user must not inherit
   const handed = await call('tab_handoff', { tab: id, reason: 'enter the card details' });
   assert.equal(handed.error, false);
   assert.match(handed.text, /Your turn in Chrome tab "Checkout": enter the card details, then tell me\./);

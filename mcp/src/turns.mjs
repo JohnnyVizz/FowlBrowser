@@ -7,6 +7,7 @@ import * as cursor from './cursor/index.mjs';
 import { uninstallPopups } from './popups.mjs';
 import { record, tabEvent } from './record.mjs';
 import { markEnding } from './takeover.mjs';
+import { clearViewport } from './viewport.mjs';
 
 export const turnSocketPath = (pid = process.ppid) => `/tmp/fowlbrowser-turn-${pid}.sock`;
 
@@ -50,6 +51,7 @@ export async function endTurn(manager) {
         if (!same()) return false;
         tab.ending = true; // its page closing now is ours, not "found gone" (record mode)
         markEnding(id); // nor the user closing it
+        await clearViewport(tab, 'turn end').catch(() => {});
         await cursor.remove(tab, { wait: !close });
         if (close) await browser.host.request('chrome.tabs.remove', [info.id]);
         else {
@@ -94,7 +96,16 @@ export function listenForTurns(manager, socketPath = turnSocketPath()) {
     });
   });
   let inode = null; // a second server with the same parent may take the path over; only ours is removed
-  server.listen(socketPath, () => { inode = fs.statSync(socketPath).ino; });
+  const listen = () => server.listen(socketPath, () => { inode = fs.statSync(socketPath).ino; });
+  // Two servers started at once by the same parent race for the path: the later one takes it over (once), as above.
+  let retried = false;
+  server.on('error', (error) => {
+    if (error.code !== 'EADDRINUSE' || retried) return;
+    retried = true;
+    fs.rmSync(socketPath, { force: true });
+    listen();
+  });
+  listen();
   server.unref();
   process.on('exit', () => {
     try { if (fs.statSync(socketPath).ino === inode) fs.rmSync(socketPath); } catch {}

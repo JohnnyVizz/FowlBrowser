@@ -153,6 +153,10 @@ export class BrowserModel {
     return this._findTabSession(s => s.targetInfo?.targetId === targetId)?.tabId;
   }
 
+  tabIdForSession(sessionId) {
+    return this._findTabSession(s => s.sessionId === sessionId)?.tabId;
+  }
+
   // Browser-level commands (Storage.*, Browser.*) need a target for chrome.debugger, so route through any
   // attached tab; the command is browser-scoped and returns the same result regardless of the tab.
   async sendBrowserCommand(method, params) {

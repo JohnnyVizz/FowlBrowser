@@ -215,6 +215,8 @@
     return { w: el?.clientWidth || innerWidth, h: el?.clientHeight || innerHeight };
   }
 
+  const zoom = () => 1 / (globalThis.visualViewport?.scale || 1);
+
   // A point inside the viewport: an element taller than it, or not scrolled into view, still gets a visible cursor.
   function inside(point) {
     const { w, h } = viewport();
@@ -224,12 +226,14 @@
   function render() {
     last = { x: pos.x, y: pos.y };
     if (!parts) return;
-    parts.cursor.style.transform = `translate3d(${pos.x}px, ${pos.y}px, 0)`;
+    // A page zoomed out (a mobile viewport without a viewport meta) would shrink the cursor with it: undo the page scale.
+    const k = zoom();
+    parts.cursor.style.transform = `translate3d(${pos.x}px, ${pos.y}px, 0)${k === 1 ? '' : ` scale(${k})`}`;
     parts.art.style.transform = rot ? `rotate(${rot}rad)` : '';
     // The label sits below and to the right of the pointer, kept inside the viewport.
     const { w, h } = viewport();
-    const bx = Math.min(BADGE.x, w - 2 - badgeWidth - pos.x);
-    const by = Math.min(BADGE.y, h - 19 - pos.y);
+    const bx = Math.min(BADGE.x, (w - 2 - pos.x) / k - badgeWidth);
+    const by = Math.min(BADGE.y, (h - pos.y) / k - 19);
     parts.badge.style.transform = `translate(${bx}px, ${by}px)`;
   }
 
@@ -543,7 +547,7 @@
     ], { duration: 220 });
     const circle = svgNode('circle', { cx: 0, cy: 0, r: 5, fill: 'none', stroke: rgb(parts.fill), 'stroke-width': 2.4 });
     const ring = svgNode('svg', { width: 1, height: 1 }, [circle]);
-    ring.style.transform = `translate(${pos.x}px, ${pos.y}px)`;
+    ring.style.transform = `translate(${pos.x}px, ${pos.y}px) scale(${zoom()})`;
     parts.fx.appendChild(ring);
     circle.animate([{ r: '5px' }, { r: '22px' }], { duration: 420, easing: 'cubic-bezier(0.33, 1, 0.68, 1)', fill: 'forwards' });
     circle.animate([{ strokeWidth: '2.4px', opacity: 0.85 }, { strokeWidth: '0.6px', opacity: 0 }], { duration: 420, fill: 'forwards' })

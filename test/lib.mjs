@@ -33,18 +33,22 @@ export const browsersFrom = arg => (arg === 'both' ? BROWSERS : [arg]);
 
 export class ToolError extends Error {}
 
-// ownTurns: the server runs under its own sh, which stays its parent (the trailing ':' keeps sh from exec'ing it), so
-// server.endTurn() can end this server's turn alone. Never end the shared e2e server's turn: it closes every job's tabs.
-export async function connect(label, { ownTurns = false } = {}) {
-  const command = process.env.FOWLBROWSER_MCP || `${ROOT}mcp/bin/fowlbrowser-mcp`;
+export const MCP_BIN = process.env.FOWLBROWSER_MCP || `${ROOT}mcp/bin/fowlbrowser-mcp`;
+
+// env: extra variables for this server, e.g. FOWLBROWSER_RECORD for a scenario that runs its own recording server.
+// command and args start it another way. ownTurns: the server runs under its own sh, which stays its parent (the
+// trailing ':' keeps sh from exec'ing it), so server.endTurn() can end this server's turn alone. Never end the shared
+// e2e server's turn: it closes every job's tabs.
+export async function connect(label, { ownTurns = false, env = {}, command = MCP_BIN, args = [] } = {}) {
+  if (ownTurns) [command, args] = ['/bin/sh', ['-c', `'${command}'; :`]];
   const transport = new StdioClientTransport({
-    ...(ownTurns ? { command: '/bin/sh', args: ['-c', `'${command}'; :`] } : { command, args: [] }), stderr: 'pipe',
-    env: { ...process.env, FOWLBROWSER_LABEL: label },
+    command, args, stderr: 'pipe',
+    env: { ...process.env, FOWLBROWSER_LABEL: label, ...env },
   });
   let stderr = '';
   transport.stderr?.on('data', d => { stderr = (stderr + d).slice(-20000); });
   const client = new Client({ name: 'fowlbrowser-e2e', version: '0.1.0' });
-  await client.connect(transport);
+  await client.connect(transport).catch(e => { throw new Error(`${e.message}; server stderr: ${stderr.slice(-1500)}`); });
   const server = {
     // opened: tabs a running job holds now; everOpened: every tab any job of this server tracked.
     label, client, opened: new Set(), everOpened: new Set(), pendingOpens: 0,

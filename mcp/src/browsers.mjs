@@ -168,6 +168,7 @@ export class Browser {
   // The tab is no longer ours (released or closed) even if the extension's event never came.
   forget(tabId) {
     this.relay.model.forgetTab(tabId);
+    this.relay.viewports.delete(tabId);
     this.tabs.delete(tabId);
   }
 
@@ -222,6 +223,7 @@ export class Browser {
       if (info?.origin === 'agent' && !info.handedOver && !info.kept && !info.parked) await installPopups(tab).catch((e) => debug('popups: install failed', e.message));
       await watchUserInput(tab).catch(() => {});
       if (page.isClosed()) return null;
+      this.relay.viewports.delete(tabId); // a new Tab has no viewport override (a detach ended any earlier one)
       this.tabs.set(tabId, tab);
       prepareCursor(tab);
       for (const resolve of this._waiters.get(tabId) ?? []) resolve(tab);

@@ -9,6 +9,7 @@ import * as cursor from './cursor/index.mjs';
 import { debug } from './debug.mjs';
 import { uninstallPopups } from './popups.mjs';
 import { tabEvent } from './record.mjs';
+import { clearViewport } from './viewport.mjs';
 
 const BEFORE_MS = 50; // an agent window starts this much before its command was sent (clock skew)
 const AFTER_MS = 250; // and ends this much after its reply (the page's own handlers, timers)
@@ -192,6 +193,7 @@ export async function takeOver(browser, tabId, how, { tab = browser.tabs.get(tab
   if (tab && !detached && !gone) {
     await cursor.remove(tab, { wait: true });
     await uninstallPopups(tab); // the user's own popups open natively again (after a detach they do from the next page on)
+    await clearViewport(tab, 'takeover').catch(() => {});
   }
   if (!gone) await browser.host.request('tabs.park', { tabId, kind: 'takeover' }).catch((error) => debug('park failed', key, error.message));
   tabEvent('takeover', key, url, { how });
@@ -204,7 +206,7 @@ export async function handOff(tab, reason) {
   try {
     await cursor.remove(tab, { wait: true });
     await uninstallPopups(tab);
-    await cdp(tab, 'Emulation.clearDeviceMetricsOverride').catch(() => {});
+    await clearViewport(tab, 'handoff').catch(() => {});
     await tab.browser.host.request('tabs.park', { tabId: tab.tabId, kind: 'handoff' });
   } catch (error) {
     records.delete(key);
