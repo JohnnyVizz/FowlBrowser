@@ -1,0 +1,44 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Shadow DOM</title>
+<link rel="stylesheet" href="style.css">
+<h1>Shadow DOM</h1>
+<div id="open-host"></div>
+<div id="closed-host"></div>
+<div id="slot-host">Slotted save</div>
+<button id="cover">Cover the page</button>
+<div id="result" role="status" aria-label="Result">{}</div>
+<script>
+  const state = {};
+  function build(host, mode, label) {
+    const root = host.attachShadow({ mode });
+    root.innerHTML = `
+      <fieldset><legend>${label}</legend>
+        <label>${label} input <input type="text"></label>
+        <button>${label} save</button>
+      </fieldset>`;
+    root.querySelector('button').addEventListener('click', () => {
+      state[mode] = root.querySelector('input').value;
+      document.getElementById('result').textContent = JSON.stringify(state);
+    });
+  }
+  build(document.getElementById('open-host'), 'open', 'Open shadow');
+  build(document.getElementById('closed-host'), 'closed', 'Closed shadow');
+  // A closed root whose button shows the host's own text through a slot.
+  const slotRoot = document.getElementById('slot-host').attachShadow({ mode: 'closed' });
+  slotRoot.innerHTML = '<button style="padding: 8px 24px"><slot></slot></button>';
+  slotRoot.querySelector('button').addEventListener('click', () => {
+    state.slotted = 'clicked';
+    document.getElementById('result').textContent = JSON.stringify(state);
+  });
+  // An overlay over the whole page until its own button closes it.
+  document.getElementById('cover').onclick = () => {
+    const cover = document.createElement('div');
+    cover.style = 'position: fixed; inset: 0; background: rgba(0, 0, 0, .3)';
+    const close = document.createElement('button');
+    close.textContent = 'Close cover';
+    close.onclick = () => cover.remove();
+    cover.append(close);
+    document.body.append(cover);
+  };
+</script>

@@ -1,0 +1,8 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Shadow frame</title>
+<div id="frame-host"></div>
+<script>
+  const root = document.getElementById('frame-host').attachShadow({ mode: 'closed' });
+  root.innerHTML = '<button>Frame shadow save</button>';
+</script>

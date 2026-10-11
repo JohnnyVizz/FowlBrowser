@@ -1,0 +1,5 @@
+body { font: 15px/1.5 -apple-system, system-ui, sans-serif; margin: 24px; color: #111; background: #fff; }
+label { display: block; margin: 8px 0; }
+fieldset { margin: 12px 0; }
+#result { margin-top: 16px; padding: 8px; border: 1px solid #ccc; min-height: 1.5em; white-space: pre-wrap; }
+button { margin: 4px 4px 4px 0; }

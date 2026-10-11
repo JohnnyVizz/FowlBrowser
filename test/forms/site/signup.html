@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Create your account · Pixelwharf</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  .select { position: relative; }
+  .select .face { border: 1px solid #c7c7cc; border-radius: 8px; padding: 10px 12px; cursor: pointer; display: flex; justify-content: space-between; }
+  .select .face.placeholder { color: #8e8e93; }
+  .select .menu { position: absolute; z-index: 5; top: 100%; left: 0; right: 0; margin-top: 4px; background: #fff; border: 1px solid #d1d1d6; border-radius: 10px; box-shadow: 0 10px 28px rgba(0,0,0,.12); padding: 4px; }
+  .select .item { padding: 9px 10px; border-radius: 7px; cursor: pointer; }
+  .select .item:hover { background: #eef3ff; }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; border: 1px solid #c7c7cc; border-radius: 8px; padding: 6px; }
+  .tags .chip { display: inline-flex; align-items: center; gap: 4px; background: #eef3ff; color: #0a3d99; border-radius: 999px; padding: 3px 4px 3px 10px; font-size: 13px; }
+  .tags .chip button { border: 0; background: none; color: inherit; width: 20px; height: 20px; border-radius: 50%; }
+  .tags input { border: 0; flex: 1; min-width: 140px; padding: 6px; font: inherit; }
+  .tags input:focus { outline: none; }
+  .editor { border: 1px solid #c7c7cc; border-radius: 8px; }
+  .editor .toolbar { display: flex; gap: 4px; padding: 6px; border-bottom: 1px solid #e5e5ea; }
+  .editor .toolbar button { border: 0; background: #f2f2f7; border-radius: 6px; width: 30px; height: 28px; }
+  .editor [contenteditable] { min-height: 90px; padding: 10px 12px; }
+  .rules { list-style: none; padding: 0; margin: 8px 0 0; font-size: 13px; color: #6e6e73; }
+  .rules li::before { content: "○ "; }
+  .rules li.met { color: #1b6e2a; }
+  .rules li.met::before { content: "✓ "; }
+  .terms { height: 150px; overflow-y: auto; border: 1px solid #e5e5ea; border-radius: 8px; padding: 10px 14px; font-size: 13px; color: #3a3a3c; background: #fafafa; }
+  .hp { position: absolute; left: -10000px; top: auto; width: 1px; height: 1px; overflow: hidden; }
+  .check { display: flex; gap: 8px; align-items: center; }
+</style>
+<header class="site"><span class="brand">Pixelwharf</span><nav><span>Showcase</span><span>Jobs</span><span>Sign in</span></nav></header>
+<main>
+  <h1>Create your account</h1>
+  <p class="lead">Join the community of designers and engineers.</p>
+  <form id="form" novalidate>
+    <section class="card">
+      <div class="field" data-field="reference"><label for="reference">Reference code</label><input type="text" id="reference" autocomplete="off"></div>
+      <div class="row">
+        <div class="field" data-field="fullName"><label for="fullName">Full name</label><input type="text" id="fullName" autocomplete="off"></div>
+        <div class="field" data-field="email"><label for="email">Email</label><input type="email" id="email" autocomplete="off"></div>
+      </div>
+      <div class="field" data-field="username"><label id="username-label">Username</label>
+        <div class="fake-input" id="username-fake" tabindex="0" style="color:#8e8e93;cursor:text">Choose a username</div></div>
+      <div class="hp" aria-label="Website field"><label for="website">Website</label><input type="text" id="website" tabindex="-1" autocomplete="off"></div>
+      <div class="row">
+        <div class="field" data-field="password"><label for="password">Password</label><input type="password" id="password" autocomplete="new-password">
+          <ul class="rules" id="rules"><li data-rule="len">At least 12 characters</li><li data-rule="upper">An uppercase letter</li><li data-rule="lower">A lowercase letter</li><li data-rule="digit">A number</li><li data-rule="symbol">A symbol</li></ul></div>
+        <div class="field" data-field="confirm"><label for="confirm">Confirm password</label><input type="password" id="confirm" autocomplete="new-password"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2 style="margin-top:0">Profile</h2>
+      <div class="field" data-field="role"><span class="label">Role</span>
+        <div class="select" id="role"><div class="face placeholder" id="role-face"><span id="role-text">Select your role</span><span>▾</span></div></div></div>
+      <div class="field" data-field="tags"><label for="tag-input">Skills</label>
+        <div class="tags" id="tags"><input type="text" id="tag-input" autocomplete="off" placeholder="Type a skill and press Enter"></div>
+        <p class="hint">Press Enter after each skill. Backspace removes the last one.</p></div>
+      <div class="field" data-field="bio"><span class="label" id="bio-label">Bio</span>
+        <div class="editor"><div class="toolbar"><button type="button" data-cmd="bold" aria-label="Bold"><b>B</b></button><button type="button" data-cmd="italic" aria-label="Italic"><i>I</i></button></div>
+          <div id="bio" contenteditable="true" role="textbox" aria-multiline="true" aria-labelledby="bio-label"></div></div></div>
+    </section>
+
+    <section class="card">
+      <h2 style="margin-top:0">Terms</h2>
+      <div class="terms" id="terms" tabindex="0" aria-label="Terms of service">
+        <p><strong>Pixelwharf Terms of Service.</strong> These terms govern your use of Pixelwharf. By creating an account you agree to them.</p>
+        <p>1. Your account. You are responsible for keeping your password safe and for everything that happens under your account. Tell us at once if you think someone else is using it.</p>
+        <p>2. Your content. You own what you post. You give us a licence to host and show it so the service works. You can delete it at any time.</p>
+        <p>3. Acceptable use. Do not post anything illegal, harmful or that you do not have the right to share. Do not try to break or overload the service.</p>
+        <p>4. Fees. The basic plan is free. Paid plans are billed in advance and can be cancelled at any time; the plan stays active until the end of the period.</p>
+        <p>5. Privacy. We collect only what we need to run the service. See the privacy policy for the details of what we store and for how long.</p>
+        <p>6. Changes. We may update these terms. We will tell you by email at least 30 days before a change takes effect.</p>
+        <p>7. Ending. You can close your account at any time. We may suspend accounts that break these terms.</p>
+        <p>8. Liability. The service is provided as is. To the extent the law allows, we are not liable for indirect losses.</p>
+        <p id="terms-end">End of terms. Thanks for reading all the way down.</p>
+      </div>
+      <div class="field" data-field="agree" style="margin-top:14px">
+        <label class="check"><input type="checkbox" id="agree" disabled> I agree to the terms of service</label>
+        <p class="hint" id="agree-hint">Scroll to the end of the terms to agree.</p>
+      </div>
+    </section>
+    <div class="actions"><button type="submit" class="btn primary">Create account</button></div>
+  </form>
+</main>
+<script type="module">
+import { showErrors, emailOk, submit } from '/common.js';
+const $ = (s) => document.querySelector(s);
+
+// Username: a placeholder box that becomes the real input on first click or focus.
+function swapUsername() {
+  const fake = $('#username-fake'); if (!fake) return;
+  const input = Object.assign(document.createElement('input'), { type: 'text', id: 'username', autocomplete: 'off' });
+  input.setAttribute('aria-labelledby', 'username-label');
+  fake.replaceWith(input); input.focus();
+}
+$('#username-fake').addEventListener('mousedown', (e) => { e.preventDefault(); swapUsername(); });
+$('#username-fake').addEventListener('focus', swapUsername);
+
+// Password rules
+const rules = { len: (v) => v.length >= 12, upper: (v) => /[A-Z]/.test(v), lower: (v) => /[a-z]/.test(v), digit: (v) => /\d/.test(v), symbol: (v) => /[^A-Za-z0-9]/.test(v) };
+$('#password').addEventListener('input', () => {
+  for (const li of $('#rules').children) li.classList.toggle('met', rules[li.dataset.rule]($('#password').value));
+});
+
+// Role: a dropdown made of plain divs (no ARIA), closes on any outside click.
+const roles = ['Product designer', 'Motion designer', 'Frontend engineer', 'Backend engineer', 'Product manager', 'Researcher', 'Founder', 'Student'];
+let role = '';
+$('#role-face').addEventListener('click', () => {
+  if ($('#role .menu')) return $('#role .menu').remove();
+  const menu = document.createElement('div'); menu.className = 'menu';
+  for (const r of roles) {
+    const item = document.createElement('div'); item.className = 'item'; item.textContent = r;
+    item.onclick = () => { role = r; $('#role-text').textContent = r; $('#role-face').classList.remove('placeholder'); menu.remove(); };
+    menu.append(item);
+  }
+  $('#role').append(menu);
+});
+document.addEventListener('click', (e) => { if (!e.target.closest('#role')) $('#role .menu')?.remove(); });
+
+// Tags
+const tags = [];
+function renderTags() {
+  $('#tags').querySelectorAll('.chip').forEach((c) => c.remove());
+  for (const t of tags) {
+    const chip = document.createElement('span'); chip.className = 'chip'; chip.textContent = t;
+    const x = document.createElement('button'); x.type = 'button'; x.textContent = '×'; x.setAttribute('aria-label', `Remove ${t}`);
+    x.onclick = () => { tags.splice(tags.indexOf(t), 1); renderTags(); };
+    chip.append(x); $('#tag-input').before(chip);
+  }
+}
+$('#tag-input').addEventListener('keydown', (e) => {
+  const input = e.target;
+  if ((e.key === 'Enter' || e.key === ',') && input.value.trim()) {
+    e.preventDefault();
+    const t = input.value.trim().replace(/,$/, '');
+    if (!tags.includes(t)) tags.push(t);
+    input.value = ''; renderTags();
+  } else if (e.key === 'Enter') e.preventDefault();
+  else if (e.key === 'Backspace' && !input.value && tags.length) { tags.pop(); renderTags(); }
+});
+
+// Rich text
+document.querySelectorAll('[data-cmd]').forEach((b) => b.onmousedown = (e) => { e.preventDefault(); document.execCommand(b.dataset.cmd); });
+
+// Terms: the checkbox unlocks once the terms are scrolled to their end.
+$('#terms').addEventListener('scroll', () => {
+  const t = $('#terms');
+  if (t.scrollTop + t.clientHeight >= t.scrollHeight - 4) { $('#agree').disabled = false; $('#agree-hint').textContent = 'Thanks for reading the terms.'; }
+});
+
+$('#form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const e = {}; const pw = $('#password').value;
+  const username = $('#username')?.value.trim() || '';
+  if (!$('#reference').value.trim()) e.reference = 'Enter your reference code.';
+  if (!$('#fullName').value.trim()) e.fullName = 'Enter your full name.';
+  if (!emailOk($('#email').value.trim())) e.email = 'Enter a valid email address.';
+  if (!/^[a-z0-9_]{3,20}$/.test(username)) e.username = 'Usernames are 3–20 lowercase letters, numbers or underscores.';
+  if (!Object.values(rules).every((r) => r(pw))) e.password = 'Your password does not meet every rule.';
+  if ($('#confirm').value !== pw) e.confirm = 'The passwords do not match.';
+  if (!role) e.role = 'Select your role.';
+  if (!tags.length) e.tags = 'Add at least one skill.';
+  const bio = $('#bio').innerText.trim().replace(/\s+/g, ' ');
+  if (bio.length < 10) e.bio = 'Write a short bio (10 characters or more).';
+  if (!$('#agree').checked) e.agree = 'You need to agree to the terms.';
+  if (!showErrors(e)) return;
+  await submit('signup', {
+    reference: $('#reference').value.trim(), fullName: $('#fullName').value.trim(), email: $('#email').value.trim(),
+    username, password: pw, role, tags: [...tags], bio, agree: $('#agree').checked, website: $('#website').value,
+  });
+});
+</script>
+</html>

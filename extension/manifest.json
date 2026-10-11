@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "FowlBrowser",
+  "short_name": "FowlBrowser",
+  "description": "Lets your Claude agents use this browser in the background.",
+  "version": "0.1.0",
+  "minimum_chrome_version": "125",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA247iwzOzrX2yukvog29uEx/frQjTv1wIAHq8qUfLvgwfcVDFwxVNkcMhcyq/ivKcV4Qcc8Ocd/vcU/H0UbcCCByWhcoVO4vmPA1J3Lqo1jVQIlApHmp9dR8CwJKXQirzJoaLykCmtIHSft92qjPQneE1p9GISAYVEYWzoHIokcPyoXEFvstljvpmvOSsSnKHas+UCalLwQrUNTf6ov2f2Th5WLY6cKeD0957SGkhRCMUBwzT/yDoREd8jkI7gCme+ssb0OmFKgHO8CaMx/qlfNStMBr1+ANp7PFdqn+BhD4SV5RSYQL4pMhDjKjUVf6yQqzxp9qVsCaZo/UvoKBEYwIDAQAB",
+  "background": { "service_worker": "background.js", "type": "module" },
+  "permissions": ["debugger", "tabs", "tabGroups", "nativeMessaging", "storage", "alarms", "webNavigation", "downloads", "history", "bookmarks", "sessions", "topSites"],
+  "icons": { "16": "icons/icon-16.png", "32": "icons/icon-32.png", "48": "icons/icon-48.png", "128": "icons/icon-128.png" },
+  "action": { "default_title": "FowlBrowser", "default_icon": { "16": "icons/icon-16.png", "32": "icons/icon-32.png" } }
+}

@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Customer survey · Tidewell</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  header.site { position: sticky; top: 0; z-index: 10; height: 84px; box-shadow: 0 2px 10px rgba(0,0,0,.06); }
+  header.site .progress { margin-left: auto; color: #6e6e73; font-size: 13px; }
+  .q { margin-bottom: 34px; }
+  .q > .label { font-weight: 600; margin-bottom: 10px; display: block; }
+  table.likert { width: 100%; border-collapse: collapse; font-size: 14px; }
+  .likert th { font-weight: 500; color: #6e6e73; font-size: 12px; padding: 6px 4px; }
+  .likert td { text-align: center; padding: 10px 4px; border-top: 1px solid #f2f2f7; }
+  .likert td:first-child { text-align: left; }
+  .stars { display: flex; gap: 6px; }
+  .stars svg { width: 34px; height: 34px; cursor: pointer; }
+  .stars svg path { fill: #e5e5ea; stroke: #c7c7cc; }
+  .stars svg.on path { fill: #ffb800; stroke: #e0a100; }
+  .nps { display: flex; gap: 6px; flex-wrap: wrap; }
+  .nps button { width: 42px; height: 42px; border-radius: 8px; border: 1px solid #c7c7cc; background: #fff; font-weight: 600; }
+  .nps button[aria-pressed=true] { background: #0a66ff; color: #fff; border-color: #0a66ff; }
+  .nps-scale { display: flex; justify-content: space-between; font-size: 12px; color: #8e8e93; max-width: 520px; margin-top: 6px; }
+  .opts label { display: block; margin: 6px 0; }
+  .counter { text-align: right; font-size: 12px; color: #6e6e73; }
+  .filler { color: #6e6e73; }
+</style>
+<header class="site"><span class="brand">Tidewell</span><span class="progress">Customer survey · about 4 minutes</span></header>
+<main>
+  <h1>How are we doing?</h1>
+  <p class="lead">Your answers help us decide what to build next.</p>
+  <form id="form" novalidate>
+    <div class="card">
+      <div class="row">
+        <div class="field" data-field="reference"><label for="reference">Reference code</label><input type="text" id="reference" autocomplete="off"></div>
+        <div class="field" data-field="email"><label for="email">Email</label><input type="email" id="email" autocomplete="off"></div>
+      </div>
+    </div>
+
+    <div class="q" data-field="likert"><span class="label">How much do you agree with each statement?</span>
+      <table class="likert"><thead><tr><th></th><th>Strongly disagree</th><th>Disagree</th><th>Neutral</th><th>Agree</th><th>Strongly agree</th></tr></thead><tbody id="likert"></tbody></table></div>
+
+    <p class="filler">A few words about how you use Tidewell. Most people finish in a few minutes. There are no right or wrong answers, and every question about your experience matters to the team that builds the app.</p>
+    <div class="q"><span class="label">Which features do you use? (optional)</span>
+      <div class="opts"><label><input type="checkbox"> Calendar</label><label><input type="checkbox"> Shared notes</label><label><input type="checkbox"> Reminders</label><label><input type="checkbox"> Reports</label><label><input type="checkbox"> Integrations</label></div></div>
+    <div class="q"><span class="label">How did you hear about us? (optional)</span>
+      <select style="max-width:320px"><option>Choose one</option><option>A friend</option><option>Search</option><option>Social media</option><option>A podcast</option></select></div>
+
+    <div class="q" data-field="stars"><span class="label" id="stars-label">Overall, how would you rate Tidewell?</span>
+      <div class="stars" id="stars" aria-labelledby="stars-label"></div>
+      <p class="hint" id="stars-text">No rating yet.</p></div>
+
+    <div class="q" data-field="nps"><span class="label" id="nps-label">How likely are you to recommend Tidewell to a friend?</span>
+      <div class="nps" id="nps" role="group" aria-labelledby="nps-label"></div>
+      <div class="nps-scale"><span>Not at all likely</span><span>Extremely likely</span></div></div>
+
+    <div class="q hidden" data-field="npsReason" id="reason-q"><label for="npsReason" id="reason-label"></label><textarea id="npsReason"></textarea></div>
+
+    <p class="filler">Thanks for sticking with us. Two more short questions, then any comments you have.</p>
+    <div class="q" data-field="contacted"><span class="label" id="contacted-label">Have you contacted our support team in the last 3 months?</span>
+      <div class="opts" role="radiogroup" aria-labelledby="contacted-label"><label><input type="radio" name="contacted" value="yes"> Yes</label><label><input type="radio" name="contacted" value="no"> No</label></div></div>
+    <div class="q hidden" data-field="contactCount" id="count-q"><label for="contactCount">How many times?</label>
+      <select id="contactCount" style="max-width:200px"><option value="">Choose</option><option value="1">Once</option><option value="2">Twice</option><option value="3">3 times</option><option value="4+">4 or more times</option></select></div>
+
+    <div class="q" data-field="comments"><label for="comments">Anything else you'd like to tell us?</label>
+      <textarea id="comments" maxlength="100"></textarea><div class="counter" id="counter" aria-live="polite">0 / 100</div></div>
+
+    <div class="actions"><button type="submit" class="btn primary">Send feedback</button></div>
+  </form>
+</main>
+<script type="module">
+import { showErrors, emailOk, submit } from '/common.js';
+const $ = (s) => document.querySelector(s);
+const answers = { stars: 0, nps: null };
+
+const statements = [['likertSpeed', 'The app feels fast'], ['likertDesign', 'The design is easy to understand'], ['likertSupport', 'Support answers quickly'], ['likertValue', 'It is good value for money']];
+const scale = ['Strongly disagree', 'Disagree', 'Neutral', 'Agree', 'Strongly agree'];
+for (const [name, text] of statements) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${text}</td>` + scale.map((s, i) => `<td><input type="radio" name="${name}" value="${i + 1}" aria-label="${text}: ${s}"></td>`).join('');
+  $('#likert').append(tr);
+}
+
+const star = '<path d="M17 3l4.2 8.6 9.4 1.3-6.8 6.6 1.6 9.4L17 24.5 8.6 28.9l1.6-9.4L3.4 12.9l9.4-1.3z"/>';
+for (let n = 1; n <= 5; n++) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 34 34'); svg.setAttribute('aria-label', `${n} star${n > 1 ? 's' : ''}`); svg.innerHTML = star;
+  svg.addEventListener('click', () => {
+    answers.stars = n;
+    $('#stars').querySelectorAll('svg').forEach((s, i) => s.classList.toggle('on', i < n));
+    $('#stars-text').textContent = `You rated ${n} out of 5.`;
+  });
+  $('#stars').append(svg);
+}
+
+const reasons = [[6, 'What should we fix first?'], [8, 'What would make it a 10?'], [10, 'What do you like most?']];
+for (let n = 0; n <= 10; n++) {
+  const b = document.createElement('button'); b.type = 'button'; b.textContent = n; b.setAttribute('aria-pressed', 'false');
+  b.onclick = () => {
+    const before = answers.nps === null ? null : reasons.find(([max]) => answers.nps <= max)[1];
+    answers.nps = n;
+    $('#nps').querySelectorAll('button').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+    const label = reasons.find(([max]) => n <= max)[1];
+    if (label !== before) $('#npsReason').value = '';
+    $('#reason-label').textContent = label; $('#reason-q').classList.remove('hidden');
+  };
+  $('#nps').append(b);
+}
+
+document.querySelectorAll('input[name=contacted]').forEach((r) => r.addEventListener('change', () => {
+  const yes = r.value === 'yes' && r.checked;
+  $('#count-q').classList.toggle('hidden', !yes);
+  if (!yes) $('#contactCount').value = '';
+}));
+
+$('#comments').addEventListener('input', () => { $('#counter').textContent = `${$('#comments').value.length} / 100`; });
+
+$('#form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const e = {};
+  const radio = (name) => document.querySelector(`input[name=${name}]:checked`)?.value;
+  if (!$('#reference').value.trim()) e.reference = 'Enter your reference code.';
+  if (!emailOk($('#email').value.trim())) e.email = 'Enter a valid email address.';
+  if (statements.some(([name]) => !radio(name))) e.likert = 'Answer every statement.';
+  if (!answers.stars) e.stars = 'Choose a star rating.';
+  if (answers.nps === null) e.nps = 'Choose a score from 0 to 10.';
+  else if (!$('#npsReason').value.trim()) e.npsReason = 'Tell us a little more about your score.';
+  if (!radio('contacted')) e.contacted = 'Answer whether you contacted support.';
+  else if (radio('contacted') === 'yes' && !$('#contactCount').value) e.contactCount = 'Choose how many times.';
+  if (!showErrors(e)) return;
+  await submit('survey', {
+    reference: $('#reference').value.trim(), email: $('#email').value.trim(),
+    ...Object.fromEntries(statements.map(([name]) => [name, Number(radio(name))])),
+    stars: answers.stars, nps: answers.nps, npsReason: $('#npsReason').value.trim(),
+    contacted: radio('contacted'), contactCount: $('#contactCount').value, comments: $('#comments').value.trim(),
+  });
+});
+</script>
+</html>

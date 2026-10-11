@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Secure card field</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  body { padding: 2px; }
+  .field { margin-bottom: 12px; }
+  .lock { font-size: 12px; color: #6e6e73; }
+</style>
+<body>
+  <div class="field"><label for="cardNumber">Card number</label><input type="text" id="cardNumber" inputmode="numeric" autocomplete="off" placeholder="1234 1234 1234 1234"></div>
+  <div class="row">
+    <div class="field"><label for="expiry">Expiry (MM/YY)</label><input type="text" id="expiry" inputmode="numeric" autocomplete="off" placeholder="MM/YY"></div>
+    <div class="field"><label for="cvc">CVC</label><input type="text" id="cvc" inputmode="numeric" autocomplete="off" placeholder="123"></div>
+  </div>
+  <p class="lock">Card details are handled by Paylock on a separate secure origin.</p>
+<script>
+// Formats as you type and reports every change to the checkout page (like hosted card fields).
+const parentOrigin = new URLSearchParams(location.search).get('parent');
+const digits = (v, n) => v.replace(/\D/g, '').slice(0, n);
+const formats = {
+  cardNumber: (v) => digits(v, 16).replace(/(\d{4})(?=\d)/g, '$1 '),
+  expiry: (v) => { const d = digits(v, 4); return d.length > 2 ? `${d.slice(0, 2)}/${d.slice(2)}` : d; },
+  cvc: (v) => digits(v, 4),
+};
+for (const [id, format] of Object.entries(formats)) {
+  const input = document.getElementById(id);
+  input.addEventListener('input', () => {
+    input.value = format(input.value);
+    parent.postMessage({ type: 'card', cardNumber: cardNumber.value, expiry: expiry.value, cvc: cvc.value }, parentOrigin);
+  });
+}
+</script>
+</body>
+</html>

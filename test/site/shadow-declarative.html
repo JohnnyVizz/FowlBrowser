@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Declarative closed shadow</title>
+<link rel="stylesheet" href="style.css">
+<h1>Declarative closed shadow</h1>
+<!-- No script makes a shadow root here: the HTML parser builds this one. -->
+<div id="decl-host"><template shadowrootmode="closed"><button>Declarative save</button></template></div>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  document.getElementById('decl-host').addEventListener('click', () => {
+    document.getElementById('result').textContent = 'declarative:clicked';
+  });
+</script>

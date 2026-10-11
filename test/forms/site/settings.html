@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Settings · Relaybox</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  .setting { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #f2f2f7; }
+  .setting:last-child { border-bottom: 0; }
+  .range { display: flex; gap: 14px; align-items: center; }
+  .range input { flex: 1; }
+  .range output { width: 40px; text-align: right; font-weight: 600; }
+  select[multiple] { height: 230px; padding: 6px; }
+  .combo { position: relative; }
+  .combo ul { position: absolute; z-index: 5; left: 0; right: 0; top: 100%; margin: 4px 0 0; padding: 4px; list-style: none; max-height: 260px; overflow-y: auto; background: #fff; border: 1px solid #d1d1d6; border-radius: 10px; box-shadow: 0 10px 28px rgba(0,0,0,.12); }
+  .combo li { padding: 8px 10px; border-radius: 7px; cursor: pointer; }
+  .combo li:hover, .combo li[aria-selected=true] { background: #eef3ff; }
+  .prio { list-style: none; padding: 0; margin: 0; }
+  .prio li { display: flex; gap: 10px; align-items: center; padding: 10px 12px; margin-bottom: 6px; border: 1px solid #d1d1d6; border-radius: 8px; background: #fff; cursor: grab; user-select: none; }
+  .prio li .grip { color: #aeaeb2; }
+  .prio li.over { border-color: #0a66ff; background: #f5f8ff; }
+  dialog { border: 0; border-radius: 14px; padding: 24px; width: 380px; box-shadow: 0 20px 60px rgba(0,0,0,.25); }
+  dialog::backdrop { background: rgba(0,0,0,.35); }
+</style>
+<header class="site"><span class="brand">Relaybox</span><nav><span>Inbox</span><span>Teams</span><span>Settings</span></nav></header>
+<main>
+  <h1>Notification settings</h1>
+  <p class="lead">Choose how and when Relaybox gets in touch.</p>
+  <form id="form" novalidate>
+    <section class="card">
+      <div class="field" data-field="reference"><label for="reference">Reference code</label><input type="text" id="reference" autocomplete="off"></div>
+    </section>
+    <section class="card">
+      <h2 style="margin-top:0">Channels</h2>
+      <div class="setting"><span>Email alerts</span><fb-switch id="emailAlerts" label="Email alerts" checked></fb-switch></div>
+      <div class="setting"><span>SMS alerts</span><fb-switch id="smsAlerts" label="SMS alerts"></fb-switch></div>
+      <div class="setting"><span>Weekly digest</span><fb-switch id="weeklyDigest" label="Weekly digest" checked></fb-switch></div>
+      <div class="setting"><span>Two-factor authentication for alerts</span><fb-secure-switch id="twoFactor" label="Two-factor authentication"></fb-secure-switch></div>
+      <div class="setting"><span>Theme</span><fb-segmented id="theme" label="Theme" options="Light,Dark,Auto" value="light"></fb-segmented></div>
+    </section>
+    <section class="card">
+      <h2 style="margin-top:0">Delivery</h2>
+      <div class="field" data-field="volume"><label for="volume">Alert volume</label>
+        <div class="range"><input type="range" id="volume" min="0" max="100" step="1" value="50"><output id="volume-out" for="volume">50</output></div></div>
+      <div class="field" data-field="languages"><label for="languages">Languages</label>
+        <select id="languages" multiple>
+          <optgroup label="Europe"><option value="en-GB">English (UK)</option><option value="de">German</option><option value="fr">French</option><option value="pt-PT">Portuguese (Portugal)</option><option value="es">Spanish (Spain)</option></optgroup>
+          <optgroup label="Americas"><option value="en-US">English (US)</option><option value="pt-BR">Portuguese (Brazil)</option><option value="es-MX">Spanish (Mexico)</option><option value="fr-CA">French (Canada)</option></optgroup>
+          <optgroup label="Asia"><option value="ja">Japanese</option><option value="ko">Korean</option><option value="zh">Chinese</option><option value="hi">Hindi</option></optgroup>
+        </select><p class="hint">Hold ⌘ to choose more than one.</p></div>
+      <div class="field combo" data-field="timezone"><label for="timezone">Time zone</label>
+        <input type="text" id="timezone" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="zones" autocomplete="off" value="UTC">
+        <ul id="zones" role="listbox" aria-label="Time zones" class="hidden"></ul>
+        <p class="hint" id="tz-hint">Type to filter, then pick a zone.</p></div>
+    </section>
+    <section class="card">
+      <h2 style="margin-top:0">Priority order</h2>
+      <p class="hint" style="margin-top:-6px">Drag to reorder. The top one interrupts you first.</p>
+      <ol class="prio" id="prio" aria-label="Priority order"></ol>
+    </section>
+    <div class="actions"><button type="submit" class="btn primary">Save</button></div>
+  </form>
+  <dialog id="confirm" aria-labelledby="confirm-title">
+    <h2 id="confirm-title" style="margin-top:0">Save these settings?</h2>
+    <p>Your notification settings will change for every device.</p>
+    <div class="actions"><button type="button" class="btn" id="cancel">Cancel</button><button type="button" class="btn primary" id="do-save">Save settings</button></div>
+  </dialog>
+</main>
+<script type="module">
+import { showErrors, submit } from '/common.js';
+const $ = (s) => document.querySelector(s);
+const switchCss = `button{width:46px;height:28px;border-radius:999px;border:0;background:#d1d1d6;position:relative;cursor:pointer;transition:background .15s}
+  button::after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.3);transition:left .15s}
+  button[aria-checked=true]{background:#34c759}button[aria-checked=true]::after{left:21px}`;
+
+// A toggle in an open shadow root.
+customElements.define('fb-switch', class extends HTMLElement {
+  connectedCallback() {
+    const root = this.attachShadow({ mode: 'open' });
+    root.innerHTML = `<style>${switchCss}</style><button type="button" role="switch" aria-label="${this.getAttribute('label')}" aria-checked="${this.hasAttribute('checked')}"></button>`;
+    const b = root.querySelector('button');
+    b.onclick = () => b.setAttribute('aria-checked', String(b.getAttribute('aria-checked') !== 'true'));
+  }
+  get checked() { return this.shadowRoot.querySelector('button').getAttribute('aria-checked') === 'true'; }
+});
+
+// The same toggle in a CLOSED shadow root: page scripts can't reach inside, only the host's `checked`.
+customElements.define('fb-secure-switch', class extends HTMLElement {
+  #button;
+  connectedCallback() {
+    const root = this.attachShadow({ mode: 'closed' });
+    root.innerHTML = `<style>${switchCss}</style><button type="button" role="switch" aria-label="${this.getAttribute('label')}" aria-checked="false"></button>`;
+    this.#button = root.querySelector('button');
+    this.#button.onclick = () => this.#button.setAttribute('aria-checked', String(this.#button.getAttribute('aria-checked') !== 'true'));
+  }
+  get checked() { return this.#button.getAttribute('aria-checked') === 'true'; }
+});
+
+// A segmented control (radio group) in an open shadow root.
+customElements.define('fb-segmented', class extends HTMLElement {
+  connectedCallback() {
+    const root = this.attachShadow({ mode: 'open' });
+    const value = this.getAttribute('value');
+    root.innerHTML = `<style>div{display:inline-flex;background:#f2f2f7;border-radius:9px;padding:2px}button{border:0;background:none;padding:6px 14px;border-radius:7px;font:inherit;cursor:pointer}
+      button[aria-checked=true]{background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.15);font-weight:600}</style>
+      <div role="radiogroup" aria-label="${this.getAttribute('label')}">${this.getAttribute('options').split(',').map((o) =>
+        `<button type="button" role="radio" data-value="${o.toLowerCase()}" aria-checked="${o.toLowerCase() === value}">${o}</button>`).join('')}</div>`;
+    root.querySelectorAll('button').forEach((b) => b.onclick = () => root.querySelectorAll('button').forEach((x) => x.setAttribute('aria-checked', String(x === b))));
+  }
+  get value() { return this.shadowRoot.querySelector('[aria-checked=true]').dataset.value; }
+});
+
+$('#volume').addEventListener('input', () => { $('#volume-out').textContent = $('#volume').value; });
+
+// Time zone combobox over every zone the browser knows (~420), filtered as you type.
+const zones = Intl.supportedValuesOf('timeZone');
+let zone = 'UTC'; let active = -1;
+const tz = $('#timezone'); const list = $('#zones');
+function closeZones() { list.classList.add('hidden'); tz.setAttribute('aria-expanded', 'false'); tz.removeAttribute('aria-activedescendant'); active = -1; }
+function pickZone(z) { zone = z; tz.value = z; closeZones(); $('#tz-hint').textContent = `Selected ${z}.`; }
+function renderZones() {
+  const q = tz.value.trim().toLowerCase().replace(/\s+/g, '_');
+  const found = zones.filter((z) => z.toLowerCase().includes(q)).slice(0, 40);
+  list.innerHTML = '';
+  found.forEach((z, i) => {
+    const li = document.createElement('li'); li.id = `zone-${i}`; li.setAttribute('role', 'option'); li.setAttribute('aria-selected', 'false'); li.textContent = z;
+    li.addEventListener('mousedown', (e) => e.preventDefault()); li.onclick = () => pickZone(z);
+    list.append(li);
+  });
+  if (!found.length) list.innerHTML = '<li role="option" aria-disabled="true">No matching time zones</li>';
+  list.classList.remove('hidden'); tz.setAttribute('aria-expanded', 'true');
+}
+tz.addEventListener('input', () => { zone = ''; $('#tz-hint').textContent = 'Type to filter, then pick a zone.'; renderZones(); });
+tz.addEventListener('focus', () => { tz.select(); renderZones(); });
+tz.addEventListener('blur', () => setTimeout(closeZones, 150));
+tz.addEventListener('keydown', (e) => {
+  const items = [...list.querySelectorAll('li[id]')];
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault(); if (!items.length) return;
+    active = (active + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+    items.forEach((li, j) => li.setAttribute('aria-selected', String(j === active)));
+    tz.setAttribute('aria-activedescendant', items[active].id); items[active].scrollIntoView({ block: 'nearest' });
+  } else if (e.key === 'Enter') { e.preventDefault(); if (active >= 0) pickZone(items[active].textContent); }
+  else if (e.key === 'Escape') closeZones();
+});
+
+// Priority list: HTML5 drag and drop. Dropping on an item moves the dragged one to that item's place.
+const prio = ['Billing', 'Security', 'Product updates', 'Mentions', 'Reminders'];
+let dragged = null;
+function renderPrio() {
+  $('#prio').innerHTML = '';
+  for (const p of prio) {
+    const li = document.createElement('li'); li.draggable = true; li.dataset.item = p;
+    li.innerHTML = `<span class="grip" aria-hidden="true">⋮⋮</span><span>${p}</span>`;
+    li.addEventListener('dragstart', (e) => { dragged = p; e.dataTransfer.setData('text/plain', p); e.dataTransfer.effectAllowed = 'move'; });
+    li.addEventListener('dragover', (e) => { e.preventDefault(); li.classList.add('over'); });
+    li.addEventListener('dragleave', () => li.classList.remove('over'));
+    li.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const from = prio.indexOf(e.dataTransfer.getData('text/plain') || dragged); const to = prio.indexOf(p);
+      if (from >= 0 && from !== to) { prio.splice(to, 0, prio.splice(from, 1)[0]); }
+      renderPrio();
+    });
+    $('#prio').append(li);
+  }
+}
+renderPrio();
+
+const values = () => ({
+  reference: $('#reference').value.trim(), emailAlerts: $('#emailAlerts').checked, smsAlerts: $('#smsAlerts').checked,
+  weeklyDigest: $('#weeklyDigest').checked, theme: $('#theme').value, twoFactor: $('#twoFactor').checked,
+  volume: Number($('#volume').value), languages: [...$('#languages').selectedOptions].map((o) => o.value), timezone: zone, priorities: [...prio],
+});
+$('#form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const e = {};
+  if (!$('#reference').value.trim()) e.reference = 'Enter your reference code.';
+  if (!zone) e.timezone = 'Pick a time zone from the list.';
+  if (!$('#languages').selectedOptions.length) e.languages = 'Choose at least one language.';
+  if (showErrors(e)) $('#confirm').showModal();
+});
+$('#cancel').onclick = () => $('#confirm').close();
+$('#do-save').onclick = async () => { const v = values(); $('#confirm').close(); await submit('settings', v); };
+</script>
+</html>

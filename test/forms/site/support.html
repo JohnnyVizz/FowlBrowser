@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Help center · Quillstack</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  .articles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 24px 0; }
+  .articles .card { margin: 0; }
+  .articles h3 { margin: 0 0 4px; font-size: 15px; }
+  .articles p { margin: 0; color: #6e6e73; font-size: 14px; }
+  .contact { display: flex; justify-content: space-between; align-items: center; }
+  dialog { border: 0; border-radius: 14px; padding: 0; width: 560px; max-height: 88vh; box-shadow: 0 20px 60px rgba(0,0,0,.25); }
+  dialog::backdrop { background: rgba(0,0,0,.35); }
+  dialog form { padding: 24px; overflow-y: auto; max-height: 88vh; }
+  .dlg-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+  .dlg-head h2 { margin: 0; }
+  .close { border: 0; background: #f2f2f7; width: 30px; height: 30px; border-radius: 50%; font-size: 16px; }
+</style>
+<header class="site"><span class="brand">Quillstack</span><nav><span>Product</span><span>Pricing</span><span>Help</span></nav></header>
+<main>
+  <h1>Help center</h1>
+  <p class="lead">Answers to common questions, or talk to a person.</p>
+  <div class="articles">
+    <div class="card"><h3>Syncing across devices</h3><p>How sync works and what to do when it stops.</p></div>
+    <div class="card"><h3>Invoices and refunds</h3><p>Download invoices and ask for a refund.</p></div>
+    <div class="card"><h3>Signing in</h3><p>Passkeys, magic links and two-factor codes.</p></div>
+    <div class="card"><h3>Exporting your notes</h3><p>Markdown, PDF and full backups.</p></div>
+  </div>
+  <div class="card contact"><div><strong>Still stuck?</strong><br><span class="hint">We usually answer within a day.</span></div><button type="button" class="btn primary" id="open">Contact support</button></div>
+
+  <dialog id="dlg" aria-labelledby="dlg-title">
+    <form id="form" novalidate>
+      <div class="dlg-head"><h2 id="dlg-title">Contact support</h2><button type="button" class="close" id="close" aria-label="Close">×</button></div>
+      <div class="field" data-field="reference"><label for="reference">Reference code</label><input type="text" id="reference" autocomplete="off"></div>
+      <div class="row">
+        <div class="field" data-field="fullName"><label for="fullName">Full name</label><input type="text" id="fullName" autocomplete="off"></div>
+        <div class="field" data-field="email"><label for="email">Email</label><input type="email" id="email" autocomplete="off"></div>
+      </div>
+      <div class="field" data-field="category"><label for="category">Topic</label>
+        <select id="category"><option value="">Choose a topic</option>
+          <optgroup label="Billing"><option value="billing-refund">Refund request</option><option value="billing-invoice">Invoice question</option><option value="billing-plan">Change plan</option></optgroup>
+          <optgroup label="Technical"><option value="tech-sync">Sync not working</option><option value="tech-login">Can't sign in</option><option value="tech-crash">App crashes</option></optgroup>
+          <optgroup label="Account"><option value="acct-delete">Delete my account</option><option value="acct-email">Change email</option></optgroup>
+        </select></div>
+      <div class="field" data-field="subject"><label for="subject">Subject</label><input type="text" id="subject" autocomplete="off"></div>
+      <div class="field" data-field="description"><label for="description">Describe the problem</label><textarea id="description"></textarea></div>
+      <div class="field" data-field="attachment"><label for="attachment">Attachment</label><input type="file" id="attachment" accept=".pdf,application/pdf"><p class="hint">PDF only, up to 5 MB.</p></div>
+      <div class="field" data-field="urgency"><label for="urgency">Urgency</label>
+        <select id="urgency"><option value="low">Low: whenever you can</option><option value="normal" selected>Normal</option><option value="high">High: it blocks my work</option><option value="critical">Critical: everything is down</option></select></div>
+      <div class="field hidden" data-field="callback" id="callback-q"><span class="label" id="callback-label">Call me back at</span>
+        <div class="row" role="group" aria-labelledby="callback-label">
+          <select id="hour" aria-label="Callback hour"><option value="">Hour</option></select>
+          <select id="minute" aria-label="Callback minute"><option value="">Minute</option><option>00</option><option>15</option><option>30</option><option>45</option></select>
+        </div><p class="hint">High and critical requests get a phone call.</p></div>
+      <div class="actions"><button type="button" class="btn" id="cancel">Cancel</button><button type="submit" class="btn primary">Send request</button></div>
+    </form>
+  </dialog>
+</main>
+<script type="module">
+import { showErrors, emailOk, submit } from '/common.js';
+const $ = (s) => document.querySelector(s);
+for (let h = 8; h <= 18; h++) $('#hour').append(new Option(String(h).padStart(2, '0'), String(h).padStart(2, '0')));
+$('#open').onclick = () => $('#dlg').showModal();
+$('#close').onclick = $('#cancel').onclick = () => $('#dlg').close();
+const needsCallback = () => ['high', 'critical'].includes($('#urgency').value);
+$('#urgency').addEventListener('change', () => $('#callback-q').classList.toggle('hidden', !needsCallback()));
+
+$('#form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const e = {}; const file = $('#attachment').files[0];
+  if (!$('#reference').value.trim()) e.reference = 'Enter your reference code.';
+  if (!$('#fullName').value.trim()) e.fullName = 'Enter your full name.';
+  if (!emailOk($('#email').value.trim())) e.email = 'Enter a valid email address.';
+  if (!$('#category').value) e.category = 'Choose a topic.';
+  if (!$('#subject').value.trim()) e.subject = 'Add a subject.';
+  if ($('#description').value.trim().length < 20) e.description = 'Describe the problem in at least 20 characters.';
+  if (!file) e.attachment = 'Attach your receipt as a PDF.';
+  else if (!/\.pdf$/i.test(file.name)) e.attachment = 'Only PDF files can be attached.';
+  else if (file.size > 5e6) e.attachment = 'The file is larger than 5 MB.';
+  if (needsCallback() && (!$('#hour').value || !$('#minute').value)) e.callback = 'Choose a callback hour and minute.';
+  if (!showErrors(e, $('#form'))) return;
+  if (!confirm('Send this request to support?')) return;
+  const payload = {
+    reference: $('#reference').value.trim(), fullName: $('#fullName').value.trim(), email: $('#email').value.trim(),
+    category: $('#category').value, subject: $('#subject').value.trim(), description: $('#description').value.trim(),
+    attachment: file.name, attachmentBytes: file.size, urgency: $('#urgency').value,
+    callback: needsCallback() ? `${$('#hour').value}:${$('#minute').value}` : '',
+  };
+  $('#dlg').close();
+  await submit('support', payload);
+});
+</script>
+</html>

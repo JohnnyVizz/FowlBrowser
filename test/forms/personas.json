@@ -1,0 +1,84 @@
+{
+  "forms": {
+    "travel": {
+      "fields": ["reference", "fullName", "email", "checkIn", "checkOut", "adults", "children", "country", "city", "airport", "seat"],
+      "personal": ["reference", "fullName", "email", "checkIn", "checkOut", "airport", "seat"]
+    },
+    "checkout": {
+      "fields": ["reference", "fullName", "email", "shipping", "address", "phone", "cardNumber", "expiry", "cvc", "promo"],
+      "personal": ["reference", "fullName", "email", "address", "phone", "cardNumber", "expiry", "cvc"]
+    },
+    "signup": {
+      "fields": ["reference", "fullName", "email", "username", "password", "role", "tags", "bio", "agree", "website"],
+      "personal": ["reference", "fullName", "email", "username", "password", "tags", "bio"]
+    },
+    "settings": {
+      "fields": ["reference", "emailAlerts", "smsAlerts", "weeklyDigest", "theme", "twoFactor", "volume", "languages", "timezone", "priorities"],
+      "personal": ["reference", "timezone"]
+    },
+    "survey": {
+      "fields": ["reference", "email", "likertSpeed", "likertDesign", "likertSupport", "likertValue", "stars", "nps", "npsReason", "contacted", "contactCount", "comments"],
+      "personal": ["reference", "email", "npsReason", "comments"]
+    },
+    "support": {
+      "fields": ["reference", "fullName", "email", "category", "subject", "description", "attachment", "urgency", "callback"],
+      "personal": ["reference", "fullName", "email", "subject", "description"]
+    }
+  },
+  "personas": {
+    "p01": { "form": "travel", "browser": "chrome", "fields": {
+      "reference": "p01", "fullName": "Mira Okonkwo-Hale", "email": "mira.hale@example.net",
+      "checkIn": "2026-12-14", "checkOut": "2026-12-19", "adults": 3, "children": 1,
+      "country": "Japan", "city": "Sapporo", "airport": "MAO", "seat": "14C" } },
+    "p02": { "form": "travel", "browser": "helium", "fields": {
+      "reference": "p02", "fullName": "Tomas Ferreira Lind", "email": "tomas.lind@example.org",
+      "checkIn": "2027-01-08", "checkOut": "2027-01-15", "adults": 2, "children": 2,
+      "country": "Chile", "city": "Puerto Montt", "airport": "QXS", "seat": "22F" } },
+    "p03": { "form": "checkout", "browser": "chrome", "fields": {
+      "reference": "p03", "fullName": "Priya Raman-Castell", "email": "priya.castell@example.com",
+      "shipping": "express", "address": "1880 Larkspur Lane, Portland, OR 97214", "phone": "(503) 555-0147",
+      "cardNumber": "4000 0566 5566 5556", "expiry": "08/29", "cvc": "314", "promo": "FALL10" } },
+    "p04": { "form": "checkout", "browser": "helium", "fields": {
+      "reference": "p04", "fullName": "Jonah Whitfield", "email": "jonah.whitfield@example.io",
+      "shipping": "overnight", "address": "47 Juniper Court, Asheville, NC 28801", "phone": "(828) 555-0193",
+      "cardNumber": "5555 5555 5555 4444", "expiry": "11/28", "cvc": "902", "promo": "WINTER15" } },
+    "p05": { "form": "signup", "browser": "chrome", "fields": {
+      "reference": "p05", "fullName": "Aiko Brennan", "email": "aiko.brennan@example.com",
+      "username": "aikobrennan", "password": "Lantern!Moss42", "role": "Motion designer",
+      "tags": ["swiftui", "typography", "color"], "bio": "I design calm interfaces for small teams. Currently learning Rust.",
+      "agree": true, "website": "" } },
+    "p06": { "form": "signup", "browser": "helium", "fields": {
+      "reference": "p06", "fullName": "Rafael Osei-Moreau", "email": "rafael.moreau@example.net",
+      "username": "rafa_moreau", "password": "Quartz#Harbor77", "role": "Frontend engineer",
+      "tags": ["react", "accessibility", "webgl"], "bio": "Frontend engineer who loves accessible forms and fast pages.",
+      "agree": true, "website": "" } },
+    "p07": { "form": "settings", "browser": "chrome", "fields": {
+      "reference": "p07", "emailAlerts": false, "smsAlerts": true, "weeklyDigest": true, "theme": "dark",
+      "twoFactor": true, "volume": 37, "languages": ["pt-BR", "ja"], "timezone": "Pacific/Chatham",
+      "priorities": ["Security", "Mentions", "Billing", "Reminders", "Product updates"] } },
+    "p08": { "form": "settings", "browser": "helium", "fields": {
+      "reference": "p08", "emailAlerts": true, "smsAlerts": true, "weeklyDigest": false, "theme": "auto",
+      "twoFactor": true, "volume": 82, "languages": ["de", "es-MX", "ko"], "timezone": "America/Argentina/Salta",
+      "priorities": ["Mentions", "Reminders", "Security", "Product updates", "Billing"] } },
+    "p09": { "form": "survey", "browser": "chrome", "fields": {
+      "reference": "p09", "email": "noor.halvorsen@example.com",
+      "likertSpeed": 4, "likertDesign": 5, "likertSupport": 2, "likertValue": 3, "stars": 4, "nps": 3,
+      "npsReason": "Search is slow on large projects.", "contacted": "yes", "contactCount": "3",
+      "comments": "Please add keyboard shortcuts for the export panel and a dark theme for reports." } },
+    "p10": { "form": "survey", "browser": "helium", "fields": {
+      "reference": "p10", "email": "eli.vasquez-park@example.org",
+      "likertSpeed": 2, "likertDesign": 3, "likertSupport": 5, "likertValue": 4, "stars": 2, "nps": 9,
+      "npsReason": "The calendar sync is fast and reliable.", "contacted": "no", "contactCount": "",
+      "comments": "Love the new onboarding. The pricing page could be clearer about seats." } },
+    "p11": { "form": "support", "browser": "chrome", "fields": {
+      "reference": "p11", "fullName": "Hana Lindqvist", "email": "hana.lindqvist@example.com",
+      "category": "billing-refund", "subject": "Charged twice for the October invoice",
+      "description": "My card was charged twice on October 3 for invoice INV-20931. Please refund the duplicate charge.",
+      "attachment": "receipt.pdf", "urgency": "high", "callback": "09:45" } },
+    "p12": { "form": "support", "browser": "helium", "fields": {
+      "reference": "p12", "fullName": "Marcus Adeyemi-Strand", "email": "marcus.strand@example.net",
+      "category": "tech-sync", "subject": "Notes stop syncing after sleep",
+      "description": "After my laptop wakes from sleep, notes stop syncing until I restart the app. Version 4.2.1.",
+      "attachment": "receipt.pdf", "urgency": "critical", "callback": "16:15" } }
+  }
+}

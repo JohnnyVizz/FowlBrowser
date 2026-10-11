@@ -1,0 +1,6 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>User tab</title>
+<link rel="stylesheet" href="style.css">
+<h1>Stand-in for one of the user's own tabs</h1>
+<script>document.title = 'User tab ' + new URLSearchParams(location.search).get('n');</script>

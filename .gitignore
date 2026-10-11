@@ -1,0 +1,9 @@
+node_modules/
+.DS_Store
+*.log
+host/fowlbrowser-host
+
+# Personal and dev-only material: kept on this machine, never published
+local/
+TASKS.md
+**/NOTES.md

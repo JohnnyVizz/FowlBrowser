@@ -1,0 +1,54 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Drag and drop</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .zone { display: inline-block; vertical-align: top; width: 180px; min-height: 120px; border: 2px dashed #999; margin: 8px; padding: 8px; }
+  .card { padding: 8px; margin: 4px 0; background: #e8eefc; border: 1px solid #99a; cursor: grab; user-select: none; touch-action: none; }
+</style>
+<h1>Drag and drop</h1>
+<h2>HTML5 drag and drop</h2>
+<div class="zone" id="html5-source" role="region" aria-label="HTML5 source">
+  <div class="card" draggable="true" id="apple" role="button" aria-label="Apple card">Apple</div>
+</div>
+<div class="zone" id="html5-target" role="region" aria-label="HTML5 basket">Basket</div>
+
+<h2>Pointer events</h2>
+<div class="zone" id="ptr-source" role="region" aria-label="Pointer source">
+  <div class="card" id="pear" role="button" aria-label="Pear card">Pear</div>
+</div>
+<div class="zone" id="ptr-target" role="region" aria-label="Pointer basket">Basket</div>
+
+<div id="result" role="status" aria-label="Result">{}</div>
+<script>
+  const state = {};
+  const show = () => { document.getElementById('result').textContent = JSON.stringify(state); };
+
+  const apple = document.getElementById('apple');
+  const basket = document.getElementById('html5-target');
+  apple.addEventListener('dragstart', e => e.dataTransfer.setData('text/plain', 'apple'));
+  basket.addEventListener('dragover', e => e.preventDefault());
+  basket.addEventListener('drop', e => {
+    e.preventDefault();
+    basket.append(apple);
+    state.html5 = e.dataTransfer.getData('text/plain');
+    show();
+  });
+
+  // Pointer-based drag: the card follows the pointer, drop is decided by the pointerup point.
+  const pear = document.getElementById('pear');
+  const ptrBasket = document.getElementById('ptr-target');
+  let dragging = false;
+  pear.addEventListener('pointerdown', e => { dragging = true; pear.setPointerCapture(e.pointerId); state.pointerMoves = 0; });
+  pear.addEventListener('pointermove', () => { if (dragging) state.pointerMoves++; });
+  pear.addEventListener('pointerup', e => {
+    if (!dragging) return;
+    dragging = false;
+    const r = ptrBasket.getBoundingClientRect();
+    if (e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom) {
+      ptrBasket.append(pear);
+      state.pointer = 'pear';
+    }
+    show();
+  });
+</script>

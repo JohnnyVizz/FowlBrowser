@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Video</title>
+<link rel="stylesheet" href="style.css">
+<h1>Video</h1>
+<video id="player" src="media/clip.mp4" width="320" height="180" preload="auto" aria-label="Test clip"></video>
+<div>
+  <button id="play">Play</button>
+  <button id="pause">Pause</button>
+  <button id="seek">Seek to 6s</button>
+  <button id="mute">Toggle mute</button>
+</div>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  const v = document.getElementById('player');
+  const show = () => {
+    document.getElementById('result').textContent = JSON.stringify({
+      paused: v.paused, time: Math.round(v.currentTime * 10) / 10, duration: v.duration,
+      volume: v.volume, muted: v.muted, ready: v.readyState,
+    });
+  };
+  for (const ev of ['play', 'pause', 'seeked', 'volumechange', 'loadedmetadata', 'timeupdate']) v.addEventListener(ev, show);
+  document.getElementById('play').onclick = () => v.play().catch(e => { document.getElementById('result').textContent = 'play-error:' + e.name; });
+  document.getElementById('pause').onclick = () => v.pause();
+  document.getElementById('seek').onclick = () => { v.currentTime = 6; };
+  document.getElementById('mute').onclick = () => { v.muted = !v.muted; };
+  show();
+</script>

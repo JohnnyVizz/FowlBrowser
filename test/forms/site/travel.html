@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Book a trip · Skyway</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  .steps { display: flex; gap: 8px; margin: 0 0 22px; padding: 0; list-style: none; font-size: 14px; color: #6e6e73; }
+  .steps li { padding: 6px 12px; border-radius: 999px; background: #f2f2f7; }
+  .steps li[aria-current=step] { background: #0a66ff; color: #fff; font-weight: 600; }
+  .date-wrap { position: relative; }
+  .date-wrap input { cursor: pointer; }
+  .calendar { position: absolute; z-index: 10; top: 100%; left: 0; margin-top: 6px; width: 320px; background: #fff; border: 1px solid #d1d1d6; border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,.14); padding: 14px; }
+  .cal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; font-weight: 600; }
+  .cal-head button { border: 0; background: #f2f2f7; border-radius: 8px; width: 32px; height: 32px; font-size: 16px; }
+  .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; text-align: center; }
+  .cal-grid .dow { font-size: 12px; color: #8e8e93; padding: 4px 0; }
+  .cal-grid button { border: 0; background: none; height: 36px; border-radius: 8px; }
+  .cal-grid button:hover:not(:disabled) { background: #eef3ff; }
+  .cal-grid button:disabled { color: #c7c7cc; cursor: default; }
+  .cal-grid button.in-range { background: #e3ecff; }
+  .cal-grid button.edge { background: #0a66ff; color: #fff; }
+  .stepper { display: flex; align-items: center; gap: 12px; }
+  .stepper button { width: 34px; height: 34px; border-radius: 50%; border: 1px solid #c7c7cc; background: #fff; font-size: 18px; line-height: 1; }
+  .stepper output { min-width: 20px; text-align: center; font-weight: 600; }
+  .airports { height: 360px; overflow-y: auto; border: 1px solid #c7c7cc; border-radius: 8px; position: relative; }
+  .airports .opt { position: absolute; left: 0; right: 0; height: 36px; padding: 0 12px; display: flex; align-items: center; justify-content: space-between; cursor: pointer; border-bottom: 1px solid #f2f2f7; }
+  .airports .opt:hover { background: #f5f8ff; }
+  .airports .opt[aria-selected=true] { background: #0a66ff; color: #fff; }
+  .airports .code { font-weight: 600; font-size: 13px; }
+  .seatmap { display: grid; grid-template-columns: repeat(3, 38px) 26px repeat(3, 38px); gap: 6px; justify-content: center; padding: 16px; border: 1px solid #e5e5ea; border-radius: 30px 30px 12px 12px; max-height: 420px; overflow-y: auto; }
+  .seatmap .rowno { font-size: 12px; color: #8e8e93; display: flex; align-items: center; justify-content: center; }
+  .seatmap button { height: 34px; border-radius: 7px 7px 4px 4px; border: 1px solid #b7c9ee; background: #f2f6ff; font-size: 11px; }
+  .seatmap button:disabled { background: #e5e5ea; border-color: #e5e5ea; color: #aeaeb2; cursor: not-allowed; }
+  .seatmap button[aria-pressed=true] { background: #0a66ff; color: #fff; border-color: #0a66ff; }
+</style>
+<header class="site"><span class="brand">Skyway</span><nav><span>Flights</span><span>Stays</span><span>Trips</span><span>Help</span></nav></header>
+<main>
+  <h1>Book a trip</h1>
+  <p class="lead">Three quick steps. You can go back at any time.</p>
+  <ol class="steps"><li data-step="1" aria-current="step">Trip</li><li data-step="2">Destination</li><li data-step="3">Seat</li></ol>
+  <form id="form" novalidate>
+    <section class="card" data-panel="1">
+      <h2 style="margin-top:0">Trip details</h2>
+      <div class="field" data-field="reference"><label for="reference">Reference code</label><input type="text" id="reference" autocomplete="off"></div>
+      <div class="row">
+        <div class="field" data-field="fullName"><label for="fullName">Full name</label><input type="text" id="fullName" autocomplete="off"></div>
+        <div class="field" data-field="email"><label for="email">Email</label><input type="email" id="email" autocomplete="off"></div>
+      </div>
+      <div class="field" data-field="dates">
+        <label for="dates">Dates</label>
+        <div class="date-wrap">
+          <input type="text" id="dates" readonly placeholder="Check-in – check-out" aria-haspopup="dialog" aria-expanded="false">
+          <div class="calendar hidden" role="dialog" aria-label="Choose dates" id="calendar">
+            <div class="cal-head"><button type="button" id="prev" aria-label="Previous month">‹</button><span id="month" aria-live="polite"></span><button type="button" id="next" aria-label="Next month">›</button></div>
+            <div class="cal-grid" id="grid"></div>
+          </div>
+        </div>
+        <p class="hint">Pick check-in, then check-out.</p>
+      </div>
+      <div class="row">
+        <div class="field" data-field="adults"><span class="label" id="adults-label">Adults</span>
+          <div class="stepper" role="group" aria-labelledby="adults-label"><button type="button" aria-label="Remove adult" data-step-for="adults" data-delta="-1">−</button><output id="adults" aria-live="polite">1</output><button type="button" aria-label="Add adult" data-step-for="adults" data-delta="1">+</button></div></div>
+        <div class="field" data-field="children"><span class="label" id="children-label">Children</span>
+          <div class="stepper" role="group" aria-labelledby="children-label"><button type="button" aria-label="Remove child" data-step-for="children" data-delta="-1">−</button><output id="children" aria-live="polite">0</output><button type="button" aria-label="Add child" data-step-for="children" data-delta="1">+</button></div></div>
+      </div>
+      <div class="actions"><button type="button" class="btn primary" id="to2">Next</button></div>
+    </section>
+
+    <section class="card hidden" data-panel="2">
+      <h2 style="margin-top:0">Destination</h2>
+      <div class="row">
+        <div class="field" data-field="country"><label for="country">Country</label>
+          <select id="country"><option value="">Choose a country</option></select></div>
+        <div class="field" data-field="city"><label for="city">City</label>
+          <select id="city" disabled><option value="">Choose a country first</option></select></div>
+      </div>
+      <div class="field" data-field="airport">
+        <span class="label" id="airport-label">Departing from</span>
+        <div class="airports" id="airports" role="listbox" aria-labelledby="airport-label" tabindex="0"><div id="spacer"></div></div>
+        <p class="hint" id="airport-picked">1,000 airports, sorted by name. No airport selected.</p>
+      </div>
+      <div class="actions"><button type="button" class="btn" id="back1">Back</button><button type="button" class="btn primary" id="to3">Next</button></div>
+    </section>
+
+    <section class="card hidden" data-panel="3">
+      <h2 style="margin-top:0">Choose your seat</h2>
+      <div class="field" data-field="seat">
+        <div class="seatmap" id="seatmap" role="group" aria-label="Seat map"></div>
+        <p class="hint" id="seat-picked">No seat selected. Grey seats are taken.</p>
+      </div>
+      <div class="actions"><button type="button" class="btn" id="back2">Back</button><button type="submit" class="btn primary">Book trip</button></div>
+    </section>
+  </form>
+</main>
+<script type="module">
+import { showErrors, clearErrors, emailOk, submit } from '/common.js';
+const $ = (s) => document.querySelector(s);
+const state = { checkIn: '', checkOut: '', adults: 1, children: 0, airport: '', seat: '' };
+
+// Wizard
+function go(step) {
+  clearErrors();
+  document.querySelectorAll('[data-panel]').forEach((p) => p.classList.toggle('hidden', p.dataset.panel !== String(step)));
+  document.querySelectorAll('.steps li').forEach((li) => li.toggleAttribute('aria-current', li.dataset.step === String(step)));
+  document.querySelectorAll('.steps li[aria-current]').forEach((li) => li.setAttribute('aria-current', 'step'));
+  scrollTo(0, 0);
+}
+$('#to2').onclick = () => {
+  const e = {};
+  if (!$('#reference').value.trim()) e.reference = 'Enter your reference code.';
+  if (!$('#fullName').value.trim()) e.fullName = 'Enter the lead traveller’s full name.';
+  if (!emailOk($('#email').value.trim())) e.email = 'Enter a valid email address.';
+  if (!state.checkIn || !state.checkOut) e.dates = 'Choose a check-in and a check-out date.';
+  if (showErrors(e)) go(2);
+};
+$('#back1').onclick = () => go(1);
+$('#to3').onclick = () => {
+  const e = {};
+  if (!$('#country').value) e.country = 'Choose a country.';
+  if (!$('#city').value) e.city = 'Choose a city.';
+  if (!state.airport) e.airport = 'Choose the airport you depart from.';
+  if (showErrors(e)) go(3);
+};
+$('#back2').onclick = () => go(2);
+
+// Date range calendar (the input is readonly: dates come only from the popup)
+const today = new Date(); today.setHours(0, 0, 0, 0);
+let shown = new Date(today.getFullYear(), today.getMonth(), 1);
+const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const pretty = (s) => new Date(`${s}T00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+function renderCalendar() {
+  $('#month').textContent = shown.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  const grid = $('#grid');
+  grid.innerHTML = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'].map((d) => `<span class="dow" aria-hidden="true">${d}</span>`).join('');
+  for (let i = 0; i < shown.getDay(); i++) grid.append(document.createElement('span'));
+  const days = new Date(shown.getFullYear(), shown.getMonth() + 1, 0).getDate();
+  for (let n = 1; n <= days; n++) {
+    const d = new Date(shown.getFullYear(), shown.getMonth(), n);
+    const b = document.createElement('button');
+    b.type = 'button'; b.textContent = n; b.dataset.date = iso(d);
+    b.setAttribute('aria-label', d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }));
+    b.disabled = d < today;
+    const v = iso(d);
+    if (v === state.checkIn || v === state.checkOut) b.classList.add('edge');
+    else if (state.checkIn && state.checkOut && v > state.checkIn && v < state.checkOut) b.classList.add('in-range');
+    b.onclick = () => pickDate(v);
+    grid.append(b);
+  }
+}
+function pickDate(v) {
+  if (!state.checkIn || state.checkOut || v <= state.checkIn) { state.checkIn = v; state.checkOut = ''; }
+  else { state.checkOut = v; setTimeout(() => toggleCalendar(false), 150); }
+  $('#dates').value = state.checkOut ? `${pretty(state.checkIn)} – ${pretty(state.checkOut)}` : `${pretty(state.checkIn)} – choose check-out`;
+  renderCalendar();
+}
+function toggleCalendar(open) {
+  $('#calendar').classList.toggle('hidden', !open);
+  $('#dates').setAttribute('aria-expanded', String(open));
+  if (open) renderCalendar();
+}
+$('#dates').addEventListener('click', () => toggleCalendar($('#calendar').classList.contains('hidden')));
+$('#prev').onclick = () => { shown = new Date(shown.getFullYear(), shown.getMonth() - 1, 1); renderCalendar(); };
+$('#next').onclick = () => { shown = new Date(shown.getFullYear(), shown.getMonth() + 1, 1); renderCalendar(); };
+// composedPath, not closest: a day button is already replaced by the re-render when this runs.
+document.addEventListener('click', (e) => { if (!e.composedPath().some((el) => el.classList?.contains('date-wrap'))) toggleCalendar(false); });
+
+// Steppers
+const limits = { adults: [1, 9], children: [0, 8] };
+document.querySelectorAll('[data-step-for]').forEach((b) => b.onclick = () => {
+  const k = b.dataset.stepFor; const [min, max] = limits[k];
+  state[k] = Math.min(max, Math.max(min, state[k] + Number(b.dataset.delta)));
+  $(`#${k}`).textContent = state[k];
+});
+
+// Country -> city (cities load 600 ms after the country changes)
+const cities = { Canada: ['Calgary', 'Halifax', 'Toronto', 'Vancouver'], Chile: ['La Serena', 'Puerto Montt', 'Santiago', 'Valparaiso'],
+  Japan: ['Fukuoka', 'Osaka', 'Sapporo', 'Tokyo'], Kenya: ['Kisumu', 'Mombasa', 'Nairobi', 'Nakuru'],
+  Norway: ['Bergen', 'Oslo', 'Stavanger', 'Tromso'], Portugal: ['Coimbra', 'Faro', 'Lisbon', 'Porto'] };
+for (const c of Object.keys(cities)) $('#country').append(new Option(c, c));
+let load = 0;
+$('#country').addEventListener('change', () => {
+  const mine = ++load; const city = $('#city');
+  city.disabled = true; city.innerHTML = '<option value="">Loading cities…</option>';
+  if (!$('#country').value) { city.innerHTML = '<option value="">Choose a country first</option>'; return; }
+  setTimeout(() => {
+    if (mine !== load) return;
+    city.innerHTML = '<option value="">Choose a city</option>';
+    for (const c of cities[$('#country').value]) city.append(new Option(c, c));
+    city.disabled = false;
+  }, 600);
+});
+
+// Virtualized airport list: only the rows in view (plus a few) exist in the DOM.
+const ROW = 36;
+const airports = await (await fetch('/airports.json')).json();
+const list = $('#airports');
+$('#spacer').style.height = `${airports.length * ROW}px`;
+function renderRows() {
+  const first = Math.max(0, Math.floor(list.scrollTop / ROW) - 3);
+  const last = Math.min(airports.length, first + Math.ceil(list.clientHeight / ROW) + 6);
+  list.querySelectorAll('.opt').forEach((o) => o.remove());
+  for (let i = first; i < last; i++) {
+    const a = airports[i];
+    const o = document.createElement('div');
+    o.className = 'opt'; o.setAttribute('role', 'option'); o.style.top = `${i * ROW}px`;
+    o.setAttribute('aria-selected', String(a.code === state.airport));
+    o.innerHTML = `<span>${a.name}</span><span class="code">${a.code}</span>`;
+    o.onclick = () => { state.airport = a.code; $('#airport-picked').textContent = `Selected: ${a.name} (${a.code})`; renderRows(); };
+    list.append(o);
+  }
+}
+list.addEventListener('scroll', renderRows);
+new ResizeObserver(renderRows).observe(list);
+
+// Seat map: rows 1-30, A-C aisle D-F; some seats taken.
+const taken = new Set();
+for (let r = 1; r <= 30; r++) for (const s of 'ABCDEF') if ((r * 7 + s.charCodeAt(0) * 3) % 5 === 0 || (r % 4 === 0 && s === 'B')) taken.add(`${r}${s}`);
+const map = $('#seatmap');
+for (let r = 1; r <= 30; r++) {
+  for (const s of 'ABCDEF') {
+    if (s === 'D') map.append(Object.assign(document.createElement('span'), { className: 'rowno', textContent: r }));
+    const b = document.createElement('button');
+    b.type = 'button'; b.textContent = `${r}${s}`; b.dataset.seat = `${r}${s}`;
+    b.setAttribute('aria-label', `Seat ${r}${s}${taken.has(`${r}${s}`) ? ', taken' : ''}`);
+    b.setAttribute('aria-pressed', 'false');
+    b.disabled = taken.has(`${r}${s}`);
+    b.onclick = () => {
+      state.seat = b.dataset.seat;
+      map.querySelectorAll('button').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      $('#seat-picked').textContent = `Seat ${state.seat} selected.`;
+    };
+    map.append(b);
+  }
+}
+
+$('#form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  if (!showErrors(state.seat ? {} : { seat: 'Choose a seat.' })) return;
+  await submit('travel', {
+    reference: $('#reference').value.trim(), fullName: $('#fullName').value.trim(), email: $('#email').value.trim(),
+    checkIn: state.checkIn, checkOut: state.checkOut, adults: state.adults, children: state.children,
+    country: $('#country').value, city: $('#city').value, airport: state.airport, seat: state.seat,
+  });
+});
+</script>
+</html>

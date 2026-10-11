@@ -1,0 +1,24 @@
+{
+  "name": "fowlbrowser-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "FowlBrowser MCP server: lets Claude agents drive Chrome and Helium tabs in the background",
+  "bin": {
+    "fowlbrowser-mcp": "bin/fowlbrowser-mcp"
+  },
+  "main": "src/server.mjs",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "smoke": "node test/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "playwright-core": "^1.64.0",
+    "ws": "^8.22.0",
+    "zod": "^4.6.5"
+  }
+}

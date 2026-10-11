@@ -1,0 +1,72 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Form</title>
+<link rel="stylesheet" href="style.css">
+<h1>Form</h1>
+<form id="form">
+  <label>Full name <input name="name" type="text"></label>
+  <label>Email <input name="email" type="email"></label>
+  <label>Age <input name="age" type="number" min="0" max="150"></label>
+  <label>Bio <textarea name="bio" rows="3"></textarea></label>
+  <label>Country
+    <select name="country">
+      <option value="">Choose…</option>
+      <option value="nl">Netherlands</option>
+      <option value="jp">Japan</option>
+      <option value="br">Brazil</option>
+    </select>
+  </label>
+  <label>Languages
+    <select name="languages" multiple size="4">
+      <option value="en">English</option>
+      <option value="nl">Dutch</option>
+      <option value="ja">Japanese</option>
+      <option value="pt">Portuguese</option>
+    </select>
+  </label>
+  <fieldset>
+    <legend>Interests</legend>
+    <label><input type="checkbox" name="interests" value="music"> Music</label>
+    <label><input type="checkbox" name="interests" value="film"> Film</label>
+    <label><input type="checkbox" name="interests" value="code"> Code</label>
+  </fieldset>
+  <fieldset>
+    <legend>Plan</legend>
+    <label><input type="radio" name="plan" value="free" checked> Free</label>
+    <label><input type="radio" name="plan" value="pro"> Pro</label>
+    <label><input type="radio" name="plan" value="team"> Team</label>
+  </fieldset>
+  <label>Start date <input name="start" type="date"></label>
+  <label>Volume <input name="volume" type="range" min="0" max="100" value="50"></label>
+  <div>Notes</div>
+  <div id="editor" contenteditable="true" role="textbox" aria-label="Notes editor" aria-multiline="true"
+       style="border:1px solid #999;min-height:3em;padding:4px"></div>
+  <!-- Controlled input: like a React controlled field, it reverts any value that did not arrive
+       through a trusted input event (programmatic .value writes are undone). -->
+  <label>Code (typed only) <input id="controlled" aria-label="Code (typed only)" type="text" autocomplete="off"></label>
+  <button type="submit">Submit</button>
+</form>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  const controlled = document.getElementById('controlled');
+  let controlledValue = '';
+  controlled.addEventListener('input', e => {
+    if (e.isTrusted) controlledValue = controlled.value;
+    else controlled.value = controlledValue;
+  });
+  setInterval(() => { if (controlled.value !== controlledValue) controlled.value = controlledValue; }, 50);
+
+  document.getElementById('form').addEventListener('submit', e => {
+    e.preventDefault();
+    const data = new FormData(e.target);
+    const values = {
+      name: data.get('name'), email: data.get('email'), age: data.get('age'), bio: data.get('bio'),
+      country: data.get('country'), languages: data.getAll('languages'), interests: data.getAll('interests'),
+      plan: data.get('plan'), start: data.get('start'), volume: data.get('volume'),
+      editor: document.getElementById('editor').innerText.trim(), controlled: controlledValue,
+    };
+    const result = document.getElementById('result');
+    result.dataset.submitted = 'true';
+    result.textContent = JSON.stringify(values);
+  });
+</script>

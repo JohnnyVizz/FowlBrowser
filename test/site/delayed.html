@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Delayed content</title>
+<link rel="stylesheet" href="style.css">
+<h1>Delayed content</h1>
+<p id="spinner">Loading data…</p>
+<div id="content"></div>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  // Data shows after 1.5 s, the spinner goes away at 2.5 s, a button appears at 2 s.
+  setTimeout(() => { document.getElementById('content').innerHTML = '<p>Data ready: 42 rows</p>'; }, 1500);
+  setTimeout(() => {
+    const b = document.createElement('button');
+    b.textContent = 'Late button';
+    b.onclick = () => { document.getElementById('result').textContent = 'late:clicked'; };
+    document.getElementById('content').append(b);
+  }, 2000);
+  setTimeout(() => document.getElementById('spinner').remove(), 2500);
+</script>

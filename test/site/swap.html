@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Swapping search field</title>
+<link rel="stylesheet" href="style.css">
+<h1>Swapping search field</h1>
+<!-- Like Wikipedia's search: clicking the field hides it and focuses a new one in an overlay. -->
+<input id="first" aria-label="Search">
+<div id="overlay" hidden><input id="second" aria-label="Search overlay"></div>
+<script>
+  document.getElementById('first').addEventListener('focus', () => {
+    document.getElementById('first').hidden = true;
+    document.getElementById('overlay').hidden = false;
+    document.getElementById('second').focus();
+  });
+</script>

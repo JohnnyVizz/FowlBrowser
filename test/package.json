@@ -1,0 +1,18 @@
+{
+  "name": "fowlbrowser-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end tests for FowlBrowser: drives Chrome and Helium through the MCP server",
+  "scripts": {
+    "serve": "node serve.mjs",
+    "test": "node run.mjs --browser both --parallel 4",
+    "stress": "node stress.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1"
+  }
+}

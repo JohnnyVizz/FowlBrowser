@@ -1,0 +1,7 @@
+html, body { margin: 0; height: 100%; background: #fff; color: #141414; font: 15px -apple-system, system-ui, sans-serif; }
+html.dark, html.dark body { background: #161616; color: #eee; }
+#mark { position: fixed; left: 40px; top: 40px; width: 40px; height: 40px; background: #000; }
+html.dark #mark { background: #fff; }
+#target { position: fixed; left: 520px; top: 300px; width: 120px; height: 40px; }
+#field { position: fixed; left: 80px; top: 420px; width: 200px; }
+#result { position: fixed; left: 120px; top: 40px; }

@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Hover menu</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  #menu { display: inline-block; position: relative; padding: 8px 16px; border: 1px solid #999; }
+  #submenu { display: none; position: absolute; top: 100%; left: 0; background: #fff; border: 1px solid #999; padding: 4px; }
+  #menu:hover #submenu { display: block; }
+</style>
+<h1>Hover menu</h1>
+<nav id="menu" aria-label="Main menu">
+  <span>Products</span>
+  <div id="submenu">
+    <button>Laptops</button>
+    <button>Phones</button>
+  </div>
+</nav>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  const out = t => { document.getElementById('result').textContent = t; };
+  document.getElementById('menu').addEventListener('mouseenter', () => out('menu:open'));
+  for (const b of document.querySelectorAll('#submenu button')) b.onclick = () => out('picked:' + b.textContent);
+</script>

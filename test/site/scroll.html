@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Infinite scroll</title>
+<link rel="stylesheet" href="style.css">
+<style>li { height: 40px; } #result { position: fixed; top: 8px; right: 8px; background: #fff; }</style>
+<h1>Infinite scroll</h1>
+<ul id="list" aria-label="Items"></ul>
+<div id="sentinel">Loading more…</div>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  const list = document.getElementById('list');
+  let count = 0;
+  function more() {
+    for (let i = 0; i < 20; i++) {
+      const li = document.createElement('li');
+      li.textContent = 'Item ' + (++count);
+      list.append(li);
+    }
+    document.getElementById('result').textContent = JSON.stringify({ count, scrollY: Math.round(scrollY) });
+  }
+  more();
+  // Loads the next batch whenever the sentinel nears the viewport.
+  new IntersectionObserver(entries => { if (entries[0].isIntersecting) setTimeout(more, 100); }, { rootMargin: '200px' })
+    .observe(document.getElementById('sentinel'));
+  addEventListener('scroll', () => { document.getElementById('result').textContent = JSON.stringify({ count, scrollY: Math.round(scrollY) }); });
+</script>

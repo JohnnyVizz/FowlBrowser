@@ -1,0 +1,5 @@
+#!/bin/sh
+# FowlBrowser MCP server launcher. Uses the node on PATH when this runs, falling back to Homebrew's.
+DIR=$(cd "$(dirname "$0")/.." && pwd)
+NODE=$(command -v node || echo /opt/homebrew/bin/node)
+exec "$NODE" "$DIR/src/server.mjs" "$@"

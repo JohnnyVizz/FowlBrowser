@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Upload</title>
+<link rel="stylesheet" href="style.css">
+<h1>Upload</h1>
+<label>Attachment <input id="file" type="file" multiple></label>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  document.getElementById('file').addEventListener('change', async e => {
+    const files = await Promise.all([...e.target.files].map(async f => ({ name: f.name, size: f.size, head: (await f.text()).slice(0, 40) })));
+    document.getElementById('result').textContent = JSON.stringify(files);
+  });
+</script>

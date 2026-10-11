@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Frame form</title>
+<link rel="stylesheet" href="style.css">
+<style>body { margin: 8px; }</style>
+<form id="form">
+  <label>Frame text <input name="text" type="text"></label>
+  <label><input name="agree" type="checkbox"> Frame agree</label>
+  <button type="submit">Frame save</button>
+</form>
+<div id="result" role="status" aria-label="Frame result"></div>
+<script>
+  const frame = new URLSearchParams(location.search).get('frame') || 'top';
+  document.getElementById('form').addEventListener('submit', e => {
+    e.preventDefault();
+    const data = new FormData(e.target);
+    const values = { frame, text: data.get('text'), agree: data.get('agree') === 'on' };
+    document.getElementById('result').textContent = JSON.stringify(values);
+    parent.postMessage(values, '*');
+  });
+</script>

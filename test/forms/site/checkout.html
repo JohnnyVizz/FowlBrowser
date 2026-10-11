@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Checkout · Northbound Supply</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  main { margin-bottom: 200px; }
+  .ship { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .ship label { display: block; border: 1px solid #c7c7cc; border-radius: 10px; padding: 14px; cursor: pointer; }
+  .ship label:has(input:checked) { border-color: #0a66ff; box-shadow: 0 0 0 1px #0a66ff; background: #f5f8ff; }
+  .ship .name { font-weight: 600; display: block; }
+  .ship .meta { color: #6e6e73; font-size: 13px; }
+  .combo { position: relative; }
+  .combo ul { position: absolute; z-index: 5; left: 0; right: 0; top: 100%; margin: 4px 0 0; padding: 4px; list-style: none; background: #fff; border: 1px solid #d1d1d6; border-radius: 10px; box-shadow: 0 10px 28px rgba(0,0,0,.12); }
+  .combo li { padding: 9px 10px; border-radius: 7px; cursor: pointer; }
+  .combo li[aria-selected=true], .combo li:hover { background: #eef3ff; }
+  .promo { display: flex; gap: 8px; }
+  .promo input { flex: 1; }
+  .ok { color: #1b6e2a; font-size: 13px; margin-top: 5px; }
+  iframe { width: 100%; height: 190px; border: 0; }
+  .paybar { position: fixed; left: 0; right: 0; bottom: 0; background: #fff; border-top: 1px solid #e5e5ea; padding: 16px 32px; display: flex; justify-content: flex-end; align-items: center; gap: 20px; }
+  .paybar .total { font-size: 17px; font-weight: 600; }
+  .cookies { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; background: #1d1d1f; color: #f5f5f7; padding: 22px 32px; display: flex; gap: 24px; align-items: center; justify-content: space-between; min-height: 110px; }
+  .cookies p { margin: 0; max-width: 560px; }
+  .cookies .btn { border-color: #f5f5f7; }
+</style>
+<header class="site"><span class="brand">Northbound Supply</span><nav><span>Shop</span><span>Journal</span><span>Cart (2)</span></nav></header>
+<main>
+  <h1>Checkout</h1>
+  <p class="lead">Canvas weekender bag and a waxed field jacket.</p>
+  <form id="form" novalidate>
+    <section class="card">
+      <h2 style="margin-top:0">Contact</h2>
+      <div class="field" data-field="reference"><label for="reference">Reference code</label><input type="text" id="reference" autocomplete="off"></div>
+      <div class="row">
+        <div class="field" data-field="fullName"><label for="fullName">Full name</label><input type="text" id="fullName" autocomplete="off"></div>
+        <div class="field" data-field="email"><label for="email">Email</label><input type="email" id="email" autocomplete="off"></div>
+      </div>
+      <div class="field" data-field="phone"><label for="phone">Phone</label><input type="tel" id="phone" autocomplete="off" placeholder="(555) 555-5555"><p class="hint">US numbers only. We format it for you.</p></div>
+    </section>
+
+    <section class="card">
+      <h2 style="margin-top:0">Shipping</h2>
+      <div class="field combo" data-field="address">
+        <label for="address">Address</label>
+        <input type="text" id="address" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="suggestions" autocomplete="off" placeholder="Start typing your street address">
+        <ul id="suggestions" role="listbox" aria-label="Address suggestions" class="hidden"></ul>
+        <p class="hint" id="address-hint">Choose your address from the suggestions.</p>
+      </div>
+      <div class="field" data-field="shipping">
+        <span class="label">Delivery</span>
+        <div class="ship" role="radiogroup" aria-label="Delivery">
+          <label><input type="radio" name="shipping" value="standard" class="visually-hidden"><span class="name">Standard</span><span class="meta">5–7 business days · Free</span></label>
+          <label><input type="radio" name="shipping" value="express" class="visually-hidden"><span class="name">Express</span><span class="meta">2–3 business days · $12</span></label>
+          <label><input type="radio" name="shipping" value="overnight" class="visually-hidden"><span class="name">Overnight</span><span class="meta">Next business day · $29</span></label>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2 style="margin-top:0">Payment</h2>
+      <div class="field" data-field="card"><iframe id="card" title="Secure card payment"></iframe></div>
+      <div class="field" data-field="promo">
+        <label for="promo">Promo code</label>
+        <div class="promo"><input type="text" id="promo" autocomplete="off"><button type="button" class="btn" id="apply">Apply</button></div>
+        <p class="hint" id="promo-status" aria-live="polite"></p>
+      </div>
+    </section>
+    <div class="paybar"><span class="total" id="total">Total $268.00</span><button type="submit" class="btn primary" id="pay">Pay now</button></div>
+  </form>
+</main>
+<div class="cookies" id="cookies" role="region" aria-label="Cookie notice">
+  <p>We use cookies to remember your cart and to measure how the shop is used. You can accept all cookies or keep only the essential ones.</p>
+  <div style="display:flex;gap:10px"><button type="button" class="btn" id="reject" style="background:transparent;color:#f5f5f7">Only essential</button><button type="button" class="btn primary" id="accept">Accept all</button></div>
+</div>
+<script type="module">
+import { showErrors, emailOk, submit } from '/common.js';
+const $ = (s) => document.querySelector(s);
+const cardOrigin = `${location.protocol}//${location.hostname}:${Number(location.port) + 1}`;
+$('#card').src = `${cardOrigin}/payment.html?parent=${encodeURIComponent(location.origin)}`;
+let card = { cardNumber: '', expiry: '', cvc: '' };
+addEventListener('message', (e) => { if (e.origin === cardOrigin && e.data?.type === 'card') card = e.data; });
+
+for (const b of ['#accept', '#reject']) $(b).onclick = () => $('#cookies').remove();
+
+// Phone mask
+$('#phone').addEventListener('input', () => {
+  const d = $('#phone').value.replace(/\D/g, '').replace(/^1(?=\d{10})/, '').slice(0, 10);
+  $('#phone').value = !d ? '' : d.length <= 3 ? `(${d}` : d.length <= 6 ? `(${d.slice(0, 3)}) ${d.slice(3)}` : `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`;
+});
+
+// Address autocomplete: debounced, suggestions arrive asynchronously, must be picked from the list.
+const streets = ['Larkspur Lane', 'Juniper Court', 'Alder Street', 'Harbor View Road', 'Maple Avenue', 'Quarry Hill Drive', 'Willow Bend', 'Cedar Ridge Way'];
+const towns = [['Portland', 'OR', '97214'], ['Portland', 'ME', '04101'], ['Asheville', 'NC', '28801'], ['Ashland', 'OR', '97520'], ['Burlington', 'VT', '05401'], ['Boulder', 'CO', '80302']];
+const addresses = [];
+for (const n of [47, 188, 470, 1880, 2215]) for (const s of streets) for (const [c, st, zip] of towns) addresses.push(`${n} ${s}, ${c}, ${st} ${zip}`);
+addresses.push('1880 Larkspur Lane, Portland, OR 97217', '47 Juniper Court, Asheville, NC 28803');
+let chosen = ''; let active = -1; let timer; let seq = 0;
+const input = $('#address'); const list = $('#suggestions');
+function close() { list.classList.add('hidden'); input.setAttribute('aria-expanded', 'false'); input.removeAttribute('aria-activedescendant'); active = -1; }
+function choose(value) { chosen = value; input.value = value; close(); $('#address-hint').textContent = 'Address confirmed.'; }
+function highlight(i) {
+  const items = [...list.children]; if (!items.length) return;
+  active = (i + items.length) % items.length;
+  items.forEach((li, j) => li.setAttribute('aria-selected', String(j === active)));
+  input.setAttribute('aria-activedescendant', items[active].id);
+}
+input.addEventListener('input', () => {
+  chosen = ''; $('#address-hint').textContent = 'Choose your address from the suggestions.';
+  clearTimeout(timer);
+  const q = input.value.trim().toLowerCase(); const mine = ++seq;
+  if (q.length < 3) return close();
+  timer = setTimeout(() => setTimeout(() => {
+    if (mine !== seq) return;
+    const found = addresses.filter((a) => a.toLowerCase().includes(q)).slice(0, 6);
+    list.innerHTML = '';
+    found.forEach((a, i) => {
+      const li = document.createElement('li');
+      li.id = `addr-${i}`; li.setAttribute('role', 'option'); li.setAttribute('aria-selected', 'false'); li.textContent = a;
+      li.addEventListener('mousedown', (e) => e.preventDefault());
+      li.onclick = () => choose(a);
+      list.append(li);
+    });
+    if (!found.length) list.innerHTML = '<li role="option" aria-disabled="true">No matching addresses</li>';
+    list.classList.remove('hidden'); input.setAttribute('aria-expanded', 'true');
+  }, 400), 300);
+});
+input.addEventListener('keydown', (e) => {
+  if (list.classList.contains('hidden')) return;
+  if (e.key === 'ArrowDown') { e.preventDefault(); highlight(active + 1); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); highlight(active - 1); }
+  else if (e.key === 'Enter' && active >= 0) { e.preventDefault(); const li = list.children[active]; if (li.id) choose(li.textContent); }
+  else if (e.key === 'Escape') close();
+});
+input.addEventListener('blur', () => setTimeout(close, 150));
+
+// Promo code: validated by the "server" after a short wait.
+const promos = { FALL10: '10% off', WINTER15: '15% off', SPRING5: '5% off' };
+let promo = '';
+$('#apply').onclick = () => {
+  const code = $('#promo').value.trim().toUpperCase(); promo = '';
+  $('#promo-status').className = 'hint'; $('#promo-status').textContent = 'Checking…';
+  setTimeout(() => {
+    if (promos[code]) { promo = code; $('#promo-status').className = 'ok'; $('#promo-status').textContent = `${code} applied: ${promos[code]}.`; }
+    else { $('#promo-status').className = 'error'; $('#promo-status').textContent = code ? `${code} isn't a valid code.` : 'Enter a code first.'; }
+  }, 700);
+};
+$('#promo').addEventListener('input', () => { promo = ''; $('#promo-status').textContent = ''; });
+
+const luhn = (n) => [...n].reverse().reduce((sum, c, i) => { let d = Number(c); if (i % 2) { d *= 2; if (d > 9) d -= 9; } return sum + d; }, 0) % 10 === 0;
+$('#form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const e = {};
+  if (!$('#reference').value.trim()) e.reference = 'Enter your reference code.';
+  if (!$('#fullName').value.trim()) e.fullName = 'Enter your full name.';
+  if (!emailOk($('#email').value.trim())) e.email = 'Enter a valid email address.';
+  if ($('#phone').value.replace(/\D/g, '').length !== 10) e.phone = 'Enter a 10-digit phone number.';
+  if (!chosen) e.address = 'Choose an address from the suggestions.';
+  const shipping = document.querySelector('input[name=shipping]:checked')?.value;
+  if (!shipping) e.shipping = 'Choose a delivery option.';
+  const number = card.cardNumber.replace(/\s/g, '');
+  const [mm, yy] = card.expiry.split('/').map(Number);
+  if (number.length !== 16 || !luhn(number)) e.card = 'Card number is incomplete or invalid.';
+  else if (!(mm >= 1 && mm <= 12) || !yy || 2000 + yy < 2026 || (2000 + yy === 2026 && mm < 11)) e.card = 'Card expiry is invalid or in the past.';
+  else if (card.cvc.length !== 3) e.card = 'Enter the 3-digit CVC.';
+  if ($('#promo').value.trim() && !promo) e.promo = 'Apply the promo code, or clear it.';
+  if (!showErrors(e)) return;
+  if (!confirm(`Pay ${$('#total').textContent.replace('Total ', '')} now?`)) return;
+  await submit('checkout', {
+    reference: $('#reference').value.trim(), fullName: $('#fullName').value.trim(), email: $('#email').value.trim(),
+    shipping, address: chosen, phone: $('#phone').value, cardNumber: card.cardNumber, expiry: card.expiry, cvc: card.cvc, promo,
+  });
+  document.querySelector('.paybar')?.remove();
+});
+</script>
+</html>

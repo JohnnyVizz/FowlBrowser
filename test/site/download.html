@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Downloads</title>
+<link rel="stylesheet" href="style.css">
+<h1>Downloads</h1>
+<p><a id="attachment" href="download.txt">Download report</a></p>
+<p><a id="anchor" href="download.txt" download>Save with download attribute</a></p>
+<p><a id="blank" href="download.txt" target="_blank">Download in a new tab</a></p>
+<script>
+  // ?name=<file name> names the attachment, so parallel runs never share a file.
+  const name = new URLSearchParams(location.search).get('name') || 'fowlbrowser-download.txt';
+  document.getElementById('attachment').href = `download.txt?attachment=${encodeURIComponent(name)}`;
+  document.getElementById('anchor').download = `anchor-${name}`;
+  document.getElementById('blank').href = `download.txt?attachment=${encodeURIComponent(`blank-${name}`)}`;
+</script>

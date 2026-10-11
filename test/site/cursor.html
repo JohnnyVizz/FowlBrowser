@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Agent cursor</title>
+<link rel="stylesheet" href="cursor.css">
+<div id="mark"></div>
+<button id="target">Target</button>
+<input id="field" aria-label="Field">
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  if (location.search.includes('dark')) document.documentElement.className = 'dark';
+  const out = t => { document.getElementById('result').textContent = t; };
+  addEventListener('click', e => out(e.target.id === 'target' ? 'target' : `click:${e.clientX},${e.clientY}`));
+</script>

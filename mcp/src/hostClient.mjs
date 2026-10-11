@@ -1,0 +1,143 @@
+// Client for one FowlBrowser host socket: uint32 LE length + UTF-8 JSON frames, host.auth, client.hello.
+import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import { debug } from './debug.mjs';
+
+export const SOCKET_DIR = process.env.FOWLBROWSER_DIR || path.join(os.homedir(), '.fowlbrowser');
+const CONNECT_TIMEOUT_MS = 10_000;
+const REQUEST_TIMEOUT_MS = 40_000; // the extension already times CDP commands out at 30 s
+
+export function listSockets() {
+  if (!fs.existsSync(SOCKET_DIR)) return [];
+  return fs.readdirSync(SOCKET_DIR).filter((f) => f.endsWith('.sock')).map((f) => path.join(SOCKET_DIR, f));
+}
+
+// Emits 'event' (method, params) and 'close'. `hello` holds the host.hello params once connected.
+export class HostClient extends EventEmitter {
+  constructor(socketPath) {
+    super();
+    this.socketPath = socketPath;
+    this.hello = null;
+    this.closed = false;
+    this._pending = new Map();
+    this._nextId = 1;
+    this._buffer = Buffer.alloc(0);
+    this._inbox = [];
+    this._draining = false;
+  }
+
+  async connect(label) {
+    const token = fs.readFileSync(path.join(SOCKET_DIR, 'token'), 'utf8').trim();
+    this._socket = net.connect(this.socketPath);
+    this._socket.on('data', (chunk) => this._onData(chunk));
+    this._socket.on('close', () => this._onClose());
+    this._socket.on('error', () => this._socket.destroy());
+    // Every handshake step races one deadline and the socket closing, so a stuck host can't pin this connect.
+    let timer, onClose;
+    const failed = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`handshake with ${this.socketPath} timed out`)), CONNECT_TIMEOUT_MS);
+      onClose = () => reject(new Error(`${this.socketPath} closed during handshake`));
+      this.once('close', onClose);
+    });
+    failed.catch(() => {});
+    const hello = new Promise((resolve) => this.once('host.hello', resolve));
+    // client.hello replays tabs we own, then extension.initialized.
+    const initialized = new Promise((resolve) => this.once('extension.initialized', resolve));
+    try {
+      this._send({ method: 'host.auth', params: { token } });
+      this.hello = await Promise.race([hello, failed]);
+      await Promise.race([this.request('client.hello', { label }), failed]);
+      await Promise.race([initialized, failed]);
+    } finally {
+      clearTimeout(timer);
+      this.off('close', onClose);
+    }
+  }
+
+  request(method, params = {}) {
+    if (this.closed) return Promise.reject(new Error('browser disconnected'));
+    const id = this._nextId++;
+    if (method !== 'chrome.debugger.sendCommand') debug('host >', method, params);
+    this._send({ id, method, params });
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._pending.delete(id);
+        debug('host timeout', method);
+        reject(new Error(`${method} timed out`));
+      }, REQUEST_TIMEOUT_MS);
+      this._pending.set(id, { resolve, reject, timer });
+    });
+  }
+
+  close() {
+    this._socket?.destroy();
+  }
+
+  _send(message) {
+    const body = Buffer.from(JSON.stringify(message), 'utf8');
+    const header = Buffer.alloc(4);
+    header.writeUInt32LE(body.length, 0);
+    this._socket.write(Buffer.concat([header, body]));
+  }
+
+  _onData(chunk) {
+    this._buffer = this._buffer.length ? Buffer.concat([this._buffer, chunk]) : chunk;
+    while (this._buffer.length >= 4) {
+      const length = this._buffer.readUInt32LE(0);
+      if (this._buffer.length < 4 + length) break;
+      this._inbox.push(JSON.parse(this._buffer.subarray(4, 4 + length).toString('utf8')));
+      this._buffer = this._buffer.subarray(4 + length);
+    }
+    this._drain();
+  }
+
+  // One message per tick, in arrival order. A CDP reply reaches Playwright through a short promise chain while
+  // an event goes straight through; handling the next message only after that chain settles keeps replies and
+  // events in the order Chrome sent them (Playwright drops execution contexts that arrive before the frame tree).
+  _drain() {
+    if (this._draining) return;
+    this._draining = true;
+    const next = () => {
+      const message = this._inbox.shift();
+      if (!message) { this._draining = false; return; }
+      try {
+        this._onMessage(message);
+      } catch (error) {
+        debug('drain error', error?.message);
+      } finally {
+        setImmediate(next);
+      }
+    };
+    next();
+  }
+
+  _onMessage(message) {
+    if (message.id !== undefined) {
+      const pending = this._pending.get(message.id);
+      if (!pending) return;
+      this._pending.delete(message.id);
+      clearTimeout(pending.timer);
+      if (message.error) pending.reject(new Error(message.error.message));
+      else pending.resolve(message.result);
+      return;
+    }
+    if (message.method !== 'chrome.debugger.onEvent') debug('host event', message.method, message.params);
+    else if (/^(Runtime\.execution|Page\.frame|Target\.|Inspector\.)/.test(message.params?.[1])) debug('cdp event', message.params[1], message.params[0], message.params[2]);
+    this.emit(message.method, message.params);
+    this.emit('event', message.method, message.params);
+  }
+
+  _onClose() {
+    if (this.closed) return;
+    this.closed = true;
+    for (const { reject, timer } of this._pending.values()) {
+      clearTimeout(timer);
+      reject(new Error('browser disconnected'));
+    }
+    this._pending.clear();
+    this.emit('close');
+  }
+}

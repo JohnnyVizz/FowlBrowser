@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Big page</title><link rel="stylesheet" href="style.css"></head>
+<body>
+  <header>
+    <button id="add">Add item</button>
+    <p role="status" id="status">0 added</p>
+    <ul id="added" aria-label="Added items"></ul>
+  </header>
+  <main>
+    <h1>Long article</h1>
+    <p>The   quick
+       brown   fox.</p>
+    <ul id="rows"></ul>
+  </main>
+  <script>
+    const rows = document.getElementById('rows');
+    for (let i = 0; i < 1500; i++) {
+      const li = document.createElement('li');
+      li.textContent = `Row number ${i} with some filler text`;
+      rows.append(li);
+    }
+    let added = 0;
+    document.getElementById('add').addEventListener('click', () => {
+      added++;
+      const li = document.createElement('li');
+      li.textContent = `Added item ${added}`;
+      document.getElementById('added').append(li);
+      document.getElementById('status').textContent = `${added} added`;
+    });
+  </script>
+</body>
+</html>

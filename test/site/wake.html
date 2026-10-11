@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Sleeping user tab</title>
+<link rel="stylesheet" href="style.css">
+<h1>Stand-in for one of the user's background tabs</h1>
+<script>
+  // When the tab goes away, record whether it was awake (the debugger's focus emulation makes hasFocus() true),
+  // so a same-origin tab can tell whether closing it attached the debugger first.
+  const tag = new URLSearchParams(location.search).get('tag');
+  addEventListener('pagehide', () => {
+    localStorage.setItem(`wake-${tag}`, JSON.stringify({ hasFocus: document.hasFocus(), visibility: document.visibilityState }));
+  });
+</script>

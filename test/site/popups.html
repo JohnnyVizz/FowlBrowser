@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Popups</title>
+<link rel="stylesheet" href="style.css">
+<h1>Popups</h1>
+<button id="open">Open window</button>
+<button id="slow">Open slow window</button>
+<a id="blank" href="popup-target.html?via=blank" target="_blank">Open link in new tab</a>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  // ?tag= is passed on to the popups so a test run can find (and clean up) exactly its own tabs.
+  const tag = new URLSearchParams(location.search).get('tag') || '';
+  document.getElementById('blank').href += `&tag=${encodeURIComponent(tag)}`;
+  document.getElementById('open').onclick = () => {
+    const w = window.open(`popup-target.html?via=window-open&tag=${encodeURIComponent(tag)}`);
+    document.getElementById('result').textContent = w ? 'opened' : 'blocked';
+  };
+  // The popup's server answers after 3 s, so its page commits long after the click returns.
+  document.getElementById('slow').onclick = () => {
+    window.open(`popup-target.html?via=slow&tag=${encodeURIComponent(tag)}&delay=3000`);
+  };
+</script>

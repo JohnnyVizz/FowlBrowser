@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Results</title>
+<link rel="stylesheet" href="style.css">
+<h1>Results</h1>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  const q = new URLSearchParams(location.search).get('q');
+  document.getElementById('result').textContent = 'results:' + q;
+  document.title = 'Results for ' + q;
+</script>

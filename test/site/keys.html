@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Keyboard shortcuts</title>
+<link rel="stylesheet" href="style.css">
+<h1>Keyboard shortcuts</h1>
+<p>Ctrl/Cmd+K opens the palette, Escape closes it, ArrowDown moves the selection, ? shows help.</p>
+<div id="palette" hidden role="dialog" aria-label="Command palette">
+  <input id="palette-input" aria-label="Command">
+  <ul><li class="item">First</li><li class="item">Second</li><li class="item">Third</li></ul>
+</div>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  const state = { palette: false, selected: 0, help: false, keys: [] };
+  const show = () => { document.getElementById('result').textContent = JSON.stringify(state); };
+  const palette = document.getElementById('palette');
+  document.addEventListener('keydown', e => {
+    const combo = [e.ctrlKey && 'Control', e.metaKey && 'Meta', e.altKey && 'Alt', e.shiftKey && 'Shift', e.key].filter(Boolean).join('+');
+    state.keys.push(combo);
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      state.palette = true; palette.hidden = false;
+      document.getElementById('palette-input').focus();
+    } else if (e.key === 'Escape') {
+      state.palette = false; palette.hidden = true;
+    } else if (e.key === 'ArrowDown' && state.palette) {
+      state.selected = Math.min(state.selected + 1, 2);
+    } else if (e.key === '?') {
+      state.help = true;
+    }
+    show();
+  });
+  show();
+</script>
