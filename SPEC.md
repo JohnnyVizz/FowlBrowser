@@ -442,7 +442,10 @@ parked; never claimed tabs or tabs opened for_user), installed when the tab come
 `Page.addScriptToEvaluateOnNewDocument {runImmediately: true}` twice: MAIN world (no `worldName`) and the isolated world
 `fowlbrowser-popups`. They run in every same-process frame and every new document; out-of-process iframes get none
 (their popups take the browser's own path, tier 2's fallback below). The MAIN script decides; the isolated one acts and
-reports (MAIN hands over through a synchronous CustomEvent with a per-server random name on `document`).
+reports (MAIN hands over through a synchronous CustomEvent with a per-server random name on `document`, dispatched
+with the `dispatchEvent` taken at document start, so a page that wraps it later can't learn the name). The isolated
+world checks every request again (an http(s) URL, user activation, a well-formed payload), since a page that knew the
+name could send anything.
 - Gate, for both tiers: transient user activation, no modifier (and the left button) on the event being handled (a
   real modified click already means a background tab or a new window), an http(s) URL (never empty or about:blank:
   `window.open('')` then `document.write` needs the window), a new browsing context (never `_self`, `_parent`, `_top`,
@@ -450,8 +453,9 @@ reports (MAIN hands over through a synchronous CustomEvent with a per-server ran
   trusted click, not `download`, not `rel=opener`, not cancelled by the page's own handlers (decided by a bubble listener
   on `window` added while the click is on its way down, so after the page's handlers, which run once as usual).
 - Tier 1, no opener needed: `<a target=_blank>` or `<area>` without `rel=opener` (target=_blank implies noopener), a
-  link to a target no frame or window has, `window.open(url, name, "noopener"|"noreferrer")` (returns null, as
-  natively). The default action is cancelled and the isolated world clicks a private link (`target=_blank`, `rel`
+  link with `rel=noopener` or `noreferrer` to a target no frame or window has, `window.open(url, name,
+  "noopener"|"noreferrer")` (returns null, as natively). A link to any other name keeps its opener (HTML's "get an
+  element's noopener"), so it is tier 2. The default action is cancelled and the isolated world clicks a private link (`target=_blank`, `rel`
   noopener or noreferrer, the link's referrerPolicy) inside a closed shadow root with a non-composed synthetic click
   carrying Cmd (Ctrl off macOS): a background tab, with the browser's own referrer, initiator and popup-blocker check.
   It goes through OpenURL, so there is no Page.windowOpen: the isolated world reports `{"type":"open","url"}`, which the
@@ -466,8 +470,16 @@ reports (MAIN hands over through a synchronous CustomEvent with a per-server ran
   shows the asked URL or none yet, once per arm. The user's own tab switches (no new tab) and Cmd+T (chrome://newtab)
   are never touched. settleChild's re-activation stays as the fallback. Measured on mac2 (Chrome and Helium, 120 Hz):
   a witness tab, the active tab of that window, is hidden 5 to 13 ms and misses no frame.
-- `window.close()` is wrapped to report `{"type":"close"}` first (top frame only); the server sets
-  `tab.closedByPageAt = Date.now()` (takeover detection reads it: a tab that closed itself is no takeover).
+- `window.close()` is wrapped to report `{"type":"close"}` once the native close ran (top frame only), and the
+  isolated world passes it on only if `window.closed` is true (set at once when the browser accepts the close), so a
+  page can't fake one; the server sets `tab.closedByPageAt = Date.now()` (takeover detection reads it: a tab that
+  closed itself is no takeover).
+- After a detach nothing reaches the page over CDP (the user's Cancel on the debugging bar parks the tab with no
+  cleanup), so the scripts notice it themselves: before every intercept the isolated world appends a blank iframe to
+  its closed shadow root for a moment and looks for the binding in that frame's new context of its world. V8 puts
+  bindings only into contexts created while the session is attached, and after a detach the old ones stay but do
+  nothing, so a missing binding means the debugger is gone: the isolated world refuses, MAIN switches off for good
+  (natives back) and the page's own call runs natively. Until that first decision the wrappers only pass calls on.
 - The wrappers are Proxies of the natives (name and length kept), and `Function.prototype.toString` gives the native
   text for them. `Symbol.for("fowlbrowser.popups")` guards against a second install in a document.
 - Removed before a tab goes back to the user, while the debugger is still attached: tab_release, tab_keep, turn end

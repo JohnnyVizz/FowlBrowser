@@ -9,13 +9,13 @@ import { tabIdsIn } from '../lib.mjs';
 const TIER1 = [
   ['link', 'Open link in new tab', 'blank'],
   ['link', 'Open noopener link', 'rel-noopener'],
-  ['link', 'Open named link', 'named'],
   ['button', 'Open noopener window', 'noopener'],
 ];
 const TIER2 = [
   ['button', 'Open window', 'window-open'],
   ['button', 'Open popup window', 'features'],
   ['link', 'Open opener link', 'rel-opener'],
+  ['link', 'Open named link', 'named'], // a named target keeps its opener (HTML: only _blank implies noopener)
   ['button', 'Submit form to new tab', 'form'],
 ];
 const SETTLE_MS = 700; // a late flash (the switch back, a re-collapsed group) lands well within this
@@ -103,6 +103,9 @@ export default {
       const done = await t.until(async () => { const r = await t.resultOf(opener); return r?.closed && r; }, 'the opener sees the popup closed');
       t.eq(done, { opened: true, code: 'code-1234', closed: true }, 'the opener got the code');
       t.eq(await since(mark), [], 'the popup closing itself left the witness alone');
+      await new Promise(r => setTimeout(r, 500));
+      const gone = await t.call('snapshot', { tab: popup }).then(() => 'still there', (e) => e.message);
+      t.ok(!/took over|still there/.test(gone), `a popup that closed itself is no takeover (its close report counted): ${gone}`);
 
       t.step('tab_keep: window.open is native again in the live document');
       await t.eval(agent, `() => { window.__fbWrapped = window.open; return Object.getOwnPropertySymbols(window).some(s => s.description === 'fowlbrowser.popups'); }`)
