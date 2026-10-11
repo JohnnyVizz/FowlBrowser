@@ -8,6 +8,7 @@ import path from 'node:path';
 import { cdp } from './cdp.mjs';
 import { registerLighthouse } from './lighthouse.mjs';
 import { registerTrace } from './trace.mjs';
+import { sleep, tabInfo } from './util.mjs';
 
 export { cdp } from './cdp.mjs';
 
@@ -59,7 +60,6 @@ export async function tracingSlot() {
   return release;
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Chrome records one trace per browser: while another session records (a sibling agent's trace or Lighthouse run,
 // DevTools' Performance panel), Tracing.start fails with "Tracing has already been started". startTracing sends it
@@ -116,7 +116,7 @@ export async function readStream(send, stream) {
 // A claimed or handed-over tab (for_user, tab_keep) is the user's own page: reloading it for a measurement would throw
 // their state away.
 export async function isUsersTab(tab) {
-  const info = (await tab.browser.host.request('tabs.listAll', {})).find((t) => t.id === tab.tabId);
+  const info = await tabInfo(tab.browser, tab.tabId);
   return info?.origin === 'user' || !!info?.handedOver;
 }
 

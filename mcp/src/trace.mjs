@@ -8,10 +8,10 @@ import { z } from 'zod';
 import { cdp, cdpEvent, fileTab, isUsersTab, outputDir, readStream, stamp, startTracing, traceBusy, tracingSlot, waitForTracing } from './perf.mjs';
 import { cap } from './snapshots.mjs';
 import { notice } from './takeover.mjs';
+import { sleep } from './util.mjs';
 
 const INSIGHT_MAX_CHARS = 20_000;
 const gunzip = promisify(zlib.gunzip);
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // DevTools' default timeline categories plus JS sampling and screenshots (what DevTools and chrome-devtools-mcp record).
 const CATEGORIES = ['-*', 'blink.console', 'blink.user_timing', 'loading', 'devtools.timeline', 'disabled-by-default-devtools.target-rundown',
@@ -346,8 +346,22 @@ async function stop(tab, header, text) {
   if (!tab.trace?.startedAt) throw new Error('No trace is recording in this tab. Call trace_start first.');
   // A tab closing from here on ends the recording through this stop (endRecording releases): never mid-parse.
   tab.page.off('close', tab.trace.release);
+  let recording;
   try {
-    const { gz, dataLoss } = await stopRecording(tab);
+    recording = await stopRecording(tab);
+  } catch (error) {
+    // Refused before Chrome stopped: it may still record, so the recording stays tracked (slot, close listener) for a
+    // retry. One Chrome did stop (the trace itself was lost), says is not running, or whose tab is gone is let go of,
+    // as trace_start does.
+    if (error.traceEnded || /not started/i.test(error.message) || tab.page.isClosed?.()) {
+      endRecording(tab);
+      throw error;
+    }
+    tab.page.on('close', tab.trace.release);
+    throw new Error(`Chrome did not stop the recording: ${error.message.replace(/\.$/, '')}. Call trace_stop again.`);
+  }
+  try {
+    const { gz, dataLoss } = recording;
     const file = path.join(outputDir('traces'), `trace-${stamp()}-${fileTab(tab)}.json.gz`);
     await fs.writeFile(file, gz); // as Chrome wrote it: gzipped
     const parsed = await parseTrace(JSON.parse((await gunzip(gz)).toString('utf8')));

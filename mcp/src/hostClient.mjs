@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { debug } from './debug.mjs';
+import { debug, debugging } from './debug.mjs';
 
 export const SOCKET_DIR = process.env.FOWLBROWSER_DIR || path.join(os.homedir(), '.fowlbrowser');
 const CONNECT_TIMEOUT_MS = 10_000;
@@ -142,7 +142,7 @@ export class HostClient extends EventEmitter {
       return;
     }
     if (message.method !== 'chrome.debugger.onEvent') debug('host event', message.method, message.params);
-    else if (/^(Runtime\.execution|Page\.frame|Target\.|Inspector\.)/.test(message.params?.[1])) debug('cdp event', message.params[1], message.params[0], message.params[2]);
+    else if (debugging && /^(Runtime\.execution|Page\.frame|Target\.|Inspector\.)/.test(message.params?.[1])) debug('cdp event', message.params[1], message.params[0], message.params[2]);
     // A rename during the handshake comes before anyone listens for events: keep it in hello.
     if (message.method === 'extension.hello' && this.hello && message.params?.userAgent) this.hello = { ...this.hello, extension: message.params };
     this.emit(message.method, message.params);

@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 
 const file = process.env.FOWLBROWSER_DEBUG;
+export const debugging = !!file;
 
 function show(part) {
   if (typeof part === 'string') return part;

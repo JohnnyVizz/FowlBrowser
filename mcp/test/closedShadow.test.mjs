@@ -1,16 +1,17 @@
 // s refs of closed shadow roots, against a fake tab answering the CDP calls closedShadow.mjs makes.
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { mock, test } from 'node:test';
 import { closedShadowSection, focusShadowRef, shadowRefPoint } from '../src/closedShadow.mjs';
 
-// A claimed-tab fake: one closed root on host 10 whose controls are `controls` (backendNodeIds, each a button).
+// A claimed-tab fake: host 10 has a closed root while there are `controls` (backendNodeIds, each a button) in it.
 function fakeTab() {
-  const tab = { documentGeneration: 0, controls: [], focused: [], page: { url: () => 'https://example.test/' } };
+  const tab = { documentGeneration: 0, controls: [], focused: [], scans: 0, page: { url: () => 'https://example.test/' } };
   const answers = {
-    'Runtime.evaluate': () => ({ result: { value: 1 } }),
-    'DOM.getDocument': () => ({
-      root: { backendNodeId: 1, children: [{ backendNodeId: 10, shadowRoots: [{ backendNodeId: 11, shadowRootType: 'closed', children: tab.controls.map((id) => ({ backendNodeId: id })) }] }] },
-    }),
+    'DOM.getDocument': () => {
+      tab.scans++;
+      const shadowRoots = tab.controls.length ? [{ backendNodeId: 11, shadowRootType: 'closed', children: tab.controls.map((id) => ({ backendNodeId: id })) }] : [];
+      return { root: { backendNodeId: 1, children: [{ backendNodeId: 10, shadowRoots }] } };
+    },
     'Accessibility.queryAXTree': () => ({ nodes: tab.controls.map((id) => ({ backendDOMNodeId: id, role: { value: 'button' }, name: { value: `b${id}` } })) }),
     'DOM.focus': (params) => { tab.focused.push(params.backendNodeId); return {}; },
   };
@@ -46,6 +47,28 @@ test('closed shadow s refs: stable within a document, never reused across docume
   tab.controls = [];
   assert.equal(await closedShadowSection(tab), '');
   await assert.rejects(focusShadowRef(tab, 's4'), /from an earlier page/);
+});
+
+test('claimed tab without closed roots: a root attached later to an existing host is found once RESCAN_MS passed', async () => {
+  mock.timers.enable({ apis: ['Date'], now: 1_000_000 });
+  try {
+    const tab = fakeTab();
+    assert.equal(await closedShadowSection(tab), '');
+    assert.equal(tab.scans, 1);
+    // The page attaches a closed root to host 10, already in the DOM: no light-DOM change to notice.
+    tab.controls = [101];
+    mock.timers.tick(9_999);
+    assert.equal(await closedShadowSection(tab), '');
+    assert.equal(tab.scans, 1);
+    mock.timers.tick(1);
+    assert.deepEqual(refsOf(await closedShadowSection(tab)), ['s1=101']);
+    assert.equal(tab.scans, 2);
+    // A tab with roots scans on every snapshot.
+    assert.deepEqual(refsOf(await closedShadowSection(tab)), ['s1=101']);
+    assert.equal(tab.scans, 3);
+  } finally {
+    mock.timers.reset();
+  }
 });
 
 // The cover check before an s ref click: the page scrolled by 1000 px, the control's box at (100, 50) in the viewport.

@@ -16,5 +16,12 @@ export default {
     t.step('type without ref');
     await t.call('type', { tab, text: 'Ada Lovelace', snapshot: false });
     t.eq(await t.eval(tab, `() => document.getElementById('second').value`), 'Ada Lovelace', 'typed into the new field');
+
+    t.step('without ref, the focused field is replaced, or appended to with append: true (caret anywhere)');
+    await t.call('type', { tab, text: 'Grace', snapshot: false });
+    t.eq(await t.eval(tab, `() => document.getElementById('second').value`), 'Grace', 'replaced, as with a ref');
+    await t.eval(tab, `() => { document.getElementById('second').setSelectionRange(2, 2); return true; }`);
+    await t.call('type', { tab, text: ' Hopper', append: true, snapshot: false });
+    t.eq(await t.eval(tab, `() => document.getElementById('second').value`), 'Grace Hopper', 'appended at the end');
   },
 };

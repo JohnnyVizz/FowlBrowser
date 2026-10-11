@@ -7,6 +7,7 @@ import * as cursor from './cursor/index.mjs';
 import { uninstallPopups } from './popups.mjs';
 import { record, tabEvent } from './record.mjs';
 import { markEnding, parked } from './takeover.mjs';
+import { tabInfo } from './util.mjs';
 import { clearViewport } from './viewport.mjs';
 
 export const turnSocketPath = (pid = process.ppid) => `/tmp/fowlbrowser-turn-${pid}.sock`;
@@ -72,8 +73,8 @@ export async function endTurn(manager) {
         (close ? result.closed : result.released).push(id);
       } catch (error) {
         errors.push({ tab: id, error: error.message });
-        const now = await browser.host.request('tabs.listAll', {}).catch(() => null);
-        if (same() && now && now.find((t) => t.id === info.id)?.owner !== 'you') browser.forget(info.id); // gone, or no longer ours
+        const now = await tabInfo(browser, info.id).catch(() => undefined);
+        if (same() && now !== undefined && now?.owner !== 'you') browser.forget(info.id); // gone, or no longer ours
       }
     }));
   }));

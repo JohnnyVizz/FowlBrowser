@@ -33,9 +33,10 @@ function fakeBrowser() {
   const host = {
     async request(method, params) {
       calls.push([method, params]);
-      if (method === 'tabs.listAll') {
+      if (method === 'tabs.listAll' || method === 'tabs.info') {
         await new Promise((resolve) => setTimeout(resolve, 0)); // the extension answers later
-        return [1, 2, 3, 4, 5, 6, 7, 8, 9].map((id) => ({ id, owner: owners.has(id) ? 'you' : null, ...owners.get(id) }));
+        const all = [1, 2, 3, 4, 5, 6, 7, 8, 9].map((id) => ({ id, owner: owners.has(id) ? 'you' : null, ...owners.get(id) }));
+        return method === 'tabs.info' ? all.find((t) => t.id === params.tabId) ?? null : all;
       }
       await new Promise((resolve) => setTimeout(resolve, 50)); // slow enough for a concurrent request to join the run
       if (method === 'chrome.tabs.remove') return void owners.delete(params[0]);

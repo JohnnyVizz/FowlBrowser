@@ -1121,6 +1121,43 @@ test('tabs.listAll: kept and windowType per tab, tabs of popup and app windows, 
   assert.ok(!listed.has(devtools.id) && !listed.has(incognito.id));
 });
 
+test('tabs.info answers for one tab exactly as tabs.listAll lists it, null where listAll leaves it out', async () => {
+  const { chrome, call } = setup();
+  await call(1, 'client.hello', { label: 'Research' });
+  const { result: mine } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  const { result: theirs } = await call(2, 'tabs.open', {});
+  const user = chrome.addTab({ url: 'https://user.example', title: 'User', active: true, windowId: 3 });
+  const devtools = chrome.addTab({ windowId: 5 });
+  const incognito = chrome.addTab({ windowId: 6, incognito: true });
+  chrome.hooks.windows = { 3: { type: 'popup' }, 5: { type: 'devtools' }, 6: { incognito: true } };
+  const listed = new Map((await call(1, 'tabs.listAll', {})).result.map((t) => [t.id, t]));
+  const info = async (tabId) => (await call(1, 'tabs.info', { tabId })).result;
+
+  for (const id of [mine.id, theirs.id, user.id]) assert.deepEqual(await info(id), listed.get(id));
+  assert.deepEqual([listed.get(mine.id).owner, listed.get(mine.id).groupTitle], ['you', 'Research']);
+  assert.equal(listed.get(theirs.id).owner, 'other');
+  assert.deepEqual([listed.get(user.id).owner, listed.get(user.id).windowType, listed.get(user.id).groupTitle], [null, 'popup', null]);
+  assert.equal(await info(devtools.id), null);
+  assert.equal(await info(incognito.id), null);
+  assert.equal(await info(9999), null, 'a missing tab');
+
+  await call(1, 'tabs.park', { tabId: mine.id, kind: 'takeover' });
+  assert.equal((await info(mine.id)).parked, 'takeover');
+});
+
+test('a closed window forgets its armed popup and its active tab history', async () => {
+  const { core, call, chrome } = setup();
+  const userTab = chrome.addTab({ url: 'https://mail.example', active: true });
+  await core.onTabActivated({ tabId: userTab.id, windowId: 1 });
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  await call(1, 'tabs.expectChild', { tabId: opener.id, ms: 3000 });
+  await core.onDebuggerEvent({ tabId: opener.id }, 'Page.windowOpen', { url: 'https://idp.example/auth' });
+  core.onWindowRemoved(1);
+  // Window ids are not reused in practice, but nothing of the old window may act on a tab that turns up with its id.
+  core.onTabCreated(structuredClone(chrome.addTab({ active: true, url: '' })));
+  assert.ok(!chrome.calls.some((c) => c[0] === 'tabs.update' && c[2].active === true));
+});
+
 test('a tab the user opens from a tab already handed to them stays theirs', async () => {
   const { core, chrome, call } = setup();
   const { result: kept } = await call(1, 'tabs.open', { forUser: true });

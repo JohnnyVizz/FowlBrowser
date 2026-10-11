@@ -562,7 +562,7 @@ function fakeTab() {
         return params[1] === 'Page.addScriptToEvaluateOnNewDocument' ? { identifier: String(next++) } : {};
       }
       commands.push([method, params]);
-      return method === 'tabs.listAll' ? [] : { ok: true };
+      return method === 'tabs.info' ? null : { ok: true };
     },
   };
   const browser = { key: 'chrome', name: 'Chrome', host, tabs: new Map(), adopting: new Map(), forget(id) { this.tabs.delete(id); } };
@@ -591,7 +591,7 @@ test('installed over raw CDP: the binding first (isolated world only), then both
   assert.deepEqual(opens, ['https://site.example/next']);
   await sleepMs(0);
   assert.deepEqual(commands.filter(([m]) => m === 'tabs.openChild'), [['tabs.openChild', { tabId: 7, url: 'https://site.example/next' }]], 'the extension opens it');
-  assert.equal(tab.closedByPageAt, undefined);
+  assert.equal(tab.closedByPageAt, null);
   const before = Date.now();
   tab.emit('binding', '__fowlbrowserPopup', '{"type":"close"}');
   assert.ok(tab.closedByPageAt >= before);
@@ -699,7 +699,7 @@ test('a tab kept while it is being adopted never keeps popup scripts: adoption s
       on() {},
       async request(method, params) {
         commands.push(method === 'chrome.debugger.sendCommand' ? `${params[1]} ${params[2]?.name ?? ''}`.trim() : method);
-        if (method === 'tabs.listAll') return [{ id: 7, owner: 'you', origin: 'agent', kept, handedOver: kept, parked: null }];
+        if (method === 'tabs.info') return { id: 7, owner: 'you', origin: 'agent', kept, handedOver: kept, parked: null };
         if (method === 'tabs.keep') { await sleepMs(20); kept = true; return { ok: true }; }
         if (method === 'tabs.isShown') return { shown: false };
         return method === 'chrome.debugger.sendCommand' && params[1] === 'Page.addScriptToEvaluateOnNewDocument' ? { identifier: '1' } : {};

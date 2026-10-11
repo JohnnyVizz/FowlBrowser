@@ -2,8 +2,7 @@
 import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import path from 'node:path';
-import { chromium } from 'playwright-core';
-import { isOwnBinding } from './cdp.mjs';
+import { cdp, isOwnBinding } from './cdp.mjs';
 import { watchClosedShadow } from './closedShadow.mjs';
 import { prepare as prepareCursor } from './cursor/index.mjs';
 import { debug } from './debug.mjs';
@@ -11,6 +10,7 @@ import { HostClient, listSockets } from './hostClient.mjs';
 import { installPopups } from './popups.mjs';
 import { downloadDone, record } from './record.mjs';
 import { Activity, currentCall, heldBack, refuseParked, watchTakeovers, watchUserInput } from './takeover.mjs';
+import { tabInfo } from './util.mjs';
 import { CDPRelay } from './vendor/cdpRelay.mjs';
 
 export const LABEL = process.env.FOWLBROWSER_LABEL || 'Claude';
@@ -50,8 +50,17 @@ export class Tab extends EventEmitter {
     this.frameGeneration = 0; // bumped when any iframe navigates (its refs from before are void; snapshots.mjs numberRefs)
     this._queue = Promise.resolve();
     this._calls = 0; // run() calls not yet settled
-    this.activity = new Activity(); // when calls ran on the tab: input in the page then is the agent's (takeover.mjs)
+    this.navigations = new Activity(); // the agent's own navigations: a back, forward or reload then is no takeover (takeover.mjs)
     this._busy = null;
+    // Set by other modules:
+    this.refs = null; // ref numbering across snapshots (snapshots.mjs newRefState)
+    this.snapshotBaseline = null; // the last whole-page snapshot, for changes-only results (tools.mjs snapshotText)
+    this.snapshotCount = 0; // whole-page snapshots so far
+    this.viewport = null; // the viewport tool's override (viewport.mjs)
+    this.trace = null; // the recording and the last parsed trace (trace.mjs)
+    this.memory = null; // the last memory reading (perf.mjs)
+    this.ending = false; // this session is closing or releasing it: its page closing is ours (record mode)
+    this.closedByPageAt = null; // when the page called window.close() (popups.mjs)
     page.setDefaultTimeout(ACTION_TIMEOUT_MS);
     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
     page.on('dialog', (dialog) => {
@@ -77,11 +86,11 @@ export class Tab extends EventEmitter {
   // The next call starts once this one, and any work it left running (keepBusy), has finished. The check runs
   // right before each call starts, so work that resumes after its dialog is answered still holds the tab.
   // A tool call queued before the tab was parked (taken over, handed off) fails with the notice when its turn comes.
+  // Neither a running nor a queued call masks the user's input (only the input the agent sends does, takeover.mjs).
   run(fn) {
     this._calls++;
-    const acted = this.activity.begin();
     const call = currentCall();
-    const result = this._queue.then(() => this._idle()).then(() => { refuseParked(this, call); return fn(); }).finally(() => { this._calls--; acted(); });
+    const result = this._queue.then(() => this._idle()).then(() => { refuseParked(this, call); return fn(); }).finally(() => { this._calls--; });
     this._queue = result.catch(() => {});
     return result;
   }
@@ -116,7 +125,7 @@ export class Tab extends EventEmitter {
   // The browser's own title for the tab; unlike document.title it does not wait for the page's JS thread
   // (blocked while a dialog is open).
   async currentTitle() {
-    const info = await this.browser.host.request('chrome.debugger.sendCommand', [{ tabId: this.tabId }, 'Target.getTargetInfo']).catch(() => null);
+    const info = await cdp(this, 'Target.getTargetInfo').catch(() => null);
     return info?.targetInfo?.title ?? '';
   }
 }
@@ -130,7 +139,6 @@ export class Browser {
     this._n = n;
     const hello = host.hello;
     this.silentDebugger = hello.silentDebugger;
-    this.version = appVersion(hello.browserPath);
     this.chromiumVersion = hello.extension?.userAgent?.match(/Chrome\/(\S+)/)?.[1] ?? null;
     this.tabs = new Map(); // chrome tab id -> Tab
     this.relay = new CDPRelay((method, params) => host.request(method, params), hello.extension?.userAgent);
@@ -148,6 +156,12 @@ export class Browser {
     this._pages = new WeakMap(); // Playwright page -> Promise<Tab | null>
     this._waiters = new Map(); // chrome tab id -> resolve functions of waitForTab calls
     this.adopting = new Map(); // chrome tab id -> its _adopt still setting up (settles once it is done)
+  }
+
+  // The app's version, read once when first asked (browser_list), not at connect.
+  get version() {
+    if (this._version === undefined) this._version = appVersion(this.host.hello.browserPath);
+    return this._version;
   }
 
   // "Chrome (Work)" with the label the user gave this browser profile in the extension's popup, else "Chrome (2)".
@@ -196,6 +210,7 @@ export class Browser {
 
   playwright() {
     this._pw ??= (async () => {
+      const { chromium } = await import('playwright-core'); // loaded with the first tab, not at startup
       const pw = await chromium.connectOverCDP(this._relayUrl, { timeout: NAVIGATION_TIMEOUT_MS });
       const context = pw.contexts()[0];
       context.on('page', (page) => this.tabFor(page));
@@ -232,12 +247,13 @@ export class Browser {
       // keep and release wait for this (adopting) to take out the popup scripts it installs; it sees one that came first.
       let adopted;
       this.adopting.set(tabId, new Promise((resolve) => { adopted = resolve; }));
-      const info = (await this.host.request('tabs.listAll', {}).catch(() => [])).find((t) => t.id === tabId);
-      // Popups open in the background only from the agent's own tabs, never from tabs that are (or went back to) the user's.
-      if (info?.origin === 'agent' && !info.handedOver && !info.kept && !info.parked) await installPopups(tab).catch((e) => debug('popups: install failed', e.message));
-      // The attachShadow hook goes only into agent tabs; the user's claimed tabs get a scan per document instead.
-      await watchClosedShadow(tab, info?.origin === 'agent').catch(() => {});
-      await watchUserInput(tab).catch(() => {});
+      const [info] = await Promise.all([tabInfo(this, tabId).catch(() => null), watchUserInput(tab).catch(() => {})]);
+      await Promise.all([
+        // Popups open in the background only from the agent's own tabs, never from tabs that are (or went back to) the user's.
+        info?.origin === 'agent' && !info.handedOver && !info.kept && !info.parked && installPopups(tab).catch((e) => debug('popups: install failed', e.message)),
+        // The attachShadow hook goes only into agent tabs; the user's claimed tabs get a scan per document instead.
+        watchClosedShadow(tab, info?.origin === 'agent').catch(() => {}),
+      ]);
       this.adopting.delete(tabId);
       adopted(page.isClosed() ? null : tab);
       if (page.isClosed()) return null;

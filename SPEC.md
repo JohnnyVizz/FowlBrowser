@@ -86,6 +86,7 @@ opened by an owned tab) or `user` (claimed). Only the owner may attach/send/deta
 |---|---|---|
 | `client.hello` | `{label}` | registers label; replies `{ok:true}`; then emits to that client `chrome.tabs.onCreated [tab]` for each tab it owns (normally none) and then `extension.initialized []` |
 | `tabs.listAll` | `{}` | every tab in non-incognito normal, popup and app windows (never DevTools): `{id, windowId, windowType, index, url, title, active, pinned, audible, muted, groupTitle, owner: "you"|"other"|null, origin, handedOver, kept, parked: "takeover"|"handoff"|null}` |
+| `tabs.info` | `{tabId}` | one tab in the `tabs.listAll` shape, from `chrome.tabs.get` and `chrome.windows.get` (cost does not grow with the tab count); `null` when the tab is gone, incognito or in a window `tabs.listAll` leaves out |
 | `tabs.open` | `{url?, group?, muted?=true, forUser?}` | new tab, `active:false`, in the last focused normal window (if none: `chrome.windows.create({focused:false, url})`), muted unless `muted:false`, `autoDiscardable:false`, added to the client's tab group for `group` (default: client label); owned, origin agent. With `forUser:true` the tab is the user's from the start: not grouped, autoDiscardable left alone, kept and already handed over (the client drives it until it disconnects); it is muted right away and its owner record marked `agentMuted`, so nothing plays while the client drives it, and when control ends (release, disconnect) it is unmuted if this extension's mute is still on (`mutedInfo.reason` `extension` with our id; the user's own mute or unmute stays). Emits `chrome.tabs.onCreated [tab]` to the client, then returns the tab. If any step after creating the tab fails, the tab is closed again and the error returned (no tab the client wasn't told about) |
 | `chrome.tabs.create` | `[createProperties]` | Playwright v2 path (`page.context().newPage()`): same as `tabs.open` with `url`, returns tab. Does NOT emit onCreated (the relay model attaches itself) |
 | `chrome.tabs.remove` | `[tabIds, {usersTab?}]` | closes owned tabs; a parked one only with `usersTab: true` (the user asked for it: MCP `tab_close confirm_close_users_tab`), checked in the tab's queue |
@@ -139,7 +140,6 @@ click download is by URL and timing. If the user downloads the very same URL wit
 agent's own item is slow to appear, or downloads from another tab on the agent's page and closes that tab within
 the settle, the agent can be handed their file. Agents act with the user's session, so it is a file the agent could fetch
 itself; `download` with `url` is exact.
-Event to all clients: `tabs.changed []` (debounced 200 ms) when tabs are created/removed/updated (url/title).
 
 Client disconnect (`host.clientDisconnected`): for each owned tab, origin agent and not kept -> ungroup then close
 (Chrome keeps closed groups as saved groups otherwise); kept -> ungroup, unmute, discardable again, unless it was already
@@ -163,8 +163,11 @@ to give a window back the tab that was active before an agent popup took its pla
 - Discovers `~/.fowlbrowser/*.sock` (rescan when a tool names an unknown browser and every 5 s while any expected
   browser is missing), one connection per socket, `client.hello {label}`; label = env `FOWLBROWSER_LABEL` or `Claude`.
 - Per browser: a relay (vendored `BrowserModel` + the browser-level command handling from Playwright's `cdpRelay.ts`)
-  served on `ws://127.0.0.1:<random port>/<random token>`; `chromium.connectOverCDP(url)` lazily on first use;
-  pages mapped to chrome tab ids.
+  served on `ws://127.0.0.1:<random port>/<random token>`; `chromium.connectOverCDP(url)` lazily on first use (and
+  playwright-core is imported then, not at startup); pages mapped to chrome tab ids. The browser app's version is read
+  when browser_list first asks for it. One-tab questions (ownership, origin, kept, parked) use `tabs.info`, not the
+  whole tab list. A tab coming under control gets its page scripts (popups, the closed-shadow hook, the user-input
+  listener) set up in parallel.
 - Tab ids exposed to the model are strings `"<browser>:<chromeTabId>"`, e.g. `helium:1834`. Every tool takes an
   explicit tab (no shared "current tab"), so subagents sharing one server never collide. Calls on the same tab
   run one at a time; different tabs run in parallel.
@@ -178,7 +181,7 @@ to give a window back the tab that was active before an agent popup took its pla
   back/forward cache keeps refs Playwright gave it on the earlier visit, whose prefix names a frame number Playwright has
   retired: refs outside iframes are looked up in the main frame directly, whatever their prefix.
   A string that is not a snapshot ref (`e12`, `f3e12`, `s4`) is refused at once; a ref whose element is gone fails
-  within 1 s ("Ref eN is from an older snapshot ..."); an iframe ref whose frame is gone fails at once ("Ref fNeM is in
+  within about 1 s ("Ref eN is from an older snapshot ..."); an iframe ref whose frame is gone fails at once ("Ref fNeM is in
   an iframe that has reloaded or gone since that snapshot ...").
   Action tools return the new URL/title, any open dialog, new tabs opened by the action, and the updated snapshot
   (`snapshot:false` skips it). Whole-page snapshots are numbered per tab ("Snapshot 7 of this tab:"). On the same
@@ -200,12 +203,17 @@ to give a window back the tab that was active before an agent popup took its pla
 - After an action the server waits for what it started: a main-frame navigation until the new document commits (or
   the request, followed through its redirects, ends without one: download, 204, error; not committing within the
   navigation timeout is an error, never a success on the old page) and loads, else until its document/xhr/fetch/script/stylesheet
-  requests finish (3 s cap). It watches for such a start for 300 ms when a snapshot will be returned (then 200 ms more
-  after requests); without one, 100 ms after actions and 50 ms after reads (evaluate, media). navigate and tab_open
+  requests finish (3 s cap), then 100 ms more and once more for a navigation one of them started. It watches for such a
+  start until the first such request, at most 300 ms when a snapshot will be returned; without one, 100 ms after
+  actions and 50 ms after reads (evaluate, media). An action that committed a new document itself (a link click whose
+  commit Playwright waited for) only waits for its load; navigate and wait_for, which waited for their own condition,
+  watch for nothing more. The dialog tool watches the same way after accepting or dismissing. navigate and tab_open
   wait up to 5 s for the load event unless the document is already complete (a back/forward cache restore never fires
-  it, so Back and Forward to such a page return in well under a second).
+  it, so Back and Forward to such a page return in well under a second). A result's title is read alongside its snapshot.
 - Before every action on a tab the server sends `tabs.expectChild {tabId, ms: 3000}` (an "Unknown method" reply from an
-  older extension is ignored), so popups from the agent's own action in a claimed tab are adopted. Action results name
+  older extension is ignored), so popups from the agent's own action in a claimed tab are adopted. It does not wait for
+  the reply: the host and the extension take one client's requests in order, so the window is open before any of the
+  action's input arrives. Action results name
   new tabs as "New tab opened by this action (loading): <id>", matched from the extension's chrome.tabs.onCreated by
   opener, waiting up to 2 s for as many as the page asked for (Page.windowOpen, or the popup script's `open` report for
   a background tab it opened), so slow popups are reported too.
@@ -214,7 +222,9 @@ to give a window back the tab that was active before an agent popup took its pla
 - Agent cursor ([docs/cursor-spec.md](docs/cursor-spec.md), `mcp/src/cursor/`): a rounded pointer in the session's colour with a name label (motion after Cua's signature_arc). In a tab
   `tabs.isShown` says the user can see, every action shows it: it travels to the target before pointer actions (click,
   hover, drag, type/fill, select_option, press_key with a ref, scroll, upload) and shows the action as a word in its label
-  (reading, scrolling, typing, pressing keys, loading, dragging, uploading), with a press and a ring for clicks; hidden for screenshots, gone after 15 s idle or when
+  (reading, scrolling, typing, pressing keys, loading, dragging, uploading), with a press and a ring for clicks (played as
+  the action's mouse press is sent, through the relay's `onInput`, not once a navigation it started is done; a drag's
+  word starts at its press too); hidden for screenshots, gone after 15 s idle or when
   control ends. Not shown: nothing is injected. Best effort: never fails an action or delays it more than 1050 ms
   (900 ms to arrive, 150 ms to land on the target fully shown).
 - Turn end (`mcp/src/turns.mjs`, Codex's per-turn cleanup): the server listens on `/tmp/fowlbrowser-turn-<parent pid>.sock`
@@ -246,7 +256,9 @@ to give a window back the tab that was active before an agent popup took its pla
   one from an earlier page is refused. Clicking one
   first scrolls it into view and checks what is under its centre (`DOM.getNodeForLocation` takes document coordinates,
   so the scroll offset is added), and fails, naming the cover, if something other than the control, its own
-  pseudo-elements or nodes inside it is there.
+  pseudo-elements or nodes inside it is there. A claimed tab (no hook in the user's page) gets a full scan
+  (`DOM.getDocument` pierce) on a document's first snapshot, on every snapshot while it has closed roots, and otherwise
+  at most every 10 s, so a closed root attached later to an element already on the page is listed within 10 s.
 - The relay refuses wrong paths before the WebSocket upgrade and validates every frame. It answers page emulation itself
   (`Emulation.setEmulatedMedia`, `setAutoDarkModeOverride`, `setUserAgentOverride`, `setLocaleOverride`,
   `setTimezoneOverride`, `setDeviceMetricsOverride`, `setTouchEmulationEnabled`, `setEmitTouchEventsForMouse`,
@@ -349,18 +361,22 @@ A tab this session controls (agent or claimed) is **taken over** when the user d
   type per 250 ms. `keydown` with Cmd held is left out: Cmd shortcuts are the browser's (address bar, close, reload,
   DevTools), and their own signals cover them. The listener also reports `navigate` (Navigation API) events with
   `userInitiated: false`: the page navigating itself (see below). Limits: cross-origin iframes are other processes, seen
-  only through the top window's `blur`; input while an agent call runs on the tab is the agent's (masked). The relay drops
+  only through the top window's `blur`; input within 250 ms of the agent's own input to the tab counts as the agent's
+  (masked). A call that only reads or waits (snapshot, evaluate, wait_for), or one queued behind another, masks nothing:
+  the user's click during a 120 s wait_for takes the tab over, and the queued calls fail with the notice. The relay drops
   `Runtime.bindingCalled` events of our bindings before Playwright sees them (Playwright parses every binding payload as
   its own).
   CDP input is trusted too and pages can't tell it apart, so an event is the user's only when **both**:
-  - its time is outside every agent window of that tab: each tool call's run on the tab `[start - 50 ms, end + 250 ms]`,
-    and each `Input.*` command the relay forwards for it `[sent - 50 ms, replied + 250 ms]`; and
+  - its time is outside every agent input window of that tab: each `Input.*` command the relay forwards for it
+    `[sent - 50 ms, replied + 250 ms]` (clicks, keys, wheel, drags, Playwright's fill and insertText, the keyboard on
+    closed-shadow refs: every input the agent sends goes through the relay); and
   - the extension says the tab is the active tab of a focused, non-minimized window (`tabs.isShown` answers `focused`
     too). Background agent tabs never count.
 - Navigation the user started, from `webNavigation.onCommitted` of the tab's main frame (the extension emits
   `tabs.committed {tabId, url, transitionType, transitionQualifiers}` to the owner): `from_address_bar`, or
   `auto_bookmark`, `keyword`, `keyword_generated`, `generated`; or `reload` / `forward_back` outside every agent window
-  of the tab (above, plus 1.5 s, since the agent's own navigate commits after its command) and not within 1 s of the page
+  of the tab (its input windows above, and its own navigations: navigate's back, forward and reload, Lighthouse's reload
+  after an audit; each plus 1.5 s, since they commit after their command) and not within 1 s of the page
   asking for a navigation itself (`Page.frameRequestedNavigation` of the main frame on the tab's session, its `frameId`
   being the tab's target id, or the listener's `navigate` report, sent from the top frame only: an iframe navigating
   itself says nothing about the tab); `forward_back` also only while the tab is shown in the focused window (the Back button, Cmd-[ and the swipe
@@ -398,8 +414,10 @@ extension, which un-parks only for `tabs.claim {resume: true}` (sent only by `ta
 `tabs.park` errors after the extension parked the tab (an ungroup refused while the user drags a tab) keeps its record:
 the server asks `tabs.listAll` and drops the record only if the tab is not parked. The server
 instructions say to use `resume` only after the user said so. A tab now on a page that can't be controlled (chrome://)
-stays parked and the claim fails. Agent windows are kept in `mcp/src/takeover.mjs`: `Tab.run` and the relay's `onInput`
-hook (every `Input.*` it forwards, by the session's tab) open and close them; finished ones are kept 5 s.
+stays parked and the claim fails. Agent windows are kept in `mcp/src/takeover.mjs`: the relay's `onInput` hook (every
+`Input.*` it forwards, by the session's tab) and `navigating` (`Tab.navigations`) open and close them; finished ones
+are kept 5 s. Per-tab bookkeeping (histories, input windows, ending, the page's own navigations, crashes) goes when the
+tab is removed.
 
 ### Handoff: giving a tab to the user mid-task
 `tab_handoff {tab, reason}` (logins, 2FA, CAPTCHAs, payments, anything only the user should do): removes the cursor
@@ -622,7 +640,9 @@ the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements 
   With `auto_stop` it waits `seconds` after the load (or after the start) and returns what `trace_stop` returns; without it
   the result says the trace is recording and `trace_stop` ends it. One recording per tab; a second `trace_start` meanwhile
   errors, a `trace_stop` without a recording errors.
-- `trace_stop {tab}`: `Tracing.end` (a failed one stops the wait for `tracingComplete` at once), reads the gzipped
+- `trace_stop {tab}`: `Tracing.end` (a failed one stops the wait for `tracingComplete` at once; Chrome may still record,
+  so the recording stays tracked with its slot and close listener and the error says "Chrome did not stop the recording:
+  <reason>. Call trace_stop again.", unless the tab is gone), reads the gzipped
   stream (`IO.read`, 1 MB chunks; `IO.close` whatever happens), saves it as Chrome wrote it to
   `os.tmpdir()/fowlbrowser-traces/trace-<stamp>-<tab>.json.gz` (loads in DevTools' Performance panel), parses it with the
   trace engine (then resets the engine's module state, which otherwise keeps the raw events; the parsed data kept per tab

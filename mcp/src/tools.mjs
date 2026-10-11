@@ -12,6 +12,7 @@ import { backgroundClick, openingLines, uninstallPopups } from './popups.mjs';
 import * as record from './record.mjs';
 import * as takeover from './takeover.mjs';
 import { callsByTab } from './turns.mjs';
+import { sleep, tabInfo, within } from './util.mjs';
 import { clearViewport, MAX_SIZE, MIN_SIZE, setViewport } from './viewport.mjs';
 import { cap as capText, collapseText, functionSource, newRefState, numberRefs, playwrightRef, REF_PATTERN, shownRef, SNAPSHOT_MAX_CHARS, SNAPSHOT_MAX_CHARS_LIMIT,
   snapshotChanges, urlMatcher } from './snapshots.mjs';
@@ -20,7 +21,6 @@ const MAX_CHARS = 80_000; // ~20k tokens, for evaluate, console and network outp
 const POPUP_WAIT_MS = 2000; // after an action the page asked for a new tab: how long to wait for the extension to announce it
 // Tools that still work on a parked tab (taken over by the user, or handed to them); every other one gets its notice.
 const ON_PARKED_TABS = new Set(['tab_claim', 'tab_release', 'tab_close', 'tab_focus']);
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // --- Schemas shared by many tools ---
 
@@ -47,7 +47,7 @@ async function resolveTab(manager, value) {
   const browser = await manager.get(key);
   if (!browser.relay.model.hasTab(tabId) && !browser.tabs.has(tabId)) {
     // Control also ends when the browser's connection to FowlBrowser restarts (extension reload): the tab is the user's again.
-    const info = (await browser.host.request('tabs.listAll', {}).catch(() => [])).find((t) => t.id === tabId);
+    const info = await tabInfo(browser, tabId).catch(() => null);
     if (info?.owner === null) {
       throw new Error(`Tab ${key}:${tabId} is not controlled by this session: it is the user's tab (never yours, released, or control ended when the browser's ` +
         'FowlBrowser connection restarted). To work in it, tab_claim it.');
@@ -104,9 +104,10 @@ async function checkRefs(tab, args) {
 }
 
 // The agent cursor (docs/cursor-spec.md), only in a tab the user can see: it travels to `where` (a point, or a function
-// returning one) before the action, plays `cue` during it, and clicks after it (feedback: false when the action is
-// no click). Not shown: none of it runs.
-async function pointed(tab, where, action, { feedback = true, shown, cue, deadline = Date.now() + cursor.ARRIVAL_CAP_MS } = {}) {
+// returning one) before the action, plays `cue` during it (cueOnPress: from the action's mouse press on), and clicks
+// when the action presses the mouse button (feedback: false when the action is no click), not once the action and a
+// navigation it started are done; an action that presses none (a select) clicks at its end. Not shown: none of it runs.
+async function pointed(tab, where, action, { feedback = true, shown, cue, cueOnPress = false, deadline = Date.now() + cursor.ARRIVAL_CAP_MS } = {}) {
   // One budget for the whole cursor path (visibility, target, travel): a slow answer means "not shown".
   shown ??= await cursor.isShown(tab);
   // A target found too late is still shown while the action runs (late: in record mode the point line says so).
@@ -115,18 +116,28 @@ async function pointed(tab, where, action, { feedback = true, shown, cue, deadli
   let late = false;
   const target = shown ? await cursor.moveTo(tab, where, Math.max(0, deadline - Date.now()), { acting, onLate: () => { late = true; } }) : null;
   const seen = record.recording && shown ? await record.pointSeen(tab, target, () => cursor.state(tab)) : null;
-  if (shown && cue) cursor.cue(tab, cue);
+  if (shown && cue && !cueOnPress) cursor.cue(tab, cue);
+  let pressed = false;
+  const onInput = (method, params) => {
+    if (pressed || method !== 'Input.dispatchMouseEvent' || params?.type !== 'mousePressed') return;
+    pressed = true;
+    if (cueOnPress) cursor.cue(tab, cue);
+    if (feedback) cursor.click(tab);
+  };
+  const listening = shown && (feedback || cueOnPress);
+  if (listening) tab.on('input', onInput);
   let failed = null;
   try {
     const result = await action();
-    if (shown && feedback) cursor.click(tab);
+    if (shown && feedback && !pressed) cursor.click(tab);
     return result;
   } catch (error) {
     failed = error;
     throw error;
   } finally {
+    if (listening) tab.off('input', onInput);
     actionDone();
-    if (shown && cue) cursor.cueEnd(tab);
+    if (shown && cue && (!cueOnPress || pressed)) cursor.cueEnd(tab);
     if (seen) record.pointDone(late ? { ...seen, late: true } : seen, failed);
   }
 }
@@ -194,9 +205,22 @@ const CARET_TO_END_FN = function (el) {
   selection.collapseToEnd();
 };
 
-const SELECT_ALL_FN = function () {
-  if (typeof this.select === 'function') this.select();
-  else getSelection().selectAllChildren(this);
+const SELECT_ALL_FN = function (el) {
+  el = el ?? this;
+  if (typeof el.select === 'function') el.select();
+  else getSelection().selectAllChildren(el);
+};
+
+// The focused element (inside open shadow roots too) if it is a text field or editable element the user can see; null
+// for anything else, and for editors that take keys through a hidden or tiny field (code and canvas editors).
+const FOCUSED_FIELD_FN = () => {
+  let el = document.activeElement;
+  while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement;
+  const field = el?.matches('textarea, input') ? !/^(button|submit|reset|checkbox|radio|file|image|range|color|hidden|date|datetime-local|month|week|time)$/.test(el.type)
+    : !!el?.isContentEditable;
+  if (!field) return null;
+  const r = el.getBoundingClientRect();
+  return r.width >= 4 && r.height >= 4 && getComputedStyle(el).opacity !== '0' ? el : null;
 };
 
 // Waits up to 5 s for the page's load event, unless the document is complete already: a page restored from the
@@ -278,7 +302,9 @@ function dialogLine(tab) {
 const text = (body) => ({ content: [{ type: 'text', text: body }] });
 
 async function report(tab, { lines = [], newTabs = [], snapshot = true, ref, changes, maxChars } = {}) {
-  const out = [await header(tab)];
+  // The title and the snapshot are read together.
+  const [head, snap] = await Promise.all([header(tab), snapshot && snapshotText(tab, { ref, changes, maxChars })]);
+  const out = [head];
   const dialog = dialogLine(tab);
   if (dialog) out.push(dialog);
   for (const t of newTabs) {
@@ -287,29 +313,52 @@ async function report(tab, { lines = [], newTabs = [], snapshot = true, ref, cha
       : `New tab opened by this action (you control it): ${t.id} · ${t.url}`);
   }
   out.push(...lines.filter(Boolean));
-  if (snapshot) out.push(await snapshotText(tab, { ref, changes, maxChars }));
+  if (snapshot) out.push(snap);
   return text(out.join('\n'));
 }
 
 // After an action: wait for a navigation it started to commit and load, or for the requests it fired to finish.
-// It first watches for such a start: 300 ms when a snapshot will be returned; without one (snapshot: false) nothing
-// returned depends on the page settling, so 100 ms after an action and 50 ms after a read (evaluate, media).
+// An action that committed a new document itself (a link whose commit Playwright's click waited for) only waits for its
+// load; `waited` (navigate, wait_for: the action waited for its own condition) nothing more. Else it watches for such a
+// start until the first request that counts, at most 300 ms when a snapshot will be returned; without one (snapshot:
+// false) nothing returned depends on the page settling, so 100 ms after an action and 50 ms after a read (evaluate, media).
 const WATCH_MS = { snapshot: 300, action: 100, read: 50 };
-async function settle(tab, requests, { watchMs = WATCH_MS.snapshot, generation, trailing = true, timeout = NAVIGATION_TIMEOUT_MS } = {}) {
-  await sleep(watchMs);
+const TRAILING_MS = 100;
+const WATCHED = new Set(['document', 'xhr', 'fetch', 'script', 'stylesheet']);
+
+// The page's requests from now on; `first` settles with the first one that counts.
+function watchRequests(page) {
+  const requests = [];
+  let started;
+  const first = new Promise((resolve) => { started = resolve; });
+  const onRequest = (r) => {
+    requests.push(r);
+    if (WATCHED.has(r.resourceType())) started();
+  };
+  page.on('request', onRequest);
+  return { requests, first, stop: () => page.off('request', onRequest) };
+}
+
+async function settle(tab, { requests, first }, { watchMs = WATCH_MS.snapshot, generation, waited = false, trailing = true, timeout = NAVIGATION_TIMEOUT_MS } = {}) {
+  const load = () => tab.page.waitForLoadState('load', { timeout: ACTION_TIMEOUT_MS }).catch(() => {});
+  if (tab.documentGeneration !== generation) return load();
+  if (waited) return;
+  await within(first, watchMs);
   const main = tab.page.mainFrame();
-  const navigation = requests.find((r) => r.isNavigationRequest() && r.frame() === main);
-  if (navigation) {
-    await committed(tab, navigation, generation, timeout);
-    await tab.page.waitForLoadState('load', { timeout: ACTION_TIMEOUT_MS }).catch(() => {});
-    return;
+  // Once more after the requests: a navigation a response started (a login that redirects once its fetch is answered).
+  for (let again = false; ; again = true) {
+    const navigation = requests.find((r) => r.isNavigationRequest() && r.frame() === main);
+    if (navigation) {
+      await committed(tab, navigation, generation, timeout);
+      return load();
+    }
+    if (again) return;
+    const pending = requests.filter((r) => WATCHED.has(r.resourceType())).map((r) => r.response().then((response) => response?.finished()).catch(() => {}));
+    if (!pending.length) return;
+    await within(Promise.all(pending), 3000);
+    if (!trailing) return;
+    await sleep(TRAILING_MS);
   }
-  const pending = requests
-    .filter((r) => ['document', 'xhr', 'fetch', 'script', 'stylesheet'].includes(r.resourceType()))
-    .map((r) => r.response().then((response) => response?.finished()).catch(() => {}));
-  if (!pending.length) return;
-  await Promise.race([Promise.all(pending), sleep(3000)]);
-  if (trailing) await sleep(200);
 }
 
 // Until a navigation's new document commits, the old one still counts as loaded: wait for the commit, or for the
@@ -365,14 +414,15 @@ const actOpening = (tab, args, fn, options) => act(tab, args, fn, { ...options, 
 
 // Runs fn on the tab, returns early if it opens a dialog, and reports new tabs plus the snapshot.
 // New tabs are the acting page's own children only, never tabs other agents of this session open meanwhile.
-async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenTabs = false, read = false } = {}) {
+async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenTabs = false, read = false, waited = false } = {}) {
   if (tab.dialog) throw new Error(`${dialogLine(tab)}`);
   // A tab this action opens from the user's claimed tab is adopted (ours, in the background) instead of being the user's.
   // Only for actions that can open tabs (a shorter window means fewer chances to catch the user's own Cmd-click, and
   // such a tab is handed back to them, never closed). Older extensions don't know the command; that only loses
-  // the adoption.
+  // the adoption. Not waited for: the host and the extension take requests in order, so the extension has it before
+  // any input of the action.
   if (mayOpenTabs) {
-    await tab.browser.host.request('tabs.expectChild', { tabId: tab.tabId, ms: 3000 }).catch((error) => {
+    tab.browser.host.request('tabs.expectChild', { tabId: tab.tabId, ms: 3000 }).catch((error) => {
       if (!/unknown method/i.test(error.message)) debug('tabs.expectChild failed', error.message);
     });
   }
@@ -382,7 +432,6 @@ async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenT
   const openings = []; // of those, the ones the extension opens (popups.mjs): { url, opening }
   const urls = new Map(); // tab id -> URL of a popup the extension opened
   const popupIds = new Set();
-  const requests = [];
   const onOpen = (url, opening, created) => {
     opens.push(url);
     if (opening) {
@@ -392,17 +441,16 @@ async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenT
   };
   const mapping = []; // popups being mapped to their tabs
   const onPopup = (page) => mapping.push(tab.browser.tabFor(page).then((t) => t && popupIds.add(t.tabId)));
-  const onRequest = (r) => requests.push(r);
   tab.on('windowopen', onOpen);
   tab.page.on('popup', onPopup);
-  tab.page.on('request', onRequest);
+  const watch = watchRequests(tab.page);
   let onDialog;
   const dialogOpened = new Promise((resolve) => { onDialog = resolve; tab.once('dialog', onDialog); });
   let lines, newTabs;
   try {
     const work = (async () => {
       lines = [].concat((await fn()) ?? []);
-      await settle(tab, requests, { watchMs: snapshot ? WATCH_MS.snapshot : read ? WATCH_MS.read : WATCH_MS.action, generation, trailing: snapshot,
+      await settle(tab, watch, { watchMs: snapshot ? WATCH_MS.snapshot : read ? WATCH_MS.read : WATCH_MS.action, generation, waited, trailing: snapshot,
         timeout: Math.max(args.timeout_ms ?? 0, NAVIGATION_TIMEOUT_MS) });
     })();
     work.catch(() => {}); // a dialog may win the race; the action then finishes or fails on its own
@@ -415,25 +463,25 @@ async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenT
     newTabs = await openedTabs(tab, popupIds, mapping, knownBefore, opens.length - failed.length, urls);
     // kept: the extension hands it back at session end, never closes it (a child of a claimed, kept or for_user tab:
     // it may be the user's own Cmd-click).
-    const all = record.recording && newTabs.length ? await tab.browser.host.request('tabs.listAll', {}).catch(() => []) : [];
-    for (const t of newTabs) {
-      const info = all.find((a) => `${tab.browser.key}:${a.id}` === t.id && a.owner === 'you');
-      record.tabEvent('adopt', t.id, t.url, { kept: !!info?.kept });
+    for (const t of record.recording ? newTabs : []) {
+      const info = await tabInfo(tab.browser, Number(t.id.split(':')[1])).catch(() => null);
+      record.tabEvent('adopt', t.id, t.url, { kept: info?.owner === 'you' && info.kept });
     }
   } finally {
     tab.off('dialog', onDialog);
     tab.off('windowopen', onOpen);
-    tab.page.off('request', onRequest);
+    watch.stop();
     tab.page.off('popup', onPopup);
   }
   return report(tab, { lines, newTabs, snapshot: snapshot && !tab.dialog, changes: true });
 }
 
-function withTab(manager, handler) {
+// checkRefs: false for tools whose action already fails fast on a gone ref (quickly, selectOnce).
+function withTab(manager, handler, { checkRefs: check = true } = {}) {
   return async (args) => {
     const tab = await resolveTab(manager, args.tab);
     return tab.run(async () => {
-      await checkRefs(tab, args);
+      if (check) await checkRefs(tab, args);
       return handler(tab, args);
     }).catch((error) => {
       // Playwright names the ref it was given; the agent knows it by the number it was shown.
@@ -738,7 +786,7 @@ const MEDIA_FN = async (el, { action, value }) => {
     case 'mute': if (yt) yt.mute(); else el.muted = true; break;
     case 'unmute': if (yt) yt.unMute(); else el.muted = false; break;
   }
-  await new Promise((r) => setTimeout(r, 300));
+  if (action !== 'status') await new Promise((r) => setTimeout(r, 300)); // the player reacting
   return { refused, status: status() };
 };
 
@@ -775,6 +823,16 @@ async function typeText(tab, args) {
     // Keyboard select-all does nothing over CDP, so select the content in the element (as fill does).
     await callOnShadowRef(tab, args.ref, args.append ? CARET_TO_END_FN : SELECT_ALL_FN);
     if (!args.append && !args.text) await tab.page.keyboard.press('Delete');
+  } else if (!args.ref) {
+    // The focused field is replaced or appended to like a ref's; elsewhere (a canvas or code editor) the text goes in at the caret.
+    const handle = await tab.page.evaluateHandle(FOCUSED_FIELD_FN);
+    const field = handle.asElement();
+    try {
+      if (field) await field.evaluate(args.append ? CARET_TO_END_FN : SELECT_ALL_FN);
+    } finally {
+      handle.dispose().catch(() => {});
+    }
+    if (field && !args.append && !args.text) await tab.page.keyboard.press('Delete');
   }
   if (!args.ref || isShadowRef(args.ref)) {
     if (args.slowly) await tab.page.keyboard.type(args.text, { delay: 50 });
@@ -884,7 +942,7 @@ export function registerTools(server, manager) {
 
   tool('tab_open',
     'Open a new tab in the named browser and control it. By default it is a work tab: in the background (never focused), muted, inside a tab group, ' +
-    'closed at the end of your turn (when you finish replying to the user), so the user is not disturbed. When the tab is for the user (they asked you to open something for them to use, watch or read), ' +
+    'closed when your session ends (in Claude Code at the end of your turn), so the user is not disturbed. When the tab is for the user (they asked you to open something for them to use, watch or read), ' +
     'pass for_user: true: it opens like their own tab (not grouped, stays open after your turn, muted only while you control it), still in the background unless focus: true. ' +
     'Returns the tab id (e.g. "helium:1834") to pass to every other tool, plus the page snapshot.',
     { browser: browserArg, url: z.string().optional().describe('URL to load (default about:blank).'),
@@ -920,7 +978,7 @@ export function registerTools(server, manager) {
     'Take control of one of the user\'s existing tabs (ids from tab_list scope "all", owner user) to work inside it. It stays where it is and is never focused, ' +
     'but claiming wakes a background tab (a video in it may start playing), so claim only to read or act in the page. ' +
     'To close the user\'s tabs, call tab_close with confirm_close_users_tab: true; no claim needed. ' +
-    'Release it with tab_release when done so the user gets it back untouched; it goes back to them at the end of your turn anyway (claim it again in a later turn). ' +
+    'Release it with tab_release when done so the user gets it back untouched; it goes back to them when your session ends anyway (in Claude Code at the end of your turn; claim it again in a later turn). ' +
     'resume: true takes back a tab the user took over or you handed to them (tab_handoff), once they said in the conversation that you may carry on.',
     { tab: tabArg, snapshot: snapshotArg,
       resume: z.boolean().optional().describe('Resume a tab the user took over or you handed to them. Only after the user said so in the conversation.') },
@@ -988,8 +1046,8 @@ export function registerTools(server, manager) {
       await (tab ? tab.run(call) : call());
     } catch (error) {
       if (ends) {
-        const all = await browser.host.request('tabs.listAll', {}).catch(() => null);
-        if (all && all.find((t) => t.id === tabId)?.owner !== 'you') browser.forget(tabId); // gone, or no longer ours
+        const info = await tabInfo(browser, tabId).catch(() => undefined);
+        if (info !== undefined && info?.owner !== 'you') browser.forget(tabId); // gone, or no longer ours
       }
       throw error;
     }
@@ -1004,7 +1062,7 @@ export function registerTools(server, manager) {
   // A claimed tab is the user's own, and so is one handed over or taken over: closing it needs their explicit request.
   const refuseUsersTab = async (browser, tabId, args) => {
     if (args.confirm_close_users_tab === true) return;
-    const info = (await browser.host.request('tabs.listAll', {})).find((t) => t.id === tabId);
+    const info = await tabInfo(browser, tabId);
     if (takeover.parked(`${browser.key}:${tabId}`) || (info?.owner === 'you' && (info.origin === 'user' || info.handedOver))) {
       throw new Error(`Tab ${browser.key}:${tabId} is the user's own tab (you claimed it, handed it to them, or they took it over), so it was not closed. Give it back with tab_release. ` +
         'Close it only if the user asked you to close it: call tab_close again with confirm_close_users_tab: true.');
@@ -1023,7 +1081,9 @@ export function registerTools(server, manager) {
     async (args) => {
       const { key, tabId } = parseTabId(args.tab);
       const browser = await manager.get(key);
-      const info = (await browser.host.request('tabs.listAll', {})).find((t) => t.id === tabId);
+      // One this session controls closes as ours (refuseUsersTab looks it up, in its queue); any other is looked up here.
+      if (browser.tabs.has(tabId)) return closeOwned(args);
+      const info = await tabInfo(browser, tabId);
       if (!info || info.owner !== null) return closeOwned(args);
       if (args.confirm_close_users_tab !== true) {
         throw new Error(`Tab ${key}:${tabId} is the user's own tab, so it was not closed. Close it only if the user asked you to: ` +
@@ -1064,7 +1124,7 @@ export function registerTools(server, manager) {
   tool('navigate',
     'Load a URL in a tab, or go back, forward or reload. Returns the new snapshot.',
     { tab: tabArg, url: z.string().optional(), action: z.enum(['back', 'forward', 'reload']).optional(), snapshot: snapshotArg, timeout_ms: timeoutArg },
-    withTab(manager, (tab, args) => act(tab, args, () => cued(tab, 'navigate', async () => {
+    withTab(manager, (tab, args) => act(tab, args, () => cued(tab, 'navigate', () => takeover.navigating(tab, async () => {
       const options = { waitUntil: 'domcontentloaded', timeout: args.timeout_ms ?? NAVIGATION_TIMEOUT_MS };
       let response;
       if (args.url) response = await tab.page.goto(refuseLocalFile(args.url), options);
@@ -1082,7 +1142,7 @@ export function registerTools(server, manager) {
       await loaded(tab.page);
       if (response === null && args.action && args.action !== 'reload') return `No ${args.action} history entry.`;
       return response && !response.ok() ? `HTTP ${response.status()} ${response.statusText()}` : null;
-    }, { after: true }))));
+    }), { after: true }), { waited: true })));
 
   tool('snapshot',
     'Read the page as an accessibility snapshot (YAML). Elements carry refs like [ref=e12] that click, type and other tools take. ' +
@@ -1134,10 +1194,10 @@ export function registerTools(server, manager) {
         try {
           await tab.page.mouse.click(x, y, { button: args.button, clickCount: args.double ? 2 : 1 });
         } finally {
-          for (const m of mods.reverse()) await tab.page.keyboard.up(m);
+          for (const m of [...mods].reverse()) await tab.page.keyboard.up(m);
         }
       });
-    })));
+    }), { checkRefs: false }));
 
   tool('hover', 'Move the mouse over an element (opens hover menus, tooltips).',
     { tab: tabArg, ref: shadowRefArg, snapshot: snapshotArg, timeout_ms: timeoutArg },
@@ -1148,11 +1208,12 @@ export function registerTools(server, manager) {
       }
       const { x, y } = await shadowRefPoint(tab, args.ref);
       await pointed(tab, { x, y }, () => tab.page.mouse.move(x, y), { feedback: false });
-    })));
+    }), { checkRefs: false }));
 
   tool('type',
     'Type text into an editable element. Replaces its content unless append is true. slowly types one key at a time (for fields that react per key, like search suggestions). submit presses Enter after. ' +
-    'Without ref it types into whatever has focus (e.g. after click at x,y on a canvas editor or a control the snapshot cannot show).',
+    'Without ref it types into whatever has focus (e.g. after click at x,y on a canvas editor or a control the snapshot cannot show): a focused text field ' +
+    'is replaced or appended to the same way; in code and canvas editors the text goes in at the caret.',
     { tab: tabArg, ref: shadowRefArg.optional(), text: z.string(), submit: z.boolean().optional(), slowly: z.boolean().optional(), append: z.boolean().optional(),
       snapshot: snapshotArg, timeout_ms: timeoutArg },
     withTab(manager, (tab, args) => actOpening(tab, args, () => (args.ref
@@ -1202,7 +1263,7 @@ export function registerTools(server, manager) {
       const loc = locator(tab, args.ref);
       const chosen = await pointed(tab, refPoint(tab, args.ref), () => selectOnce(tab, args.ref, loc, args.values, args.timeout_ms));
       return `Selected: ${chosen.join(', ')}`;
-    })));
+    }), { checkRefs: false }));
 
   tool('press_key',
     'Press a key or combo, e.g. "Enter", "Escape", "ArrowDown", "ControlOrMeta+a". With ref, focuses that element first; otherwise goes to the focused element.',
@@ -1252,7 +1313,7 @@ export function registerTools(server, manager) {
       const deadline = Date.now() + cursor.ARRIVAL_CAP_MS;
       const shown = await cursor.isShown(tab);
       if (shown) await cursor.moveTo(tab, refPoint(tab, args.from_ref), Math.max(0, deadline - Date.now()));
-      await pointed(tab, refPoint(tab, args.to_ref), () => from.dragTo(to, { timeout: args.timeout_ms }), { shown, feedback: false, cue: 'drag', deadline });
+      await pointed(tab, refPoint(tab, args.to_ref), () => from.dragTo(to, { timeout: args.timeout_ms }), { shown, feedback: false, cue: 'drag', cueOnPress: true, deadline });
     })));
 
   tool('upload_files',
@@ -1282,10 +1343,18 @@ export function registerTools(server, manager) {
       if (!dialog) throw new Error('No dialog is open on this tab.');
       tab.dialog = null;
       const summary = `${args.accept ? 'Accepted' : 'Dismissed'} ${dialog.type()} "${dialog.message()}".`;
-      if (args.accept) await dialog.accept(args.text);
-      else await dialog.dismiss();
-      await sleep(300);
-      return report(tab, { lines: [summary], snapshot: args.snapshot !== false && !tab.dialog, changes: true });
+      const snapshot = args.snapshot !== false;
+      // What the page does once it goes on (a navigation a confirm allowed, a request) is waited for like after an action.
+      const watch = watchRequests(tab.page);
+      try {
+        const generation = tab.documentGeneration;
+        if (args.accept) await dialog.accept(args.text);
+        else await dialog.dismiss();
+        await settle(tab, watch, { watchMs: snapshot ? WATCH_MS.snapshot : WATCH_MS.action, generation, trailing: snapshot }).catch(() => {});
+      } finally {
+        watch.stop();
+      }
+      return report(tab, { lines: [summary], snapshot: snapshot && !tab.dialog, changes: true });
     });
 
   tool('wait_for',
@@ -1308,7 +1377,7 @@ export function registerTools(server, manager) {
       }
       if (!args.seconds && !args.text && !args.text_gone && !args.url) throw new Error('Pass text, text_gone, url or seconds.');
       return 'Wait finished.';
-    }))));
+    }), { waited: true })));
 
   tool('screenshot',
     'Screenshot the tab (or one element with ref) as JPEG. Image pixels are CSS pixels, so x,y read off a viewport screenshot work directly with click. Prefer snapshot for reading text.',
@@ -1330,7 +1399,7 @@ export function registerTools(server, manager) {
   tool('viewport',
     'Lay the page out at another size (CSS px), like a phone or a smaller window; mobile: true also emulates a phone (meta viewport, touch). ' +
     'Only when the user asks for a size or device, to test a breakpoint or mobile layout, or when the task can\'t be answered without it; never to make screenshots bigger. ' +
-    'Snapshot, screenshot and click x,y then use this size. Reset with reset: true when done unless the user asked to keep it (releasing the tab or the end of your turn resets it too).',
+    'Snapshot, screenshot and click x,y then use this size. Reset with reset: true when done unless the user asked to keep it (releasing the tab or the end of your session or Claude Code turn resets it too).',
     { tab: tabArg, width: sizeArg.describe(`Width in CSS px (${MIN_SIZE} to ${MAX_SIZE}).`), height: sizeArg.describe(`Height in CSS px (${MIN_SIZE} to ${MAX_SIZE}).`),
       mobile: z.boolean().optional().describe('Emulate a phone: meta viewport, overlay scrollbars, touch (default false).'),
       device_scale_factor: z.number().positive().max(4).optional().describe('devicePixelRatio, e.g. 3 for a recent iPhone (default: the screen\'s own).'),
@@ -1346,7 +1415,7 @@ export function registerTools(server, manager) {
         lines.push(`Viewport set to ${args.width}x${args.height}${args.mobile ? ' (mobile)' : ''}: the page reflowed` +
           `${page ? ` (innerWidth ${page.w}, innerHeight ${page.h}, devicePixelRatio ${page.dpr})` : ''}. Snapshot, screenshot and click x,y use this size; ` +
           'reset with viewport reset: true when done.');
-        const info = (await tab.browser.host.request('tabs.listAll', {}).catch(() => [])).find((t) => t.id === tab.tabId);
+        const info = await tabInfo(tab.browser, tab.tabId).catch(() => null);
         if (info && (info.origin === 'user' || info.kept || info.handedOver)) {
           lines.push('This is the user\'s tab: they see it resized too until you reset it or release it.');
         }
@@ -1433,9 +1502,9 @@ export function registerTools(server, manager) {
         await handle?.dispose().catch(() => {});
         if (shown) cursor.cueEnd(tab);
       }
-      const tabInfo = (await tab.browser.host.request('tabs.listAll', {})).find((t) => t.id === tab.tabId);
+      const info = await tabInfo(tab.browser, tab.tabId);
       const lines = [`Media ${args.action}${refused ? ` (play refused: ${refused})` : ''}: ${JSON.stringify(status)}`];
-      if (tabInfo?.muted) lines.push('Note: the tab\'s audio is muted (agent tabs open muted), so the user hears nothing whatever the player says; tab_mute with muted: false changes that.');
+      if (info?.muted) lines.push('Note: the tab\'s audio is muted (agent tabs open muted), so the user hears nothing whatever the player says; tab_mute with muted: false changes that.');
       return lines;
     }, { snapshot: args.snapshot === true, read: true })));
 
