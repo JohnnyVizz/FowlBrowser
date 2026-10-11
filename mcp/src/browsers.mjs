@@ -126,7 +126,8 @@ export class Browser {
     this.key = key; // socket base name: "helium", "chrome", "helium-2"
     this.host = host;
     const [base, n] = key.split(/-(?=\d+$)/);
-    this.name = (NAMES[base] ?? base) + (n ? ` (${n})` : '');
+    this._app = NAMES[base] ?? base;
+    this._n = n;
     const hello = host.hello;
     this.silentDebugger = hello.silentDebugger;
     this.version = appVersion(hello.browserPath);
@@ -149,7 +150,14 @@ export class Browser {
     this.adopting = new Map(); // chrome tab id -> its _adopt still setting up (settles once it is done)
   }
 
+  // "Chrome (Work)" with the label the user gave this browser profile in the extension's popup, else "Chrome (2)".
+  get name() {
+    const label = this.host.hello.extension?.label;
+    return this._app + (label ? ` (${label})` : this._n ? ` (${this._n})` : '');
+  }
+
   // The extension's identity (user agent) can come after host.hello; keep the real one for Browser.getVersion.
+  // It is sent again when the user renames the browser.
   _identity(extension) {
     if (!extension?.userAgent) return;
     this.host.hello = { ...this.host.hello, extension };

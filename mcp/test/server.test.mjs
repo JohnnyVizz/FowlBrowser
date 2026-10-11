@@ -21,7 +21,9 @@ function frame(message) {
 }
 
 const seen = [];
+const sockets = [];
 const server = net.createServer((socket) => {
+  sockets.push(socket);
   let buffer = Buffer.alloc(0);
   socket.on('data', (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
@@ -130,6 +132,14 @@ test("tab_close closes the user's unclaimed tab without claiming it, only when c
   assert.match(await call('tab_close', { tab: 'helium:7', confirm_close_users_tab: true }), /Closed the user's tab/);
   assert.deepEqual(seen.find((m) => m.method === 'tabs.closeUnowned').params, { tabId: 7 });
   assert.ok(!seen.some((m) => m.method === 'tabs.claim' || m.method === 'chrome.debugger.attach'), 'never claimed or attached');
+});
+
+test('a name the user gives the browser in the popup shows up right away', async () => {
+  const userAgent = 'Mozilla/5.0 Chrome/141.0.1.2 Safari/537.36';
+  for (const socket of sockets) socket.write(frame({ method: 'extension.hello', params: { version: '0.1.0', instanceId: 'x', userAgent, label: 'Work' } }));
+  for (let i = 0; i < 50 && !/Helium \(Work\)/.test(await call('browser_list')); i++) await new Promise((r) => setTimeout(r, 20));
+  assert.match(await call('browser_list'), /- Helium \(Work\) \(Chromium 141\.0\.1\.2\) · browser: "helium"/);
+  assert.match(await call('tab_list', { browser: 'helium' }), /^Browser: Helium \(Work\) \("helium"\)/);
 });
 
 test.after(async () => {

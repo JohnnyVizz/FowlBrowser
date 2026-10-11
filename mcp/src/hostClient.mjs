@@ -126,6 +126,8 @@ export class HostClient extends EventEmitter {
     }
     if (message.method !== 'chrome.debugger.onEvent') debug('host event', message.method, message.params);
     else if (/^(Runtime\.execution|Page\.frame|Target\.|Inspector\.)/.test(message.params?.[1])) debug('cdp event', message.params[1], message.params[0], message.params[2]);
+    // A rename during the handshake comes before anyone listens for events: keep it in hello.
+    if (message.method === 'extension.hello' && this.hello && message.params?.userAgent) this.hello = { ...this.hello, extension: message.params };
     this.emit(message.method, message.params);
     this.emit('event', message.method, message.params);
   }

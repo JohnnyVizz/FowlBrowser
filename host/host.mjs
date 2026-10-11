@@ -129,6 +129,7 @@ const clients = new Map(); // clientId -> socket
 const pending = new Map(); // host request id -> { clientId, id: the client's original id, at }
 const inFlight = new Map(); // clientId -> number of its routes in `pending`
 const waitingForHello = new Set(); // greet functions of clients authed before extension.hello arrived
+const greetedClients = new Set(); // sockets that got host.hello; a later extension.hello (label changed) goes to them
 let requestSeq = 0;
 
 function takeRoute(key) {
@@ -167,6 +168,7 @@ function onExtensionMessage(message) {
   if (message.method === 'extension.hello') {
     extensionHello = message.params ?? null;
     log('extension.hello', JSON.stringify(extensionHello));
+    for (const socket of greetedClients) sendToClient(socket, { method: 'extension.hello', params: extensionHello });
     for (const greet of waitingForHello) greet();
     return;
   }
@@ -218,6 +220,7 @@ function onClient(socket) {
     greeted = true;
     waitingForHello.delete(greet);
     clearTimeout(helloTimer);
+    greetedClients.add(socket);
     sendToClient(socket, { method: 'host.hello', params: { browser, browserPath, browserPid, silentDebugger, extension: extensionHello } });
   };
   const authTimer = setTimeout(() => {
@@ -279,6 +282,7 @@ function onClient(socket) {
     if (closed || !authed) return;
     closed = true;
     clients.delete(clientId);
+    greetedClients.delete(socket);
     waitingForHello.delete(greet);
     clearTimeout(helloTimer);
     for (const [key, route] of pending) if (route.clientId === clientId) takeRoute(key);
@@ -344,4 +348,6 @@ process.on('uncaughtException', (error) => { log('uncaught', error.stack); shutd
 
 listening = await listen();
 listening.ino = fs.statSync(listening.socketPath).ino;
+// The extension's popup shows this: the host is installed and agents reach this browser as <socket name>.
+sendToExtension({ method: 'host.listening', params: { browser, key: path.basename(listening.socketPath, '.sock') } });
 log('listening', listening.socketPath, 'browser', browser, browserPath, 'pid', browserPid, 'silent', silentDebugger);

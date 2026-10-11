@@ -31,7 +31,7 @@ const snapshotArg = z.boolean().optional().describe(
   'Return the page snapshot after the action (default true): on the same page only what changed since the tab\'s previous snapshot, else the whole page. Pass false to save tokens.');
 const timeoutArg = z.number().int().positive().optional().describe(`Timeout in ms (default ${ACTION_TIMEOUT_MS} for actions, ${NAVIGATION_TIMEOUT_MS} for navigation).`);
 const browserArg = z.string().describe(
-  'Browser name from browser_list, e.g. "chrome" (Google Chrome) or "helium". Pick it on purpose: the one the user named, or the one where the site and their login live.');
+  'Browser name from browser_list, e.g. "chrome" (Google Chrome) or "helium". Pick it on purpose: the one the user named (by app or by the name they gave it, like "Work"), or the one where the site and their login live.');
 
 // --- Helpers ---
 
@@ -828,6 +828,7 @@ export function registerTools(server, manager) {
 
   tool('browser_list',
     'List the browsers FowlBrowser can drive right now: the user\'s own Google Chrome and Helium (their real profiles, logins and tabs). ' +
+    'Each browser profile with the extension is listed on its own ("chrome", "chrome-2"), named after the label the user gave it ("Chrome (Work)"). ' +
     'Call this first and choose the browser on purpose; every other tool names its browser through the tab id prefix ("chrome:52", "helium:1834").',
     {},
     async () => {

@@ -7,28 +7,54 @@ const RECONNECT_DELAY_MS = 1000;
 const RECONNECT_ALARM = 'reconnect';
 
 let port = null;
+// For the popup: 'connecting', 'connected' (the host is listening as `key`, e.g. "chrome-2") or 'missing' (no host
+// installed: setup needed).
+let status = { state: 'connecting' };
+
+// A "!" on the toolbar icon while setup is needed, so the user knows to open the popup.
+function setStatus(next) {
+  status = next;
+  chrome.action.setBadgeText({ text: next.state === 'missing' ? '!' : '' });
+}
+chrome.action.setBadgeBackgroundColor({ color: '#e8890c' });
 
 const core = createCore({ chrome, send: (msg) => port?.postMessage(msg) });
+
+// The label is the name the user gave this browser profile in the popup ("Work"); agents see "Chrome (Work)".
+async function sayHello(current) {
+  const [instanceId, { label = '' }] = await Promise.all([core.instanceId(), chrome.storage.local.get('label')]);
+  if (port !== current) return;
+  current.postMessage({
+    method: 'extension.hello',
+    params: { version: chrome.runtime.getManifest().version, instanceId, userAgent: navigator.userAgent, label },
+  });
+}
 
 function connect() {
   if (port) return;
   const current = chrome.runtime.connectNative(HOST_NAME);
   port = current;
-  current.onMessage.addListener((msg) => core.handleMessage(msg));
+  current.onMessage.addListener((msg) => {
+    if (msg.method === 'host.listening') setStatus({ state: 'connected', ...msg.params });
+    else core.handleMessage(msg);
+  });
   current.onDisconnect.addListener(() => {
-    void chrome.runtime.lastError; // host missing or exited; read it so Chrome doesn't log it as unchecked
+    // Host missing or exited; read the error so Chrome doesn't log it as unchecked.
+    const missing = /not found|forbidden/i.test(chrome.runtime.lastError?.message ?? '');
+    setStatus({ state: missing ? 'missing' : 'connecting' });
     if (port === current) port = null;
     core.portClosed();
     setTimeout(connect, RECONNECT_DELAY_MS);
   });
-  core.instanceId().then((instanceId) => {
-    if (port !== current) return;
-    current.postMessage({
-      method: 'extension.hello',
-      params: { version: chrome.runtime.getManifest().version, instanceId, userAgent: navigator.userAgent },
-    });
-  });
+  sayHello(current);
 }
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === 'status' && sender.id === chrome.runtime.id) sendResponse(status);
+});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.label && port) sayHello(port);
+});
 
 // Listeners are registered synchronously so events wake the worker.
 chrome.debugger.onEvent.addListener(core.onDebuggerEvent);

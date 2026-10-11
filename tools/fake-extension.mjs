@@ -212,11 +212,21 @@ async function selfTest() {
   c1.send({ id: 'who2', method: 'who', params: {}, client: id2 });
   await waitFor(() => c1.messages.some((m) => m.id === 'who2'), 'who2');
   assert.equal(c1.messages.find((m) => m.id === 'who2').result.client, id1);
-  assert.ok(!a.fromHost.some((m) => m.method?.startsWith('host.') && m.method !== 'host.clientConnected'), 'host.* from a client reached the extension');
+  const fromHostItself = ['host.clientConnected', 'host.listening'];
+  assert.ok(!a.fromHost.some((m) => m.method?.startsWith('host.') && !fromHostItself.includes(m.method)), 'host.* from a client reached the extension');
+  // The host tells the extension (its popup) that it is installed and which socket name agents reach it by.
+  assert.deepEqual(a.fromHost.find((m) => m.method === 'host.listening')?.params, { browser: 'node', key: 'node' });
   assert.ok(!c1.closed, 'a reserved method only drops the message');
 
-  // extension.hello is the host's, not broadcast to clients.
-  a.toHost({ method: 'extension.hello', params: { version: '0.1.0', instanceId: 'fake-instance', userAgent: 'fake' } });
+  // A later extension.hello (the user renamed the browser in the popup) reaches connected clients, and new ones get
+  // it in host.hello.
+  a.toHost({ method: 'extension.hello', params: { version: '0.1.0', instanceId: 'fake-instance', userAgent: 'fake', label: 'Work' } });
+  await waitFor(() => [c1, c2].every((c) => c.messages.some((m) => m.method === 'extension.hello')), 'extension.hello to clients');
+  assert.equal(c1.messages.find((m) => m.method === 'extension.hello').params.label, 'Work');
+  const renamed = await connect(sockName());
+  await waitFor(() => renamed.messages.length, 'host.hello after rename');
+  assert.equal(renamed.messages[0].params.extension.label, 'Work');
+  renamed.socket.destroy();
 
   // Malformed frames drop only the client that sent them; the host and everyone else carry on.
   const badFrames = [encode(null), encode(5), encode([1]), encode({ id: 1 }), encode('text'),
@@ -291,7 +301,6 @@ async function selfTest() {
     assert.ok(reply.result?.params.emoji === emoji, `emoji payload (pad ${pad.length}) came back changed: ${JSON.stringify(reply).slice(0, 200)}`);
   }
   assert.equal(a.splitSurrogates, 0, 'a chunk ended in half a surrogate pair');
-  assert.ok(![c1, c2].some((c) => c.messages.some((m) => m.method === 'extension.hello')), 'extension.hello broadcast');
 
   // Disconnect notifies the extension.
   c2.socket.destroy();

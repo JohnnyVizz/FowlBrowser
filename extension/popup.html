@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="icons/icon-32.png" width="16" height="16" alt="">
+    <h1>FowlBrowser</h1>
+    <span id="status" class="status" data-state="connecting"><i></i><span>Connecting…</span></span>
+  </header>
+
+  <section class="name">
+    <label for="label">Name</label>
+    <input id="label" type="text" maxlength="24" placeholder="Work, Personal…" spellcheck="false" autocomplete="off">
+    <p class="hint" id="preview">Agents see this browser as <b>this browser</b>.</p>
+  </section>
+
+  <details id="setup">
+    <summary>Set up an agent</summary>
+    <div class="agents" role="tablist" aria-label="Agent">
+      <button type="button" role="tab" data-agent="claude">Claude Code</button>
+      <button type="button" role="tab" data-agent="codex">Codex</button>
+      <button type="button" role="tab" data-agent="other">Other</button>
+    </div>
+    <button type="button" id="prompt" class="prompt" title="Copy">
+      <span id="prompt-text"></span>
+      <span class="copy" aria-hidden="true">
+        <svg class="icon-copy" viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8" rx="2"/><path d="M10.5 3.5v-.5a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3v5A1.5 1.5 0 0 0 4 9.5h.5"/></svg>
+        <svg class="icon-done" viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7"/></svg>
+      </span>
+    </button>
+    <p class="hint" id="prompt-hint">Copy, then paste it into Claude Code.</p>
+  </details>
+
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

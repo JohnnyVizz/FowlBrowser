@@ -55,8 +55,17 @@ Socket auth: the host keeps a random token in `~/.fowlbrowser/token` (0600, crea
 first message must be `{method:"host.auth", params:{token}}`; anything else, or a wrong token, closes the socket
 before any message reaches the extension. Only after auth does the host send `host.hello`.
 
-On connect the extension sends `{method:"extension.hello", params:{version, instanceId, userAgent}}` (instanceId: random
-UUID kept in chrome.storage.local). The host answers every new socket client first with
+On connect the extension sends `{method:"extension.hello", params:{version, instanceId, userAgent, label}}` (instanceId: random
+UUID kept in chrome.storage.local; label: the name the user gave this browser profile in the popup, `''` if none). It
+sends it again when the label changes; the host forwards that one to every greeted client as an `extension.hello`
+event. Once listening, the host sends the extension `{method:"host.listening", params:{browser, key:<socket base name,
+e.g. chrome-2>}}`.
+
+Popup (`extension/popup.*`): status (Connected; Not set up when connectNative says the host is not found or
+forbidden, also a "!" badge on the toolbar icon; else Connecting…), the label field (saved to chrome.storage.local,
+no autofocus) with what agents see ("Chrome (Work)", else "Chrome (2)" for a `-2` socket), and "Set up an agent":
+Claude Code, Codex and Other tabs, each a setup prompt copied by a click. Setup starts open only when not set up.
+Each profile runs its own extension and host, so profiles are separate browsers (`chrome`, `chrome-2`). The host answers every new socket client first with
 `{method:"host.hello", params:{browser, browserPath, browserPid, silentDebugger:<bool: parent command line contains
 --silent-debugger-extension-api>, extension:<last extension.hello params or null>}}`. A client that authenticates
 before `extension.hello` arrived gets `host.hello` once it arrives, or after 5 s with `extension: null`, so clients
