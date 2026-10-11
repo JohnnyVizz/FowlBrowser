@@ -282,28 +282,55 @@ export function remoteLocalDir() {
   return fs.mkdtempSync('/tmp/fb-remote-');
 }
 
+// The processes one setup starts: each is killed at exit from the moment it is spawned, and stop() kills them and
+// waits until they are gone (a failed setup must not leave an ssh master holding its forwards).
+export function processGroup() {
+  const started = [];
+  const kill = () => { for (const p of started) if (p.exitCode === null && p.signalCode === null) p.kill(); };
+  process.on('exit', kill);
+  return {
+    spawn: (...args) => { const p = spawn(...args); started.push(p); return p; },
+    stop: async () => {
+      const gone = started.map((p) => (p.exitCode !== null || p.signalCode !== null ? null : new Promise((resolve) => p.once('exit', resolve))));
+      kill();
+      await Promise.all(gone);
+    },
+  };
+}
+
 // One ssh connection for the whole round: forwards the remote FowlBrowser sockets to <dir> and the graded ports to the
-// same local ports, then takes the remote GUI lock (held until close) and checks the test bed is this tree.
-async function openRemote(host, { owner, ports, stamp, held, surface }) {
+// same local ports, then takes the remote GUI lock (held until close) and checks the test bed is this tree. If any step
+// fails, every process it started is stopped and its dir removed before the error goes on.
+export async function openRemote(host, { owner, ports, stamp, held, surface }) {
   const busy = await portsInUse(ports);
   if (busy.length) throw new Error(`--remote ${host}: local port${busy.length > 1 ? 's' : ''} ${busy.join(', ')} already in use (another round or a local site?)`);
   const dir = remoteLocalDir();
   process.on('exit', () => fs.rmSync(dir, { recursive: true, force: true }));
+  const procs = processGroup();
+  try {
+    return await connectRemote(host, { owner, ports, stamp, held, surface, dir, procs });
+  } catch (err) {
+    remote = null;
+    await procs.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw err;
+  }
+}
+
+async function connectRemote(host, { owner, ports, stamp, held, surface, dir, procs }) {
   const ssh = ['-o', 'BatchMode=yes', '-o', `ControlPath=${dir}/cm`, host];
   const home = (await sh('ssh', ['-o', 'BatchMode=yes', host, 'echo $HOME'])).trim();
   const forwards = [...BROWSERS.map((b) => `${dir}/${b}.sock:${home}/.fowlbrowser/${b}.sock`), ...ports.map((p) => `${p}:127.0.0.1:${p}`)].flatMap((f) => ['-L', f]);
-  const master = spawn('ssh', ['-o', 'BatchMode=yes', '-o', 'ControlMaster=yes', '-o', `ControlPath=${dir}/cm`, '-o', 'StreamLocalBindUnlink=yes',
+  const master = procs.spawn('ssh', ['-o', 'BatchMode=yes', '-o', 'ControlMaster=yes', '-o', `ControlPath=${dir}/cm`, '-o', 'StreamLocalBindUnlink=yes',
     '-o', 'ExitOnForwardFailure=yes', '-N', ...forwards, host], { stdio: 'ignore' });
   for (let i = 0; !(await sh('ssh', ['-O', 'check', ...ssh]).then(() => true, () => false)); i++) {
     if (i === 50 || master.exitCode !== null) throw new Error(`--remote ${host}: the ssh connection did not come up (exit ${master.exitCode})`);
     await sleep(200);
   }
   remote = { host, ssh, dir, home, bed: `${home}/Projects/FowlBrowser`, runDir: `/tmp/fb-rounds-remote/${stamp}-${path.basename(dir).slice('fb-remote-'.length)}` };
-  process.on('exit', () => master.kill());
   if (!held) console.log(`--remote ${host}: waiting for its GUI lock as ${owner}`);
-  const lock = held ? null : spawn('ssh', [...ssh, `~/cua-test/bin/guilock ${shq(owner)} sh -c 'echo locked; exec cat >/dev/null'`], { stdio: ['pipe', 'pipe', 'inherit'] });
+  const lock = held ? null : procs.spawn('ssh', [...ssh, `~/cua-test/bin/guilock ${shq(owner)} sh -c 'echo locked; exec cat >/dev/null'`], { stdio: ['pipe', 'pipe', 'inherit'] });
   if (lock) {
-    process.on('exit', () => lock.kill());
     await new Promise((resolve, reject) => {
       lock.stdout.on('data', (d) => /locked/.test(d) && resolve());
       lock.on('exit', (code) => reject(new Error(`--remote ${host}: guilock exited ${code}`)));
@@ -316,8 +343,7 @@ async function openRemote(host, { owner, ports, stamp, held, surface }) {
   // The remote front app, streamed (an ssh call per monitor tick is too slow): remote.front is the latest. The loop ends
   // when its output can't be written any more (ssh gone); nothing else would stop it there.
   remote.front = null;
-  const fronts = spawn('ssh', [...ssh, 'while printf "%s\\n" "$(lsappinfo info -only name "$(lsappinfo front)")"; do sleep 0.2; done']);
-  process.on('exit', () => fronts.kill());
+  const fronts = procs.spawn('ssh', [...ssh, 'while printf "%s\\n" "$(lsappinfo info -only name "$(lsappinfo front)")"; do sleep 0.2; done']);
   fronts.stdout.setEncoding('utf8');
   fronts.stdout.on('data', (d) => { const names = [...d.matchAll(/"([^"]*)"/g)]; if (names.length) remote.front = names.at(-1)[1]; });
   remote.close = async () => {
@@ -352,16 +378,19 @@ async function loadRemoteCodex(args) {
 // Codex batches many actions into one js call: these method calls in its code count as actions.
 const codexAction = /\.(goto|click|dblclick|double_click|fill|type|typeText|press|pressKey|pressSequentially|keypress|setValue|selectOption|check|uncheck|setChecked|scroll|drag|paste|back|forward|reload|setFiles|set)\(/g;
 // Code asking Codex's browser to show a tab or focus a window.
-// Code that opens a tab (its result names the new tab: "Browser tab: N").
-const codexCreate = /createBrowserTab\(|\.newTab\(|tabs\.new\(/;
+// Code that opens a tab (its result names the new tab: "Browser tab: N"), and code that gets hold of a tab it did not
+// just open (its result may name that one too).
+const codexCreate = /createBrowserTab\(|\.newTab\(|tabs\.new\(/g;
+const codexLookup = /getTab\(|claimTab\(|listTabs\(|tabs\.(get|list|query)\(|popup|waitForEvent\(/i;
 const codexFocus = /visible:\s*true|['"]visibility['"]\)[\s\S]{0,80}\.set\(\s*true|windows\.update\([^)]*focused|bringToFront/;
 const resultText = (content) => (typeof content === 'string' ? content : (content || []).map((c) => c.text ?? '').join('\n'));
 
 // lines: parsed events.jsonl. Returns the agent's browser calls ({t, id, name, input}), failed ones ({t, id, name,
 // text}), action count, Codex kernel resets and lost debugger sessions, elicitation lines seen in the stream, calls whose
-// code asks for focus (as journal-like call lines for focusEvents) and the result event.
+// code asks for focus (as journal-like call lines for focusEvents), the tabs results named (namedTabs: `created` is the id
+// a call provably opened), every tab id its code or results referred to (tabRefs) and the result event.
 export function parseTranscript(lines) {
-  const calls = []; const errors = []; const elicitations = []; const focusCalls = []; const namedTabs = [];
+  const calls = []; const errors = []; const elicitations = []; const focusCalls = []; const namedTabs = []; const tabRefs = new Set();
   const byId = new Map();
   let servers = null; let result = null; let kernelResets = 0; let unattached = 0;
   for (const e of lines) {
@@ -372,13 +401,20 @@ export function parseTranscript(lines) {
       if (e.type === 'assistant' && c.type === 'tool_use' && c.name.startsWith('mcp__')) {
         const call = { t: e.t, id: c.id, name: c.name, input: c.input };
         calls.push(call); byId.set(c.id, call);
+        // Codex takes tab ids as strings: getTab('898969305').
+        for (const m of (c.input?.code ?? '').matchAll(/(['"`])(\d+)\1/g)) tabRefs.add(Number(m[2]));
         if (codexFocus.test(c.input?.code ?? '')) focusCalls.push({ t: e.t, tool: 'focus', args: { code: c.input.code.slice(0, 200) } });
       }
       if (e.type === 'user' && c.type === 'tool_result' && byId.has(c.tool_use_id)) {
         const text = resultText(c.content);
         const call = byId.get(c.tool_use_id);
-        const ids = [...text.matchAll(/Browser tab: (\d+)/g)].map((m) => Number(m[1]));
-        if (ids.length) namedTabs.push({ from: call.t, t: e.t, ids, creates: codexCreate.test(call.input?.code ?? '') });
+        const ids = [...new Set([...text.matchAll(/Browser tab: (\d+)/g)].map((m) => Number(m[1])))];
+        ids.forEach((id) => tabRefs.add(id));
+        // A creation is proven only when the call made one tab, looked up none and its result names one tab: in batched
+        // code the result can't say which id the creation returned.
+        const code = call.input?.code ?? '';
+        const creates = (code.match(codexCreate) || []).length;
+        if (ids.length) namedTabs.push({ t: e.t, ids, created: creates === 1 && !codexLookup.test(code) && ids.length === 1 ? ids[0] : null });
         if (/kernel reset/i.test(text)) kernelResets++;
         if (/Debugger (is )?(un|not )attached/i.test(text)) unattached++;
         if (c.is_error) errors.push({ t: e.t, id: c.tool_use_id, name: byId.get(c.tool_use_id).name, text: text.slice(0, 300) });
@@ -386,26 +422,15 @@ export function parseTranscript(lines) {
     }
   }
   const actions = calls.reduce((n, c) => n + (c.input?.code ? (c.input.code.match(codexAction) || []).length : 1), 0);
-  return { servers, calls, errors, actions, kernelResets, unattached, elicitations, focusCalls, namedTabs, result };
+  return { servers, calls, errors, actions, kernelResets, unattached, elicitations, focusCalls, namedTabs, tabRefs: [...tabRefs], result };
 }
 
 // The tabs a Codex agent provably created (Codex keeps no journal, and its group or a demo tag says nothing about who
-// opened a tab): ids its tab-creating calls returned ("Browser tab: N"), and tabs a call's result named that came into
-// being while that call ran (a popup Codex adopted). transcript: parseTranscript(); monitor: the round's monitor log.
-export function codexCreatedTabs({ browser, transcript, monitor, startKeys }) {
-  const born = new Map();
-  for (const e of monitor) {
-    if (e.kind === 'activity' && e.event === 'created' && e.browser === browser && e.tabId != null) born.set(`${browser}:${e.tabId}`, e.at ?? e.t);
-    if (e.kind === 'tab' && e.event === 'new' && !born.has(e.tab)) born.set(e.tab, e.t);
-  }
-  const created = new Set();
-  for (const { from, t, ids, creates } of transcript.namedTabs) {
-    for (const k of ids.map((id) => `${browser}:${id}`)) {
-      // The monitor polls every 250 ms: a tab made just before the result can show up a little after it.
-      if (!startKeys.has(k) && (creates || (born.get(k) >= from && born.get(k) <= t + 500))) created.add(k);
-    }
-  }
-  return created;
+// opened a tab): the id each single creating call returned. Ids seen only in batched output, popups it adopted and tabs
+// that merely appeared during a call are not proven (teardown leaves them open and reports them). transcript:
+// parseTranscript().
+export function codexCreatedTabs({ browser, transcript, startKeys }) {
+  return new Set(transcript.namedTabs.filter((n) => n.created !== null).map((n) => `${browser}:${n.created}`).filter((k) => !startKeys.has(k)));
 }
 
 // Elicitations a Codex run hit, from the tee in its MCP pipe (tools/mcp-tee.mjs: {t, dir, message} lines): the
@@ -572,16 +597,24 @@ export function roundSettings(surface, { mcpRoot, codex }) {
   return { hooks };
 }
 
-// The user's own tabs (unowned at round start) must keep their url and stay open. A change counts only on a tab some
-// agent's journal names (claimed, closed, called on): an agent can't touch their tabs any other way, and the rest is the user
-// browsing while they watch (listed, not counted). Which tab is active is graded by focusEvents.
-export function userTabChanges(start, end, touched = new Set()) {
+// The user's own tabs (unowned at round start) must keep their url and stay open: every change the monitor saw
+// (`start-tab` lines, so a tab sent away and back still counts), then the end state. A change counts only on a tab some
+// agent named (FowlBrowser: its journal; Codex: its code or a "Browser tab: N" result): an agent can't touch their tabs
+// any other way, and the rest is the user browsing while they watch (listed, not counted). Which tab is active is graded
+// by focusEvents.
+export function userTabChanges(start, end, touched = new Set(), monitor = []) {
   const changes = []; const browsing = [];
   for (const [k, tab] of Object.entries(start)) {
     if (tab.owner) continue;
+    const list = []; let url = tab.url; let closed = false;
+    for (const e of monitor.filter((e) => e.kind === 'start-tab' && e.tab === k)) {
+      if (e.event === 'gone') { list.push(`${k} closed (${url})`); closed = true; }
+      else { list.push(`${k} ${url} -> ${e.url}`); url = e.url; }
+    }
     const now = end[k];
-    const change = !now ? `${k} closed (${tab.url})` : now.url !== tab.url ? `${k} ${tab.url} -> ${now.url}` : null;
-    if (change) (touched.has(k) ? changes : browsing).push(change);
+    if (!closed && !now) list.push(`${k} closed (${url})`);
+    else if (!closed && now.url !== url) list.push(`${k} ${url} -> ${now.url}`);
+    (touched.has(k) ? changes : browsing).push(...list);
   }
   return { changes, browsing };
 }
@@ -676,7 +709,7 @@ async function startMonitor(hosts, file) {
     host.on('tabs.activity', ({ kind, ...e }) => write({ kind: 'activity', event: kind, browser, ...e }));
     await host.request('tabs.watchActivity').catch((err) => write({ kind: 'error', message: `${browser}: no tabs.activity stream (${err.message}); flashes are not counted there` }));
   }
-  let front; const active = new Map(); const windows = new Map(); const audible = new Map(); const grouped = new Set(); const urls = new Map(); const startTabs = new Set();
+  let front; const active = new Map(); const windows = new Map(); const audible = new Map(); const grouped = new Set(); const urls = new Map(); const startTabs = new Set(); const startUrls = new Map();
   let first = true; let running = true;
   const tick = async () => {
     const app = await frontApp();
@@ -693,13 +726,18 @@ async function startMonitor(hosts, file) {
       if (!sounding && audible.has(k)) { write({ kind: 'audio', event: 'stop', tab: k, url: tab.url, owner: tab.owner }); audible.delete(k); }
       if (tab.groupTitle?.startsWith('🧪 ') && !grouped.has(k)) { write({ kind: 'group', tab: k, label: tab.groupTitle, url: tab.url }); grouped.add(k); }
       // Tabs opened during the round: when they appear, each new url (attribution by demo site tag) and when they go.
-      if (first) startTabs.add(k);
-      else if (!startTabs.has(k) && urls.get(k) !== tab.url) {
+      // Tabs open at round start: each url change (graded by userTabChanges).
+      if (first) { startTabs.add(k); startUrls.set(k, tab.url); }
+      else if (startUrls.has(k) && startUrls.get(k) !== tab.url) {
+        write({ kind: 'start-tab', event: 'url', tab: k, from: startUrls.get(k), url: tab.url });
+        startUrls.set(k, tab.url);
+      } else if (!startTabs.has(k) && urls.get(k) !== tab.url) {
         write({ kind: 'tab', event: urls.has(k) ? 'url' : 'new', tab: k, url: tab.url, windowType: tab.windowType });
         urls.set(k, tab.url);
       }
     }
     for (const k of urls.keys()) if (!tabs[k]) { write({ kind: 'tab', event: 'gone', tab: k }); urls.delete(k); }
+    for (const [k, url] of startUrls) if (!tabs[k]) { write({ kind: 'start-tab', event: 'gone', tab: k, url }); startUrls.delete(k); }
     for (const [k, tab] of audible) if (!tabs[k]) { write({ kind: 'audio', event: 'stop', tab: k, url: tab.url, owner: tab.owner, gone: true }); audible.delete(k); }
     for (const [win, keys] of seenWindows) if (!windows.has(win)) write({ kind: 'window', event: 'open', browser: win.split(':')[0], windowId: Number(win.split(':')[1]), tabs: keys, initial: first || undefined });
     for (const win of windows.keys()) if (!seenWindows.has(win)) { write({ kind: 'window', event: 'close', browser: win.split(':')[0], windowId: Number(win.split(':')[1]) }); active.delete(win); }
@@ -1012,8 +1050,9 @@ async function main() {
     for (const p of [run.turnEndError && `turn end on ${remote.host} failed: ${run.turnEndError}`, run.pullError && `could not pull its record dir: ${run.pullError}`].filter(Boolean)) problems.push(`${task.name} · remote · ${p}`);
     return { task, journal, outcome, checks, cursor, focus: myFocus, flashes: myFlashes, sound: mySound, tabs, timing, tokens, calls: callCell };
   });
-  const touched = new Set(journals.flatMap((journal) => (journal || []).map((e) => e.tab).filter(Boolean)));
-  const userTabs = userTabChanges(start, end, touched);
+  const touched = new Set([...journals.flatMap((journal) => (journal || []).map((e) => e.tab).filter(Boolean)),
+    ...(surface === 'codex' ? transcripts.flatMap((tr, i) => tr.tabRefs.map((id) => `${tasks[i].browser}:${id}`)) : [])]);
+  const userTabs = userTabChanges(start, end, touched, monitor.log);
   for (const c of userTabs.changes) problems.push(`round · the user's tabs · ${c}`);
   for (const e of focus.filter((e) => e.owner === 'round')) problems.push(`round · focus · ${e.text}`);
   for (const p of monitorProblems(monitor.log, monitor.ticks)) problems.push(`round · monitor · ${p}`);
@@ -1022,7 +1061,7 @@ async function main() {
   // round's downloads in ~/Downloads, then a final inventory. FowlBrowser's journals name the tabs its agents opened;
   // for Codex, the tabs its transcript proves it created (codexCreatedTabs). Other new tabs seen in an agent's group or on
   // its demo pages may be the user's: left open and reported.
-  const created = surface === 'codex' ? new Set(tasks.flatMap((t, i) => [...codexCreatedTabs({ browser: t.browser, transcript: transcripts[i], monitor: monitor.log, startKeys })]))
+  const created = surface === 'codex' ? new Set(tasks.flatMap((t, i) => [...codexCreatedTabs({ browser: t.browser, transcript: transcripts[i], startKeys })]))
     : createdTabs(journals, startKeys);
   if (!args['keep-tabs']) {
     const now = await inventory(hosts);
