@@ -5,18 +5,30 @@
 <h1>Popups</h1>
 <button id="open">Open window</button>
 <button id="slow">Open slow window</button>
-<a id="blank" href="popup-target.html?via=blank" target="_blank">Open link in new tab</a>
+<button id="features">Open popup window</button>
+<button id="noopener">Open noopener window</button>
+<p>
+  <a id="blank" href="popup-target.html?via=blank" target="_blank">Open link in new tab</a>
+  <a id="rel-noopener" href="popup-target.html?via=rel-noopener" target="_blank" rel="noopener">Open noopener link</a>
+  <a id="rel-opener" href="popup-target.html?via=rel-opener" target="_blank" rel="opener">Open opener link</a>
+  <a id="named" href="popup-target.html?via=named" target="fbnamed">Open named link</a>
+</p>
+<form id="form" action="popup-target.html" target="_blank">
+  <input type="hidden" name="via" value="form">
+  <input type="hidden" name="tag" id="form-tag">
+  <button>Submit form to new tab</button>
+</form>
 <div id="result" role="status" aria-label="Result"></div>
 <script>
   // ?tag= is passed on to the popups so a test run can find (and clean up) exactly its own tabs.
   const tag = new URLSearchParams(location.search).get('tag') || '';
-  document.getElementById('blank').href += `&tag=${encodeURIComponent(tag)}`;
-  document.getElementById('open').onclick = () => {
-    const w = window.open(`popup-target.html?via=window-open&tag=${encodeURIComponent(tag)}`);
-    document.getElementById('result').textContent = w ? 'opened' : 'blocked';
-  };
+  const target = (via) => `popup-target.html?via=${via}&tag=${encodeURIComponent(tag)}`;
+  for (const link of document.querySelectorAll('a')) link.href += `&tag=${encodeURIComponent(tag)}`;
+  document.getElementById('form-tag').value = tag;
+  const result = (text) => { document.getElementById('result').textContent = text; };
+  document.getElementById('open').onclick = () => result(window.open(target('window-open')) ? 'opened' : 'blocked');
   // The popup's server answers after 3 s, so its page commits long after the click returns.
-  document.getElementById('slow').onclick = () => {
-    window.open(`popup-target.html?via=slow&tag=${encodeURIComponent(tag)}&delay=3000`);
-  };
+  document.getElementById('slow').onclick = () => { window.open(`${target('slow')}&delay=3000`); };
+  document.getElementById('features').onclick = () => result(window.open(target('features'), 'fbpopup', 'popup,width=400,height=300') ? 'opened' : 'blocked');
+  document.getElementById('noopener').onclick = () => result(window.open(target('noopener'), '_blank', 'noopener') === null ? 'null' : 'window');
 </script>

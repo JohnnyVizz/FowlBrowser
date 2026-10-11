@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 import net from 'node:net';
 import * as cursor from './cursor/index.mjs';
+import { uninstallPopups } from './popups.mjs';
 import { record, tabEvent } from './record.mjs';
 
 export const turnSocketPath = (pid = process.ppid) => `/tmp/fowlbrowser-turn-${pid}.sock`;
@@ -48,7 +49,10 @@ export async function endTurn(manager) {
         tab.ending = true; // its page closing now is ours, not "found gone" (record mode)
         await cursor.remove(tab, { wait: !close });
         if (close) await browser.host.request('chrome.tabs.remove', [info.id]);
-        else await browser.host.request('tabs.release', { tabId: info.id });
+        else {
+          await uninstallPopups(tab);
+          await browser.host.request('tabs.release', { tabId: info.id });
+        }
         return true;
       };
       try {

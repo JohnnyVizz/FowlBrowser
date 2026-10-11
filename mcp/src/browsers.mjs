@@ -6,7 +6,9 @@ import { chromium } from 'playwright-core';
 import { isOwnBinding } from './cdp.mjs';
 import { watchClosedShadow } from './closedShadow.mjs';
 import { prepare as prepareCursor } from './cursor/index.mjs';
+import { debug } from './debug.mjs';
 import { HostClient, listSockets } from './hostClient.mjs';
+import { installPopups } from './popups.mjs';
 import { downloadDone, record } from './record.mjs';
 import { CDPRelay } from './vendor/cdpRelay.mjs';
 
@@ -212,6 +214,8 @@ export class Browser {
       // The attachShadow hook goes only into agent tabs; the user's claimed tabs get a scan per document instead.
       const info = (await this.host.request('tabs.listAll', {}).catch(() => [])).find((t) => t.id === tabId);
       await watchClosedShadow(tab, info?.origin === 'agent').catch(() => {});
+      // Popups open in the background only from the agent's own tabs, never from tabs that are (or went back to) the user's.
+      if (info?.origin === 'agent' && !info.handedOver && !info.kept && !info.parked) await installPopups(tab).catch((e) => debug('popups: install failed', e.message));
       if (page.isClosed()) return null;
       this.tabs.set(tabId, tab);
       prepareCursor(tab);

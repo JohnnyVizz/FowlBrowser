@@ -7,6 +7,7 @@ import { callOnShadowRef, cleanRef, closedShadowSection, focusShadowRef, isShado
 import * as cursor from './cursor/index.mjs';
 import { debug } from './debug.mjs';
 import { EXPORT_DESCRIPTION, exportShape, exportTab } from './exports.mjs';
+import { uninstallPopups } from './popups.mjs';
 import * as record from './record.mjs';
 import { callsByTab } from './turns.mjs';
 import { cap as capText, collapseText, functionSource, newRefState, numberRefs, playwrightRef, REF_PATTERN, shownRef, SNAPSHOT_MAX_CHARS, SNAPSHOT_MAX_CHARS_LIMIT,
@@ -912,8 +913,9 @@ export function registerTools(server, manager) {
   // `ends`: the call ends our control of the tab. Then it leaves this session's model even if the extension's
   // event never comes (a tab closing during its release), so no ghost tab stays behind.
   // The cursor overlay leaves with our control: released tabs see its exit animation, closing ones don't wait.
-  // event: the record mode tab line for it (release, close, keep).
-  const simpleTabCall = (method, params, done, { ends = false, check, fadeCursor = false, event } = {}) => async (args) => {
+  // event: the record mode tab line for it (release, close, keep). toUser: the tab goes back to the user, so the popup
+  // scripts leave it first (popups.mjs).
+  const simpleTabCall = (method, params, done, { ends = false, check, fadeCursor = false, event, toUser = false } = {}) => async (args) => {
     const { key, tabId } = parseTabId(args.tab);
     const browser = await manager.get(key);
     await check?.(browser, tabId, args);
@@ -922,6 +924,7 @@ export function registerTools(server, manager) {
     const call = async () => {
       if (ends && tab) tab.ending = true; // its page closing now is ours, not "found gone" (record mode)
       if (ends && tab) await cursor.remove(tab, { wait: fadeCursor });
+      if (toUser && tab) await uninstallPopups(tab);
       return browser.host.request(method, params(tabId, args));
     };
     try {
@@ -949,7 +952,7 @@ export function registerTools(server, manager) {
   };
 
   tool('tab_release', 'Give a claimed or opened tab back to the user: stop controlling it and leave it open.',
-    { tab: tabArg }, simpleTabCall('tabs.release', byId, 'Released. The tab stays open and is no longer controlled.', { ends: true, fadeCursor: true, event: 'release' }));
+    { tab: tabArg }, simpleTabCall('tabs.release', byId, 'Released. The tab stays open and is no longer controlled.', { ends: true, fadeCursor: true, event: 'release', toUser: true }));
   const closeOwned = simpleTabCall('chrome.tabs.remove', (tabId) => [tabId], 'Closed.', { ends: true, check: refuseUsersTab, event: 'close' });
   tool('tab_close',
     'Close a tab. Your own tabs close directly. The user\'s tabs (claimed or not) close only when the user asked for it, with confirm_close_users_tab: true; ' +
@@ -976,7 +979,7 @@ export function registerTools(server, manager) {
     'For a tab meant for the user from the start, use tab_open with for_user: true.',
     { tab: tabArg }, simpleTabCall('tabs.keep', byId, 'Kept: handed to the user now (ungrouped) and stays open after your turn ends. You still control it until then; ' +
       'if it was muted it stays muted till then (tab_mute false if the user asked to hear it now).',
-      { event: 'keep' }));
+      { event: 'keep', toUser: true }));
   tool('tab_mute',
     'Mute or unmute a tab\'s audio (the browser\'s tab mute, what the speaker icon in the tab strip shows). Agent tabs open muted unless muted: false (for_user tabs until your turn ends). ' +
     'This is separate from the page\'s own video mute (media mute/unmute).',

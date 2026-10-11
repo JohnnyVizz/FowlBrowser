@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Witness</title>
+<link rel="stylesheet" href="style.css">
+<h1>Witness</h1>
+<p>Stands for the tab the user is looking at: logs every time it is hidden, loses focus or misses frames.</p>
+<script>
+  // localStorage['fbwatch:<tag>'] (same origin, so an agent tab reads it without touching this one):
+  // { events: [[type, visibilityState, hasFocus, at]], gaps: [[ms, at]] (rAF frames more than 1.5 intervals apart),
+  //   frames, interval (median ms between frames), at }
+  const key = 'fbwatch:' + new URLSearchParams(location.search).get('tag');
+  const state = { events: [], gaps: [], frames: 0, interval: null, at: Date.now() };
+  const save = () => { state.at = Date.now(); localStorage[key] = JSON.stringify(state); };
+  const log = (type) => { state.events.push([type, document.visibilityState, document.hasFocus(), Date.now()]); save(); };
+  for (const type of ['visibilitychange', 'blur', 'focus', 'pagehide', 'pageshow']) addEventListener(type, () => log(type), true);
+  const recent = [];
+  let last = null;
+  const frame = (now) => {
+    state.frames++;
+    if (last !== null) {
+      const ms = now - last;
+      if (ms > 1.5 * (state.interval ?? 16.7)) { state.gaps.push([Math.round(ms), Date.now()]); save(); }
+      recent.push(ms);
+      if (recent.length > 120) recent.shift();
+    }
+    last = now;
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+  setInterval(() => { state.interval = [...recent].sort((a, b) => a - b)[recent.length >> 1] ?? null; save(); }, 500);
+  log('start');
+</script>

@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Identity provider</title>
+<link rel="stylesheet" href="style.css">
+<h1>Identity provider</h1>
+<p>Allow the site to sign you in?</p>
+<button id="continue">Continue</button>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  // Served from the other origin (localhost:5412). Sends the code to its opener and closes itself, like real IdPs.
+  const origin = new URLSearchParams(location.search).get('origin');
+  document.getElementById('result').textContent = window.opener ? 'opener' : 'no opener';
+  document.getElementById('continue').onclick = () => {
+    window.opener?.postMessage({ code: 'code-1234' }, origin);
+    window.close();
+  };
+</script>

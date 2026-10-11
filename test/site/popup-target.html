@@ -4,7 +4,9 @@
 <link rel="stylesheet" href="style.css">
 <h1>Popup target</h1>
 <div id="result" role="status" aria-label="Result"></div>
+<p id="opener"></p>
 <script>
+  document.getElementById('opener').textContent = window.opener ? 'has opener' : 'no opener';
   document.getElementById('result').textContent = 'popup:' + new URLSearchParams(location.search).get('via');
   document.title = 'Popup target ' + new URLSearchParams(location.search).get('via');
 </script>

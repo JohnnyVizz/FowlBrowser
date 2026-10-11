@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>OAuth opener</title>
+<link rel="stylesheet" href="style.css">
+<h1>Sign in</h1>
+<button id="signin">Sign in with IdP</button>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  // Opens a cross-origin "identity provider" popup the classic way (popup features, a name), waits for its code by
+  // postMessage and watches the popup close. #result: {opened, code, closed}.
+  const tag = new URLSearchParams(location.search).get('tag') || '';
+  const state = { opened: false, code: null, closed: false };
+  const show = () => { document.getElementById('result').textContent = JSON.stringify(state); };
+  addEventListener('message', (e) => {
+    if (e.origin !== 'http://localhost:5412' || !e.data?.code) return;
+    state.code = e.data.code;
+    show();
+  });
+  document.getElementById('signin').onclick = () => {
+    const url = `http://localhost:5412/oauth-popup.html?tag=${encodeURIComponent(tag)}&origin=${encodeURIComponent(location.origin)}`;
+    const popup = window.open(url, 'idp', 'popup,width=480,height=640');
+    state.opened = !!popup;
+    show();
+    const poll = setInterval(() => {
+      if (popup && popup.closed) { state.closed = true; show(); clearInterval(poll); }
+    }, 100);
+  };
+</script>

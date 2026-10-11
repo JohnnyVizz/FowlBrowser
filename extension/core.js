@@ -27,6 +27,7 @@ const DOWNLOAD_SETTLE_MS = 800;        // quiet time after the latest of them be
 const DOWNLOAD_PAIR_MS = 2000;         // a download and its tab's signal arrive this close together, or they don't pair
 const DOWNLOAD_EXPECT_MAX_MS = 300_000;
 const BROWSING_DATA_MAX = 200;
+const POPUP_ARM_MS = 1500;             // after a Page.windowOpen, how long a new active tab in that window is switched back
 const GROUP_COLORS = ['grey', 'blue', 'red', 'yellow', 'green', 'pink', 'purple', 'cyan', 'orange'];
 
 export function colorFor(label) {
@@ -60,6 +61,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
   const childTargets = new Map();   // tabId -> target and session ids of that tab's own children (iframes, workers)
   const closing = new Set();        // unowned tabs tabs.closeUnowned is closing: never adopted meanwhile
   const expectations = new Map();   // claimed tabId -> { client, until }: tabs.expectChild windows
+  const windowOf = new Map();       // owned tabId -> windowId, learnt before each of its actions (tabs.expectChild)
+  const armedWindows = new Map();   // windowId -> { source, url, at, until }: a popup is on its way into that window
   // Downloads: each belongs to the client whose tab started it (see attributeDownload), and only that client
   // ever sees it. Nothing here survives a disconnect; the files stay.
   const downloads = new Map();      // download id -> { client, tabId }
@@ -287,7 +290,6 @@ export function createCore({ chrome, send, timers = globalThis }) {
     for (const [id, record] of downloads) if (record.client === client) downloads.delete(id);
     for (const [tabId, expected] of downloadExpectations) if (expected.client === client) downloadExpectations.delete(tabId);
     for (let i = downloadSignals.length - 1; i >= 0; i--) if (downloadSignals[i].client === client) downloadSignals.splice(i, 1);
-    // A popup of this client's still waiting for its opener fallback is adopted now, so it is closed with the rest.
     const mine = [...owners].filter(([, owner]) => owner.client === client);
     for (const [, owner] of mine) owner.releasing = true;
     await Promise.allSettled([persist(), ...mine.map(([tabId, owner]) => serialize(tabId, () => cleanUp(tabId, owner)))]);
@@ -404,6 +406,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
     async 'tabs.expectChild'({ tabId, ms }, { client }) {
       requireOwner(client, tabId);
       expectations.set(tabId, { client, until: Date.now() + Math.min(Math.max(Number(ms) || 0, 0), EXPECT_CHILD_MAX_MS) });
+      // So a popup of this action can be armed synchronously; known long before the click it waits for has opened anything.
+      chrome.tabs.get(tabId).then((tab) => windowOf.set(tabId, tab.windowId), () => {});
       return { ok: true };
     },
 
@@ -686,6 +690,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
       childTargets.get(source.tabId)?.delete(params.sessionId);
     } else if (method === 'Page.downloadWillBegin' && !owner.releasing) {
       downloadSignal(owner.client, source.tabId, params?.url, params?.guid);
+    } else if (method === 'Page.windowOpen' && adopter(source.tabId)) {
+      armPopup(source.tabId, params?.url ?? '');
     }
     emitToOwner(owner, 'chrome.debugger.onEvent', [source, method, params]);
   }
@@ -821,6 +827,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
     scheduleChanged();
     childTargets.delete(tabId);
     expectations.delete(tabId);
+    windowOf.delete(tabId);
     const owner = owners.get(tabId);
     if (!owner) return;
     owners.delete(tabId);
@@ -849,6 +856,32 @@ export function createCore({ chrome, send, timers = globalThis }) {
     if ('url' in changeInfo || 'title' in changeInfo) scheduleChanged();
   }
 
+  // --- Popups that Chrome opens as the active tab ---
+  // A window.open the page script let through (it needs its opener) or one it never saw (no script in that frame) opens
+  // as the active tab of the opener's window. Blink reports it (Page.windowOpen) before it asks the browser for the
+  // window, so the window is armed first; the new tab is then switched back in the tabs.onCreated listener itself,
+  // before anything is awaited, to keep the flash to a frame or two. settleChild's re-activation is the fallback.
+  // Only a new tab in the armed window, showing the asked URL (or nothing yet), once: never the user's own tab switch
+  // or their Cmd+T (chrome://newtab).
+  function armPopup(tabId, url) {
+    const arm = (windowId) => armedWindows.set(windowId, { source: tabId, url, at: Date.now(), until: Date.now() + POPUP_ARM_MS });
+    if (windowOf.has(tabId)) return arm(windowOf.get(tabId));
+    chrome.tabs.get(tabId).then((tab) => { windowOf.set(tabId, tab.windowId); arm(tab.windowId); }, () => {});
+  }
+
+  function switchBackFromPopup(tab) {
+    const arm = armedWindows.get(tab.windowId);
+    if (!arm || !tab.active || Date.now() > arm.until) return;
+    const url = tab.pendingUrl || tab.url || '';
+    if (url && url !== 'about:blank' && url !== arm.url) return;
+    const record = activeByWindow.get(tab.windowId);
+    const previous = record?.current === tab.id ? record.previous : record?.current;
+    if (previous === undefined || previous === tab.id) return;
+    armedWindows.delete(tab.windowId);
+    chrome.tabs.update(previous, { active: true }).catch(() => {});
+    log('popup: switched back', { tab: tab.id, previous, source: arm.source, armedMs: Date.now() - arm.at });
+  }
+
   async function onTabActivated({ tabId, windowId }) {
     await ready;
     const record = activeByWindow.get(windowId);
@@ -858,7 +891,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // A tab opened by an owned tab (window.open, target=_blank) joins the opener's client in the background.
   // Only webNavigation's navigation-target event decides whose it is: Helium reports the window's active tab as
   // openerTabId, which can be the user's or another session's, so openerTabId is never used.
-  async function onTabCreated() {
+  async function onTabCreated(tab) {
+    switchBackFromPopup(tab);
     await ready;
     scheduleChanged();
   }

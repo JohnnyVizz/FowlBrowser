@@ -225,6 +225,38 @@ test('a tab opened by an owned tab is adopted and the user keeps their active ta
   assert.equal(core.owners.has(userChild.id), false);
 });
 
+test('a popup Chrome activates after Page.windowOpen is switched back inside the onCreated listener, once', async () => {
+  const { core, call, chrome } = setup();
+  const userTab = chrome.addTab({ url: 'https://mail.example', active: true });
+  await core.onTabActivated({ tabId: userTab.id, windowId: 1 });
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  await call(1, 'tabs.expectChild', { tabId: opener.id, ms: 3000 });
+  const switchedBack = () => chrome.calls.filter((c) => c[0] === 'tabs.update' && c[2].active === true);
+
+  // Not armed: the user's own new tab (or a popup of a tab nobody drives) is left alone.
+  core.onTabCreated(structuredClone(chrome.addTab({ active: true, url: 'https://elsewhere.example' })));
+  assert.equal(switchedBack().length, 0);
+
+  await core.onDebuggerEvent({ tabId: opener.id }, 'Page.windowOpen', { url: 'https://idp.example/auth' });
+  // The user's Cmd+T in the armed window is theirs.
+  core.onTabCreated(structuredClone(chrome.addTab({ active: true, url: 'chrome://newtab/' })));
+  assert.equal(switchedBack().length, 0);
+
+  const popup = chrome.addTab({ active: true, url: '' });
+  core.onTabCreated(structuredClone(popup)); // not awaited: the switch is issued synchronously
+  assert.deepEqual(switchedBack().map((c) => c[1]), [userTab.id]);
+
+  // Used up: a second new active tab is the user's.
+  core.onTabCreated(structuredClone(chrome.addTab({ active: true, url: '' })));
+  assert.equal(switchedBack().length, 1);
+
+  // A claimed tab arms only inside its expectChild window (the agent's own click).
+  const { result: claimed } = await call(1, 'tabs.claim', { tabId: userTab.id });
+  await core.onDebuggerEvent({ tabId: claimed.id }, 'Page.windowOpen', { url: 'https://user.example/' });
+  core.onTabCreated(structuredClone(chrome.addTab({ active: true, url: '' })));
+  assert.equal(switchedBack().length, 1);
+});
+
 test('client disconnect closes agent tabs, ungroups kept ones and releases claimed ones', async () => {
   const { core, call, chrome } = setup();
   const { result: agentTab } = await call(1, 'tabs.open', {});

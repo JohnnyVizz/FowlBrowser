@@ -155,6 +155,16 @@ export function makeContext({ server, browser, tag }) {
       }
     },
     async listAll() { return parseTabs(await server.call('tab_list', { browser, scope: 'all' })); },
+    // A raw host connection of the scenario's own (never this server's): tabs.listAll with windowId, index, kept and
+    // handedOver, and tabs.focus for a witness tab. Closed by cleanup.
+    async host() {
+      t._host ??= (async () => {
+        const host = new HostClient(path.join(SOCKET_DIR, `${browser}.sock`));
+        await host.connect(`raw-${tag}`);
+        return host;
+      })();
+      return t._host;
+    },
 
     async snapshot(tab, ref) {
       return (await server.call('snapshot', ref ? { tab, ref } : { tab })).text;
@@ -202,6 +212,7 @@ export function makeContext({ server, browser, tag }) {
       for (const tab of t.userTabs) {
         if (!t.closed.has(tab)) try { await server.call('tab_close', { tab, confirm_close_users_tab: true }); } catch {}
       }
+      if (t._host) (await t._host.catch(() => null))?.close();
     },
   };
   return t;

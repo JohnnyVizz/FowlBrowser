@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Runs the end-to-end scenarios through one FowlBrowser MCP server.
 //   node test/run.mjs --browser chrome|helium|both --parallel N [--only name,name] [--local]
-// --local skips the real-site scenarios. The test site is started if it isn't already up.
+// --local skips the real-site scenarios. The test site is started if it isn't already up. Scenarios marked
+// `exclusive` (they watch or change which tab the user sees) run one at a time after all the others.
 import { browsersFrom, connect, ensureSite, loadScenarios, parseArgs, parseTabs, pool, printTable, runJob, sweepLeaks } from './lib.mjs';
 
 const args = parseArgs(process.argv.slice(2), { browser: 'both', parallel: '2' });
@@ -16,7 +17,10 @@ let exitCode = 0;
 try {
   const jobs = scenarios.flatMap(s => browsers.map(b => [s, b]));
   const started = Date.now();
-  const rows = await pool(jobs, Number(args.parallel), ([s, b]) => runJob(server, s, b));
+  const rows = [
+    ...await pool(jobs.filter(([s]) => !s.exclusive), Number(args.parallel), ([s, b]) => runJob(server, s, b)),
+    ...await pool(jobs.filter(([s]) => s.exclusive), 1, ([s, b]) => runJob(server, s, b)),
+  ];
   printTable(rows, `FowlBrowser e2e: ${browsers.join(' + ')}, parallel ${args.parallel}, ${((Date.now() - started) / 1000).toFixed(1)}s total`);
   if (rows.some(r => !r.ok)) exitCode = 1;
 

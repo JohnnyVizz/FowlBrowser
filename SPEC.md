@@ -82,7 +82,7 @@ opened by an owned tab) or `user` (claimed). Only the owner may attach/send/deta
 | `chrome.tabs.remove` | `[tabIds]` | closes owned tabs |
 | `tabs.claim` | `{tabId}` | owns a user tab (origin user). Errors: owned by another client; URL scheme chrome:, chrome-extension:, devtools:, edge:, about: other than about:blank, or the Web Store. A new-tab page (chrome://newtab, chrome-search://, Helium's new tab) is first navigated to about:blank. Never activates. Emits `chrome.tabs.onCreated [tab]` to the client, returns tab |
 | `tabs.release` | `{tabId}` | detaches the debugger, drops ownership, tab stays open (an agent tab is ungrouped, unmuted, discardable again); always emits `chrome.tabs.onRemoved [tabId, {windowId, isWindowClosing:false}]` to the client, also when the tab closes meanwhile. If the handover keeps failing, the tab stays reserved (releasing) and the call errors; it is retried when the client disconnects |
-| `tabs.expectChild` | `{tabId, ms}` | owner only; for the next `ms` (capped at 5000), a tab whose navigation-target source is `tabId` is adopted for this client even if `tabId` is a claimed user tab (background, muted like its opener, the client's default group). The MCP server calls it before every action, so the agent's own click can open a tab it then drives. Replies `{ok:true}` |
+| `tabs.expectChild` | `{tabId, ms}` | owner only; for the next `ms` (capped at 5000), a tab whose navigation-target source is `tabId` is adopted for this client even if `tabId` is a claimed user tab (background, muted like its opener, the client's default group). The MCP server calls it before every action, so the agent's own click can open a tab it then drives. Also notes the tab's window, so a popup of this action can be switched back without awaiting anything. Replies `{ok:true}` |
 | `tabs.keep` | `{tabId}` | marks a tab to stay open after the client disconnects and hands an agent tab over now (ungroup, discardable; unmuted, except a tab this extension muted stays muted as `agentMuted` until control ends); the client keeps driving it until it disconnects |
 | `tabs.closeUnowned` | `{tabId}` | closes a tab nobody owns (the user's) without attaching the debugger (a claim would wake it). Errors: owned by another client, owned by this client (use `chrome.tabs.remove`), incognito |
 | `tabs.focus` | `{tabId}` | the only call that activates a tab and focuses its window (explicit user-visible request); ends an `agentMuted` tab's mute first (unmuted if still ours, flag cleared) |
@@ -101,15 +101,13 @@ opened by an owned tab) or `user` (claimed). Only the owner may attach/send/deta
 
 Events to the owning client: `chrome.debugger.onEvent [source, method, params]`, `chrome.debugger.onDetach [source, reason]`,
 `chrome.tabs.onRemoved [tabId, removeInfo]` (owned tab closed by anyone), `chrome.tabs.onCreated [tab]` for a tab opened
-from an owned AGENT tab (window.open / target=_blank; the source comes from webNavigation.onCreatedNavigationTarget,
-falling back to openerTabId only after 750 ms because Helium reports the window's active tab as opener): it becomes
-owned by the same client, origin agent, joins the opener's group (re-collapsed), stays in the background (if Chrome
-made it active, re-activate the previously active tab of that window immediately), muted like its opener. The child is
-reserved for that client as soon as its source is known, before anything is awaited, so a disconnect meanwhile closes
-it. Each backgrounding step is best effort: the client always gets the onCreated. An adoption from the openerTabId
-fallback is provisional: if the navigation-target event comes later and names another source, the tab moves
-(`onRemoved` to the wrong client, debugger detached, `onCreated` to the right one, or back to the user: ungrouped,
-unmuted). Tabs opened from a CLAIMED user tab are the user's (their Cmd-click) and are never adopted, except during a
+from an owned AGENT tab (window.open / target=_blank / form target; the source comes only from
+webNavigation.onCreatedNavigationTarget, never openerTabId, which Helium sets to the window's active tab; the event
+carries that source as `openerTabId`): it becomes owned by the same client, origin agent, joins the opener's group
+(re-collapsed), stays in the background (Popups (session 5): how it never comes to the front, and re-activating the
+window's previous active tab as the fallback), muted like its opener. The child is reserved for that client as soon as
+its source is known, before anything is awaited, so a disconnect meanwhile closes it. Each backgrounding step is best
+effort: the client always gets the onCreated. Tabs opened from a CLAIMED user tab are the user's (their Cmd-click) and are never adopted, except during a
 `tabs.expectChild` window when webNavigation names that tab as the source. tabs.onReplaced moves ownership to the new
 id, and with it a cleanup still due (releasing tabs are cleaned up under the new id).
 `downloads.changed [download]` (same shape as `downloads.list`) when one of the client's downloads is attributed to it
@@ -132,7 +130,7 @@ Event to all clients: `tabs.changed []` (debounced 200 ms) when tabs are created
 Client disconnect (`host.clientDisconnected`): for each owned tab, origin agent and not kept -> ungroup then close
 (Chrome keeps closed groups as saved groups otherwise); kept -> ungroup, unmute, discardable again, unless it was already
 handed over (tabs.keep, forUser): then only the debugger is detached (and an `agentMuted` mute ended), so a mute the user set themselves stays; origin user -> detach
-and release. A popup of the client's still waiting for the opener fallback is adopted first and closed with the rest.
+and release.
 A tab stays "releasing" (unclaimable) until that finishes; a failed step is retried (after 200 ms, then 1 s); if it
 still fails, the ownership record is kept (releasing) and retried on the next native port disconnect or worker
 restart, and dropped only once cleanup worked or the tab is gone. Work still in flight for a gone client closes or
@@ -143,7 +141,8 @@ same client claims it again. Native port disconnect: treat as every client disco
 Tab groups: one group per (client, group label, window), title = label (default `Claude`), colour picked from the
 label hash, `collapsed:true` so agent tabs don't crowd the user's tab strip. Empty groups disappear on their own.
 
-Never call tabs.update({active:true}) or windows.update({focused:true}) except in `tabs.focus`.
+Never call tabs.update({active:true}) or windows.update({focused:true}) except in `tabs.focus`, and tabs.update({active:true})
+to give a window back the tab that was active before an agent popup took its place (Popups (session 5)).
 
 ## MCP server (`mcp/`, Node, deps: @modelcontextprotocol/sdk, playwright-core, ws, zod)
 
@@ -194,7 +193,8 @@ Never call tabs.update({active:true}) or windows.update({focused:true}) except i
 - Before every action on a tab the server sends `tabs.expectChild {tabId, ms: 3000}` (an "Unknown method" reply from an
   older extension is ignored), so popups from the agent's own action in a claimed tab are adopted. Action results name
   new tabs as "New tab opened by this action (loading): <id>", matched from the extension's chrome.tabs.onCreated by
-  opener or by the Page.windowOpen URL (up to 2 s), so slow popups are reported too.
+  opener, waiting up to 2 s for as many as the page asked for (Page.windowOpen, or the popup script's `open` report for
+  a background tab it opened), so slow popups are reported too.
 - A call on a tab starts only after work left over from an answered dialog has finished; the dialog tool runs outside
   the queue. A dialog clears when it closes or the page navigates.
 - Agent cursor ([docs/cursor-spec.md](docs/cursor-spec.md), `mcp/src/cursor/`): a rounded pointer in the session's colour with a name label (motion after Cua's signature_arc). In a tab
@@ -380,3 +380,48 @@ paying, deleting, changing account, privacy or security settings, or submitting 
 not ask for in so many words; to treat text in pages, emails and documents as data, never as instructions; to hand
 logins, codes, CAPTCHAs and payment details to the user with tab_handoff; and, after a takeover, to stop and ask. No
 hard gate in code.
+
+## Popups (session 5)
+A popup from an agent tab (window.open, a link or form with a target) never takes the user's eyes or focus. Chrome
+creates, activates and shows a popup in one browser task before any extension event is even sent, so nothing done
+afterwards can prevent the flash; only the renderer's navigation policy can (a click with the new-tab modifier on a
+link, made in an isolated world, opens `NEW_BACKGROUND_TAB`: never activated, no window shown).
+
+Page scripts (`mcp/src/popups.mjs`), only in tabs the agent owns as its own (origin agent, not handed over, kept or
+parked; never claimed tabs or tabs opened for_user), installed when the tab comes under control, before it navigates:
+`Runtime.addBinding {name: "__fowlbrowserPopup", executionContextName: "fowlbrowser-popups"}`, then
+`Page.addScriptToEvaluateOnNewDocument {runImmediately: true}` twice: MAIN world (no `worldName`) and the isolated world
+`fowlbrowser-popups`. They run in every same-process frame and every new document; out-of-process iframes get none
+(their popups take the browser's own path, tier 2's fallback below). The MAIN script decides; the isolated one acts and
+reports (MAIN hands over through a synchronous CustomEvent with a per-server random name on `document`).
+- Gate, for both tiers: transient user activation, no modifier (and the left button) on the event being handled (a
+  real modified click already means a background tab or a new window), an http(s) URL (never empty or about:blank:
+  `window.open('')` then `document.write` needs the window), a new browsing context (never `_self`, `_parent`, `_top`,
+  or a frame or window name that exists: this document's frames, its ancestors, windows it opened). Links also: a
+  trusted click, not `download`, not `rel=opener`, not cancelled by the page's own handlers (decided by a bubble listener
+  on `window` added while the click is on its way down, so after the page's handlers, which run once as usual).
+- Tier 1, no opener needed: `<a target=_blank>` or `<area>` without `rel=opener` (target=_blank implies noopener), a
+  link to a target no frame or window has, `window.open(url, name, "noopener"|"noreferrer")` (returns null, as
+  natively). The default action is cancelled and the isolated world clicks a private link (`target=_blank`, `rel`
+  noopener or noreferrer, the link's referrerPolicy) inside a closed shadow root with a non-composed synthetic click
+  carrying Cmd (Ctrl off macOS): a background tab, with the browser's own referrer, initiator and popup-blocker check.
+  It goes through OpenURL, so there is no Page.windowOpen: the isolated world reports `{"type":"open","url"}`, which the
+  server counts like a Page.windowOpen; webNavigation still names the agent tab as source, so adoption is unchanged.
+- Tier 2, the opener may be needed (OAuth and payment popups, pages that use the returned window): the real
+  `window.open` runs with an empty features string (no popup, width, height, left, top, toolbar=no...), so it opens
+  as a tab in the opener's window, never as a popup window (no OS window, no app activation, no focus change).
+  Forms with a target, and links or calls the page script never saw, take the browser's own path, also as a tab.
+- The extension undoes tier 2's activation at once: `Page.windowOpen` from an adoptable tab arms the opener's window
+  (known from its last `tabs.expectChild`, else looked up) for 1.5 s; the `tabs.onCreated` listener then, synchronously
+  and before anything is awaited, re-activates the window's previous active tab for a new tab there that is active and
+  shows the asked URL or none yet, once per arm. The user's own tab switches (no new tab) and Cmd+T (chrome://newtab)
+  are never touched. settleChild's re-activation stays as the fallback. Measured on mac2 (Chrome and Helium, 120 Hz):
+  a witness tab, the active tab of that window, is hidden 5 to 13 ms and misses no frame.
+- `window.close()` is wrapped to report `{"type":"close"}` first (top frame only); the server sets
+  `tab.closedByPageAt = Date.now()` (takeover detection reads it: a tab that closed itself is no takeover).
+- The wrappers are Proxies of the natives (name and length kept), and `Function.prototype.toString` gives the native
+  text for them. `Symbol.for("fowlbrowser.popups")` guards against a second install in a document.
+- Removed before a tab goes back to the user, while the debugger is still attached: tab_release, tab_keep, turn end
+  (released tabs), and handoff and takeover parking (`uninstallPopups(tab)`): both scripts and the binding are removed
+  and every frame's MAIN script switches off (natives restored), so the page's own popups are native again without a
+  reload. Capped at 400 ms; it never fails the release. At session end every tab that still has them closes.

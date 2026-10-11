@@ -7,8 +7,11 @@ export default {
   async run(t) {
     const tab = await t.open(`${t.site}/popups.html?tag=${t.tag}`);
     t.step('hand the tab to the user, then claim it');
+    await t.eval(tab, '() => { window.__fbWrapped = window.open; return true; }');
     await t.call('tab_release', { tab });
     await t.call('tab_claim', { tab, snapshot: false });
+    // The popup script left with the release (the user's popups are native again) and a claim puts none in.
+    t.eq(await t.eval(tab, '() => window.open !== window.__fbWrapped'), true, 'window.open is native again after the release');
 
     t.step('click a target=_blank link');
     const res = await t.call('click', { tab, ref: await t.refOf(tab, 'link', 'Open link in new tab'), snapshot: false });
