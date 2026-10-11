@@ -308,6 +308,9 @@ async function onReport(tab, payload) {
   if (report.type === 'navigate') return void selfNavigated.set(tab.id, Date.now());
   const how = inputHow(report);
   if (!how || records.has(tab.id) || agentInput(browser, tabId, report.at)) return;
+  // Focus moving into an iframe has no Input.* command behind it when the agent's fill or focus moves it (through the DOM):
+  // while a call runs on the tab, that one signal is the agent's. Clicks, keys and wheel are judged by input alone.
+  if (report.type === 'frame' && tab.busy) return;
   // Agent input is trusted too; only input in the tab the user is looking at, in the window they are in, can be theirs.
   const seen = await browser.host.request('tabs.isShown', { tabId }).catch(() => null);
   if (!seen?.shown || !seen.focused || agentInput(browser, tabId, report.at)) return;

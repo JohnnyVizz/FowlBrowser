@@ -551,3 +551,18 @@ test('a handoff whose park errors after parking keeps its record: calls get the 
   assert.match((await call('tab_claim', { tab: id })).text, /You handed .*:1 to the user/);
   assert.ok(!browser.requests.some(([m]) => m === 'tabs.claim' || m === 'tabs.setMuted'));
 });
+
+test('focus moving into an iframe is the agent\'s while one of its calls runs (Playwright focuses through the DOM), the user\'s otherwise', async () => {
+  const browser = await fakeBrowser({ ids: [1] });
+  const tab = browser.tabs.get(1);
+  let finish;
+  const running = tab.run(() => new Promise((resolve) => { finish = resolve; }));
+  report(tab, 'frame', Date.now());
+  await sleep(10);
+  assert.deepEqual(parks(browser), [], 'during an agent call');
+  finish();
+  await running;
+  report(tab, 'frame', Date.now() + 1000);
+  await sleep(10);
+  assert.deepEqual(parks(browser), [{ tabId: 1, kind: 'takeover' }], 'no call running: the user clicked into the frame');
+});

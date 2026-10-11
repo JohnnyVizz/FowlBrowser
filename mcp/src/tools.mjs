@@ -216,8 +216,8 @@ const SELECT_ALL_FN = function (el) {
 const FOCUSED_FIELD_FN = () => {
   let el = document.activeElement;
   while (el?.shadowRoot?.activeElement) el = el.shadowRoot.activeElement;
-  const field = el?.matches('textarea, input') ? !/^(button|submit|reset|checkbox|radio|file|image|range|color|hidden|date|datetime-local|month|week|time)$/.test(el.type)
-    : !!el?.isContentEditable;
+  // Only text inputs and textareas: in an editable area (rich text, a code editor) select-all would take the whole document.
+  const field = el?.matches('textarea, input') && !/^(button|submit|reset|checkbox|radio|file|image|range|color|hidden|date|datetime-local|month|week|time)$/.test(el.type);
   if (!field) return null;
   const r = el.getBoundingClientRect();
   return r.width >= 4 && r.height >= 4 && getComputedStyle(el).opacity !== '0' ? el : null;
@@ -345,19 +345,21 @@ async function settle(tab, { requests, first }, { watchMs = WATCH_MS.snapshot, g
   if (waited) return;
   await within(first, watchMs);
   const main = tab.page.mainFrame();
-  // Once more after the requests: a navigation a response started (a login that redirects once its fetch is answered).
-  for (let again = false; ; again = true) {
+  // Requests that start while earlier ones finish (a fetch answered, then another, then a redirect) are followed too,
+  // all within one 3 s budget, and a navigation any of them started is waited for.
+  const deadline = Date.now() + 3000;
+  const seen = new Set();
+  for (;;) {
     const navigation = requests.find((r) => r.isNavigationRequest() && r.frame() === main);
     if (navigation) {
       await committed(tab, navigation, generation, timeout);
       return load();
     }
-    if (again) return;
-    const pending = requests.filter((r) => WATCHED.has(r.resourceType())).map((r) => r.response().then((response) => response?.finished()).catch(() => {}));
-    if (!pending.length) return;
-    await within(Promise.all(pending), 3000);
-    if (!trailing) return;
-    await sleep(TRAILING_MS);
+    const pending = requests.filter((r) => WATCHED.has(r.resourceType()) && !seen.has(r));
+    if (!pending.length || Date.now() >= deadline) return;
+    for (const r of pending) seen.add(r);
+    await within(Promise.all(pending.map((r) => r.response().then((response) => response?.finished()).catch(() => {}))), deadline - Date.now());
+    await sleep(trailing ? TRAILING_MS : 0);
   }
 }
 
@@ -419,10 +421,9 @@ async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenT
   // A tab this action opens from the user's claimed tab is adopted (ours, in the background) instead of being the user's.
   // Only for actions that can open tabs (a shorter window means fewer chances to catch the user's own Cmd-click, and
   // such a tab is handed back to them, never closed). Older extensions don't know the command; that only loses
-  // the adoption. Not waited for: the host and the extension take requests in order, so the extension has it before
-  // any input of the action.
+  // the adoption. Waited for: the extension reads the tab's window and group state for a popup of this action first.
   if (mayOpenTabs) {
-    tab.browser.host.request('tabs.expectChild', { tabId: tab.tabId, ms: 3000 }).catch((error) => {
+    await tab.browser.host.request('tabs.expectChild', { tabId: tab.tabId, ms: 3000 }).catch((error) => {
       if (!/unknown method/i.test(error.message)) debug('tabs.expectChild failed', error.message);
     });
   }
@@ -823,7 +824,7 @@ async function typeText(tab, args) {
     await callOnShadowRef(tab, args.ref, args.append ? CARET_TO_END_FN : SELECT_ALL_FN);
     if (!args.append && !args.text) await tab.page.keyboard.press('Delete');
   } else if (!args.ref) {
-    // The focused field is replaced or appended to like a ref's; elsewhere (a canvas or code editor) the text goes in at the caret.
+    // A focused text input or textarea is replaced or appended to like a ref's; elsewhere (rich text, code or canvas editors) the text goes in at the caret.
     const handle = await tab.page.evaluateHandle(FOCUSED_FIELD_FN);
     const field = handle.asElement();
     try {
@@ -1211,8 +1212,8 @@ export function registerTools(server, manager) {
 
   tool('type',
     'Type text into an editable element. Replaces its content unless append is true. slowly types one key at a time (for fields that react per key, like search suggestions). submit presses Enter after. ' +
-    'Without ref it types into whatever has focus (e.g. after click at x,y on a canvas editor or a control the snapshot cannot show): a focused text field ' +
-    'is replaced or appended to the same way; in code and canvas editors the text goes in at the caret.',
+    'Without ref it types into whatever has focus (e.g. after click at x,y on a canvas editor or a control the snapshot cannot show): a focused text input or textarea ' +
+    'is replaced or appended to the same way; in rich text, code and canvas editors the text goes in at the caret.',
     { tab: tabArg, ref: shadowRefArg.optional(), text: z.string(), submit: z.boolean().optional(), slowly: z.boolean().optional(), append: z.boolean().optional(),
       snapshot: snapshotArg, timeout_ms: timeoutArg },
     withTab(manager, (tab, args) => actOpening(tab, args, () => (args.ref
