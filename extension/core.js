@@ -62,6 +62,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
   const childTargets = new Map();   // tabId -> target and session ids of that tab's own children (iframes, workers)
   const closing = new Set();        // unowned tabs tabs.closeUnowned is closing: never adopted meanwhile
   const expectations = new Map();   // claimed tabId -> { client, until }: tabs.expectChild windows
+  const folded = new Map();         // owned tabId -> { groupId, folded }: its group's state right before its current action
+  const openedActive = new Set();   // tabs Chrome opened as the active tab (that unfolds a folded group they join)
   const windowOf = new Map();       // owned tabId -> windowId, learnt before each of its actions (tabs.expectChild)
   const armedWindows = new Map();   // windowId -> { source, url, at, until }: a popup is on its way into that window
   const openedFor = new Map();      // tabs.openChild child tabId -> opener tabId, until the child's first page commits
@@ -164,7 +166,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
       if (!existing) {
         const created = (async () => {
           const groupId = await chrome.tabs.group({ tabIds: [tabId], createProperties: { windowId } });
-          await chrome.tabGroups.update(groupId, { title: label, color: colorFor(label), collapsed: true });
+          await chrome.tabGroups.update(groupId, { title: label, color: colorFor(label), collapsed: false });
           return groupId;
         })();
         groups.set(key, created);
@@ -256,13 +258,18 @@ export function createCore({ chrome, send, timers = globalThis }) {
     delete owner.agentMuted;
   }
 
+  // Whether the user has the tab's group folded (false when it has none).
+  async function groupFolded(tab) {
+    return tab.groupId !== -1 && (await chrome.tabGroups.get(tab.groupId).catch(() => null))?.collapsed === true;
+  }
+
   // A parked tab stays the client's (so it can resume) but is the user's meanwhile: debugger detached, out of the
   // client's group, this extension's mute ended, discardable, and kept and handed over, so a disconnect hands it to
   // them and never closes it. What it was is remembered for unpark. The client hears a detach with reason "parked".
   async function park(tabId, owner, kind) {
     const tab = await chrome.tabs.get(tabId);
     const grouped = owner.origin === 'agent' && tab.groupId !== -1; // a claimed tab's group is the user's own
-    owner.parked = { kind, at: Date.now(), grouped, muted: ownMute(tab), agentMuted: !!owner.agentMuted, kept: !!owner.kept, handedOver: !!owner.handedOver };
+    owner.parked = { kind, at: Date.now(), grouped, groupId: tab.groupId, folded: grouped && await groupFolded(tab), muted: ownMute(tab), agentMuted: !!owner.agentMuted, kept: !!owner.kept, handedOver: !!owner.handedOver };
     owner.detached = true;
     owner.kept = owner.handedOver = true;
     delete owner.agentMuted;
@@ -292,7 +299,13 @@ export function createCore({ chrome, send, timers = globalThis }) {
     const { parked } = owner;
     parked.resuming = true;
     try {
-      if (parked.grouped) await addToGroup(owner.client, owner.group ?? labelFor(owner.client), tabId, tab.windowId);
+      if (parked.grouped) {
+        await addToGroup(owner.client, owner.group ?? labelFor(owner.client), tabId, tab.windowId);
+        // Its group went with it (it was the last tab) and was made again, expanded: folded again if it was. A group
+        // that is still there keeps whatever the user did to it since.
+        const { groupId } = await chrome.tabs.get(tabId);
+        if (parked.folded && groupId !== -1 && groupId !== parked.groupId) await chrome.tabGroups.update(groupId, { collapsed: true });
+      }
       const restore = { ...(parked.muted && { muted: true }), ...(owner.origin === 'agent' && !parked.handedOver && { autoDiscardable: false }) };
       if (Object.keys(restore).length) await chrome.tabs.update(tabId, restore);
       await persist();
@@ -346,6 +359,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
         }
       }
       if (owners.get(tabId) === owner) owners.delete(tabId);
+      folded.delete(tabId);
       await persist();
       return true;
     }
@@ -483,8 +497,11 @@ export function createCore({ chrome, send, timers = globalThis }) {
     async 'tabs.expectChild'({ tabId, ms }, { client }) {
       requireOwner(client, tabId);
       expectations.set(tabId, { client, until: Date.now() + Math.min(Math.max(Number(ms) || 0, 0), EXPECT_CHILD_MAX_MS) });
-      // So a popup of this action can be armed synchronously; known long before the click it waits for has opened anything.
-      chrome.tabs.get(tabId).then((tab) => windowOf.set(tabId, tab.windowId), () => {});
+      // Read before replying, so before the action: the window, so a popup of the action can be armed synchronously, and
+      // whether the user has its group folded, so a popup Chrome activates in it (which unfolds it) folds it back.
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (tab) windowOf.set(tabId, tab.windowId);
+      if (tab && owners.get(tabId)?.client === client) folded.set(tabId, { groupId: tab.groupId, folded: await groupFolded(tab) });
       return { ok: true };
     },
 
@@ -992,6 +1009,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
     childTargets.delete(tabId);
     expectations.delete(tabId);
     windowOf.delete(tabId);
+    folded.delete(tabId);
     openedFor.delete(tabId);
     const owner = owners.get(tabId);
     if (!owner) return;
@@ -1006,6 +1024,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
   async function onTabReplaced(addedTabId, removedTabId) {
     await ready;
     scheduleChanged();
+    folded.delete(removedTabId);
     const owner = owners.get(removedTabId);
     if (!owner) return;
     owners.delete(removedTabId);
@@ -1060,6 +1079,10 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // Only webNavigation's navigation-target event decides whose it is: Helium reports the window's active tab as
   // openerTabId, which can be the user's or another session's, so openerTabId is never used.
   async function onTabCreated(tab) {
+    if (tab?.active) {
+      openedActive.add(tab.id);
+      timers.setTimeout(() => openedActive.delete(tab.id), EXPECT_CHILD_MAX_MS);
+    }
     activity('created', { tabId: tab?.id, windowId: tab?.windowId, active: !!tab?.active });
     switchBackFromPopup(tab);
     await ready;
@@ -1119,6 +1142,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
   async function settleChild(tabId, owner, openerTabId) {
     await persist();
     const tab = await chrome.tabs.get(tabId).catch(() => null);
+    const wasActive = openedActive.delete(tabId) || !!tab?.active;
     if (!tab) {
       if (owners.get(tabId) === owner) owners.delete(tabId);
       return persist();
@@ -1133,10 +1157,12 @@ export function createCore({ chrome, send, timers = globalThis }) {
     await addToGroup(owner.client, owner.group, tabId, tab.windowId).catch((e) => log('adopt: group failed', e.message)); // popup windows can't hold groups
     const adopted = await chrome.tabs.get(tabId).catch(() => null);
     if (!adopted || owners.get(tabId) !== owner) return; // closed or cleaned up meanwhile
-    // Chrome expands a collapsed group when one of its tabs is activated; fold it back.
-    if (adopted.groupId !== -1) {
-      const { collapsed } = await chrome.tabGroups.get(adopted.groupId).catch(() => ({}));
-      if (collapsed === false) await chrome.tabGroups.update(adopted.groupId, { collapsed: true }).catch(() => {});
+    // Chrome unfolds a folded group when an active tab joins it: a group the user had folded right before the action
+    // goes back. Children that never were active (opened in the background) leave the group alone.
+    const before = folded.get(openerTabId);
+    if (wasActive && before?.folded && before.groupId === adopted.groupId) {
+      folded.delete(openerTabId);
+      await chrome.tabGroups.update(adopted.groupId, { collapsed: true }).catch(() => {});
     }
     // openerTabId is the source webNavigation named (Helium's own value can point at another tab).
     emitToOwner(owner, 'chrome.tabs.onCreated', [{ ...adopted, openerTabId }]);

@@ -76,13 +76,22 @@ function fakeChrome({ session = {}, local = {} } = {}) {
       async group({ groupId, tabIds }) {
         await wait('tabs.group');
         if (hooks.groupError) throw new Error(hooks.groupError);
+        if (groupId !== undefined && !groupsById.has(groupId)) throw new Error(`No group with id: ${groupId}.`);
         const id = groupId ?? nextGroupId++;
         if (groupId === undefined) groupsById.set(id, { id, title: '', collapsed: false });
         for (const t of tabIds) getTab(t).groupId = id;
         calls.push(['tabs.group', tabIds, id]);
         return id;
       },
-      async ungroup(ids) { for (const id of [ids].flat()) getTab(id).groupId = -1; calls.push(['tabs.ungroup', ids]); },
+      // Like Chrome: a group whose last tab leaves is gone.
+      async ungroup(ids) {
+        for (const id of [ids].flat()) {
+          const { groupId } = getTab(id);
+          getTab(id).groupId = -1;
+          if (![...tabs.values()].some((t) => t.groupId === groupId)) groupsById.delete(groupId);
+        }
+        calls.push(['tabs.ungroup', ids]);
+      },
     },
     tabGroups: {
       async update(id, props) { calls.push(['tabGroups.update', id, props]); Object.assign(groupsById.get(id) ?? {}, props); },
@@ -165,14 +174,14 @@ test('only the owner may drive a tab', async () => {
     { ok: 'Page.reload' });
 });
 
-test('tabs.open makes a muted background tab in a collapsed group and tells the client', async () => {
+test('tabs.open makes a muted background tab in an expanded group and tells the client', async () => {
   const { chrome, call, sent } = setup();
   await call(1, 'client.hello', { label: 'Research' });
   const { result: tab } = await call(1, 'tabs.open', { url: 'https://example.com' });
 
   assert.deepEqual(chrome.calls.find((c) => c[0] === 'tabs.create')[1], { windowId: 1, url: 'https://example.com', active: false });
   assert.deepEqual(chrome.calls.find((c) => c[0] === 'tabs.update')[2], { muted: true, autoDiscardable: false });
-  assert.deepEqual(chrome.calls.find((c) => c[0] === 'tabGroups.update')[2], { title: 'Research', color: colorFor('Research'), collapsed: true });
+  assert.deepEqual(chrome.calls.find((c) => c[0] === 'tabGroups.update')[2], { title: 'Research', color: colorFor('Research'), collapsed: false });
   assert.ok(sent.some((m) => m.method === 'chrome.tabs.onCreated' && m.client === 1 && m.params[0].id === tab.id));
   assert.ok(!chrome.calls.some((c) => c[0] === 'tabs.update' && c[2].active));
 
@@ -713,15 +722,14 @@ test('parallel tabs.open calls share one group', async () => {
   assert.equal(chrome.groupsById.size, 1);
 });
 
-test('an adopted popup folds its expanded group back up', async () => {
+test('an adopted popup leaves its expanded group expanded', async () => {
   const { core, chrome, call } = setup();
   const { result: opener } = await call(1, 'tabs.open', {});
   const groupId = chrome.tabsById.get(opener.id).groupId;
-  chrome.groupsById.get(groupId).collapsed = false; // Chrome expanded it when the popup took focus
   const popup = chrome.addTab({ openerTabId: opener.id, groupId, active: true });
   await core.onNavigationTarget({ sourceTabId: opener.id, tabId: popup.id });
   assert.equal(core.owners.get(popup.id).client, 1);
-  assert.equal(chrome.groupsById.get(groupId).collapsed, true);
+  assert.equal(chrome.groupsById.get(groupId).collapsed, false);
 });
 
 test('kept and released agent tabs are unmuted and discardable again', async () => {
@@ -1156,7 +1164,7 @@ test('tabs.park hands the tab to the user for now; tabs.claim resumes it as it w
   sent.length = 0;
   assert.ok(!(await call(1, 'tabs.claim', { tabId: tab.id, resume: true })).error);
   const resumed = chrome.tabsById.get(tab.id);
-  assert.equal(resumed.groupId, groupId, 'back in its group');
+  assert.notEqual(resumed.groupId, -1, 'back in a group (made again: its old one went with its last tab)');
   assert.equal(resumed.mutedInfo.muted, true, 'muted again');
   assert.equal(resumed.autoDiscardable, false);
   assert.ok(sent.some((m) => m.method === 'chrome.tabs.onCreated' && m.params[0].id === tab.id), 'the claim re-attaches');
@@ -1329,4 +1337,49 @@ test('a parked tab closes only with the user\'s confirmation', async () => {
   assert.ok(chrome.tabsById.has(tab.id));
   assert.ok(!(await call(1, 'chrome.tabs.remove', [tab.id, { usersTab: true }])).error);
   assert.ok(!chrome.tabsById.has(tab.id));
+});
+
+test('a group the user folded stays folded: a resumed tab and an adopted popup fold it again', async () => {
+  const { core, chrome, call } = setup();
+  const { result: tab } = await call(1, 'tabs.open', { url: 'https://shop.example/' });
+  await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3']);
+  const groupId = chrome.tabsById.get(tab.id).groupId;
+  chrome.groupsById.get(groupId).collapsed = true; // the user folded it
+  await call(1, 'tabs.park', { tabId: tab.id, kind: 'handoff' });
+  assert.ok(!chrome.groupsById.has(groupId), 'its last tab left: the group is gone');
+  assert.ok(!(await call(1, 'tabs.claim', { tabId: tab.id, resume: true })).error);
+  assert.notEqual(chrome.tabsById.get(tab.id).groupId, groupId, 'a new group');
+  assert.equal(chrome.groupsById.get(chrome.tabsById.get(tab.id).groupId).collapsed, true, 'resumed into a folded group');
+  await call(1, 'chrome.debugger.attach', [{ tabId: tab.id }, '1.3']); // the resume completes once re-attached
+
+  // An action that opens a popup: Chrome makes it active in the folded group, which unfolds it.
+  await call(1, 'tabs.expectChild', { tabId: tab.id, ms: 3000 });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const popup = chrome.addTab({ openerTabId: tab.id, groupId: chrome.tabsById.get(tab.id).groupId, active: true });
+  chrome.groupsById.get(chrome.tabsById.get(tab.id).groupId).collapsed = false;
+  await core.onNavigationTarget({ sourceTabId: tab.id, tabId: popup.id });
+  assert.equal(chrome.groupsById.get(chrome.tabsById.get(tab.id).groupId).collapsed, true, 'folded again after the popup');
+});
+
+test('a group the user unfolded is left alone: a resume into it, and children opened in the background', async () => {
+  const { core, chrome, call } = setup();
+  const { result: a } = await call(1, 'tabs.open', {});
+  const { result: b } = await call(1, 'tabs.open', {});
+  await call(1, 'chrome.debugger.attach', [{ tabId: a.id }, '1.3']);
+  const groupId = chrome.tabsById.get(a.id).groupId;
+  chrome.groupsById.get(groupId).collapsed = true;
+  await call(1, 'tabs.park', { tabId: a.id, kind: 'takeover' });
+  chrome.groupsById.get(groupId).collapsed = false; // b keeps the group; the user unfolds it
+  await call(1, 'tabs.claim', { tabId: a.id, resume: true });
+  assert.equal(chrome.tabsById.get(a.id).groupId, groupId);
+  assert.equal(chrome.groupsById.get(groupId).collapsed, false, 'the resume did not fold it');
+
+  chrome.groupsById.get(groupId).collapsed = true;
+  await call(1, 'chrome.debugger.attach', [{ tabId: b.id }, '1.3']);
+  await call(1, 'tabs.expectChild', { tabId: b.id, ms: 3000 });
+  chrome.groupsById.get(groupId).collapsed = false; // the user unfolds it during the action
+  const child = chrome.addTab({ openerTabId: b.id, groupId, active: false }); // opened in the background
+  await core.onNavigationTarget({ sourceTabId: b.id, tabId: child.id });
+  assert.equal(core.owners.get(child.id).client, 1);
+  assert.equal(chrome.groupsById.get(groupId).collapsed, false, 'a background child never folds it');
 });

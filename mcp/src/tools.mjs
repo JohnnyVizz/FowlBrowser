@@ -883,7 +883,7 @@ export function registerTools(server, manager) {
     });
 
   tool('tab_open',
-    'Open a new tab in the named browser and control it. By default it is a work tab: in the background (never focused), muted, inside a collapsed tab group, ' +
+    'Open a new tab in the named browser and control it. By default it is a work tab: in the background (never focused), muted, inside a tab group, ' +
     'closed at the end of your turn (when you finish replying to the user), so the user is not disturbed. When the tab is for the user (they asked you to open something for them to use, watch or read), ' +
     'pass for_user: true: it opens like their own tab (not grouped, stays open after your turn, muted only while you control it), still in the background unless focus: true. ' +
     'Returns the tab id (e.g. "helium:1834") to pass to every other tool, plus the page snapshot.',

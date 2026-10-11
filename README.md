@@ -18,7 +18,7 @@ in front of you. Open an agent's tab whenever you like, and a cursor shows exact
 
 - **Uses the browser you're already signed in to.** Gmail, GitHub, Google Docs, YouTube and X just work. There's no
   separate browser profile to set up and no logging in again.
-- **Stays out of your way.** Agent tabs open in the background, muted, inside a folded tab group. Nothing jumps to the
+- **Stays out of your way.** Agent tabs open in the background, muted, in their own tab group. Nothing jumps to the
   front, and pop-ups the agent triggers stay in the background too.
 - **Shows its work.** In the tab you're looking at, a cursor with the agent's name moves to each click and says what
   it's doing ("typing", "scrolling").

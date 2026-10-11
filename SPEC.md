@@ -118,7 +118,7 @@ another tab, see tabs.onReplaced), `tabs.committed {tabId, url, transitionType, 
 from an owned AGENT tab (window.open / target=_blank / form target; the source comes only from
 webNavigation.onCreatedNavigationTarget, never openerTabId, which Helium sets to the window's active tab; the event
 carries that source as `openerTabId`): it becomes owned by the same client, origin agent, joins the opener's group
-(re-collapsed), stays in the background (Popups (session 5): how it never comes to the front, and re-activating the
+(a group the user had folded before the action is folded again if Chrome unfolded it), stays in the background (Popups (session 5): how it never comes to the front, and re-activating the
 window's previous active tab as the fallback), muted like its opener. The child is reserved for that client as soon as
 its source is known, before anything is awaited, so a disconnect meanwhile closes it. Each backgrounding step is best
 effort: the client always gets the onCreated. Tabs opened from a CLAIMED user tab are the user's (their Cmd-click) and are never adopted, except during a
@@ -153,7 +153,7 @@ same client claims it again. Native port disconnect: treat as every client disco
 `chrome.runtime.connectNative` after 1 s (alarm fallback every 30 s).
 
 Tab groups: one group per (client, group label, window), title = label (default `Claude`), colour picked from the
-label hash, `collapsed:true` so agent tabs don't crowd the user's tab strip. Empty groups disappear on their own.
+label hash, created expanded (`collapsed:false`) so the user sees the agent's tabs; a group the user folded stays folded (a handed-off or taken-over tab resumes into a folded group if its group was folded when it was parked). Empty groups disappear on their own.
 
 Never call tabs.update({active:true}) or windows.update({focused:true}) except in `tabs.focus`, and tabs.update({active:true})
 to give a window back the tab that was active before an agent popup took its place (Popups (session 5)).
