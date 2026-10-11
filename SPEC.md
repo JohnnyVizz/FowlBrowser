@@ -581,19 +581,20 @@ the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements 
   would emulate a device on its own; `device` only sets the audit thresholds) and its first line says so. The session hands events to Lighthouse's listeners one by one, swallowing a listener's
   synchronous throw and its rejected promise (its async target listeners would otherwise end the process when a child
   target vanishes mid-answer); once the run ends, queued and new sends fail with "Target closed" (benign to Lighthouse)
-  and the run waits up to 45 s for sends in flight (a host request can take that long to time out). For a navigation run
-  Playwright leaves the tab (its relay session only; the debugger stays attached) and the same Tab gets a fresh page
-  afterwards (`Tab.attachPage`; its id, queue and buffers stay, refs start over with the new document): with both on one
-  session, Lighthouse's network-quiet wait ran to its cap on busy pages (the BBC: about 80 s against 35 s). Calls on the
-  tab meanwhile queue behind the run. If the tab closes or the user cancels debugging during the run, the tab is not
-  taken back (the extension's rules apply: closed is gone, canceled needs a `tab_claim`) and the tool errors saying so;
-  a failed take-back or final load errors too, naming the report paths. `maxWaitForLoad` 30 s, as chrome-devtools-mcp sets it.
-  After the run, whatever happened: `clearEmulation`, cache enabled again, blocked URLs cleared, the scripts Lighthouse
-  added with `Page.addScriptToEvaluateOnNewDocument` removed, `Page` (with lifecycle events), `Runtime`, `Network` and
-  `Log` enabled again for Playwright (a snapshot run shares the session and Lighthouse disables them when it finishes),
-  the trace engine's module state reset (Lighthouse parses its trace with the same engine), and after a navigation run
-  the fresh page loads the URL once more, so the document the agent goes on with has none of Lighthouse's init scripts
-  (one wraps `window.requestIdleCallback` in every frame). Lighthouse records a trace, so a run takes the tracing slot like
+  and the run waits up to 45 s for sends in flight (a host request can take that long to time out). Both modes run on
+  the tab's session beside Playwright's (with both on one session Lighthouse's network-quiet wait runs longer on busy
+  pages: the BBC took about 80 s against 12 s for chrome-devtools-mcp). `maxWaitForLoad` 30 s, as chrome-devtools-mcp
+  sets it. A tab whose own trace is recording is refused (`trace_stop` first: it would queue behind the run). In
+  navigation mode a viewport the agent set (`viewport`) makes way for Lighthouse's emulation and is set again afterwards,
+  also on failure (a failed re-set is a warning line in the result); a snapshot audits the page as it is, at that
+  viewport. After the run, whatever happened: `clearEmulation` (script execution enabled again too: Lighthouse disables
+  it on a page it found hung), cache enabled again, blocked URLs cleared, the scripts Lighthouse added with
+  `Page.addScriptToEvaluateOnNewDocument` removed, `Page` (with lifecycle events), `Runtime`, `Network` and `Log` enabled
+  again for Playwright (Lighthouse disables them when it finishes) and the takeover and popup bindings added again
+  (`Runtime.disable` drops them), the trace engine's module state reset (Lighthouse parses its trace with the same
+  engine). The reports are written, then after a navigation run the page is loaded once more (Playwright's reload, so
+  refs start over; a failed load is a warning line in the result, the reports are kept), so the document the agent goes
+  on with has none of Lighthouse's init scripts (one wraps `window.requestIdleCallback` in every frame). Lighthouse records a trace, so a run takes the tracing slot like
   `trace_start` (this server's runs queue; another session's or DevTools' recording makes it fail, saying so). Result:
   Lighthouse version, device, mode and wall time; scores as 0-100 (a category holding only weight-0 audits, performance in
   snapshot mode, prints `n/a (<passed> of <n> audits pass)` instead of Lighthouse's 0); FCP, LCP, TBT, CLS, Speed Index and

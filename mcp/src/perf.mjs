@@ -40,6 +40,7 @@ export async function clearEmulation(tab) {
     ['Network.setUserAgentOverride', { userAgent: '' }],
     ['Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }],
     ['Emulation.setCPUThrottlingRate', { rate: 1 }],
+    ['Emulation.setScriptExecutionDisabled', { value: false }], // Lighthouse disables scripts on a page it found hung
   ]) await cdp(tab, method, params).catch(() => {});
 }
 

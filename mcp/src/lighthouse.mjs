@@ -7,7 +7,8 @@ import path from 'node:path';
 import { z } from 'zod';
 import { cdp, clearEmulation, fileTab, isUsersTab, onCdpEvent, outputDir, stamp, tracingSlot } from './perf.mjs';
 import { debug } from './debug.mjs';
-import * as record from './record.mjs';
+import { POPUP_BINDING, POPUP_WORLD, popupsInstalled } from './popups.mjs';
+import { USER_BINDING, USER_WORLD } from './takeover.mjs';
 import { resetEngine } from './trace.mjs';
 import { clearViewport, setViewport } from './viewport.mjs';
 
@@ -110,6 +111,10 @@ export async function restore(tab, scripts) {
   for (const [method, params] of [['Page.enable'], ['Page.setLifecycleEventsEnabled', { enabled: true }], ['Runtime.enable'], ['Network.enable'], ['Log.enable']]) {
     await cdp(tab, method, params).catch(() => {});
   }
+  // Runtime.disable dropped the bindings FowlBrowser's own page scripts report through (takeover detection, popup
+  // interception): without them new documents would go unheard.
+  await cdp(tab, 'Runtime.addBinding', { name: USER_BINDING, executionContextName: USER_WORLD }).catch(() => {});
+  if (popupsInstalled(tab)) await cdp(tab, 'Runtime.addBinding', { name: POPUP_BINDING, executionContextName: POPUP_WORLD }).catch(() => {});
 }
 
 let loading;
@@ -133,62 +138,28 @@ async function run(tab, lh, { device, mode, categories }) {
   // Snapshot mode never applies the emulation before collecting: it audits the page as it is (formFactor only sets
   // the audit thresholds), without the full-page screenshot, whose gatherer would emulate a device on its own.
   if (mode === 'snapshot') Object.assign(flags, { screenEmulation: { disabled: true }, emulatedUserAgent: false, disableFullPageScreenshot: true });
+  // The tab's own recording holds the slot this run needs, and trace_stop would queue behind this call: say so instead.
+  if (tab.trace?.startedAt) throw new Error('A trace is recording in this tab: call trace_stop first, then lighthouse.');
   const release = await tracingSlot(); // Lighthouse records and parses a trace: one at a time
-  // A viewport the agent set (viewport tool) makes way for Lighthouse's emulation and comes back afterwards.
-  const viewport = tab.viewport;
-  if (viewport) await clearViewport(tab, 'lighthouse').catch(() => {});
-  // For a navigation run Playwright leaves the tab (its relay session only; the debugger stays attached) and the Tab
-  // gets a fresh page afterwards (the same object: its queue and id stay): with both on one session, Lighthouse's
-  // network-quiet wait ran to its cap on busy pages. Control ending meanwhile (the tab closed, debugging canceled by
-  // the user) is honoured: then there is nothing to come back to.
-  const { browser } = tab;
-  const detach = mode === 'navigation';
-  let ended = null;
-  const onEvent = (method, params) => {
-    if (method === 'chrome.tabs.onRemoved' && params?.[0] === tab.tabId) ended = 'closed';
-    else if (method === 'chrome.debugger.onDetach' && params?.[0]?.tabId === tab.tabId && params?.[1] !== 'target_closed') ended ??= 'canceled';
-  };
+  // In navigation mode a viewport the agent set (viewport tool) makes way for Lighthouse's emulation and comes back
+  // afterwards, whatever happened; a snapshot audits the page as it is, at that viewport.
+  const viewport = mode === 'navigation' ? tab.viewport : null;
+  const warnings = [];
+  const root = rootSession(tab);
+  const page = { url: async () => (await root.send('Target.getTargetInfo')).targetInfo.url, target: () => ({ createCDPSession: async () => root }) };
   try {
-    browser.host.on('event', onEvent);
-    let info;
-    if (detach) {
-      info = (await browser.host.request('tabs.listAll', {})).find((t) => t.id === tab.tabId);
-      tab.replacing = true;
-      browser.relay.model.forgetTab(tab.tabId);
-    }
-    const root = rootSession(tab);
-    const page = { url: async () => (await root.send('Target.getTargetInfo')).targetInfo.url, target: () => ({ createCDPSession: async () => root }) };
-    let url, lhr;
-    try {
-      url = await page.url();
-      await root.send('Network.enable');
-      await root.send('Network.setCacheDisabled', { cacheDisabled: true });
-      const result = detach ? await lh.navigation(page, url, { flags, config }) : await lh.snapshot(page, { flags, config });
-      lhr = result.lhr;
-    } finally {
-      root.close();
-      await root.settled(45_000); // a host request can take that long to time out
-      await restore(tab, root.scripts);
-      await resetEngine().catch(() => {}); // Lighthouse parsed its trace with the shared engine
-    }
-    if (detach) {
-      if (ended) {
-        delete tab.replacing;
-        browser.forget(tab.tabId);
-        if (ended === 'closed') record.tabEvent('close', tab.id, url);
-        throw new Error(ended === 'closed' ? 'The tab was closed during the audit.' : 'The user canceled debugging during the audit; the tab is still yours: tab_claim it to re-attach.');
-      }
-      browser.relay.model.onTabCreated(info ?? { id: tab.tabId });
-      await browser.waitForTab(tab.tabId, undefined, { fresh: true }).catch((error) => { throw new Error(`Lighthouse finished but the tab could not be taken back: ${error.message}`); });
-      // Lighthouse's init scripts ran in the audited document and its frames (one wraps requestIdleCallback): a fresh
-      // load gives the agent a page without them.
-      await tab.page.goto(url, { waitUntil: 'load' }).catch((error) => { throw new Error(`Lighthouse finished but the page could not be loaded again (${error.message.split('\n')[0]}); navigate to it.`); });
-    }
-    if (viewport) await setViewport(tab, viewport).catch(() => {});
-    return lhr;
+    if (viewport) await clearViewport(tab, 'lighthouse');
+    const url = await page.url();
+    await root.send('Network.enable');
+    await root.send('Network.setCacheDisabled', { cacheDisabled: true });
+    const result = mode === 'navigation' ? await lh.navigation(page, url, { flags, config }) : await lh.snapshot(page, { flags, config });
+    return { lhr: result.lhr, warnings };
   } finally {
-    browser.host.off('event', onEvent);
-    if (tab.replacing) { delete tab.replacing; browser.forget(tab.tabId); } // no fresh page came: unmapped, not half-mapped
+    root.close();
+    await root.settled(45_000); // a host request can take that long to time out
+    await restore(tab, root.scripts);
+    if (viewport) await setViewport(tab, viewport).catch((error) => warnings.push(`The viewport you had set (${viewport.width}x${viewport.height}) could not be put back: ${error.message}. Set it again with viewport.`));
+    await resetEngine().catch(() => {}); // Lighthouse parsed its trace with the shared engine
     release();
   }
 }
@@ -258,7 +229,7 @@ export function registerLighthouse(tool, manager, { withTab, header, text, tabAr
       }
       const lh = await load();
       const started = Date.now();
-      const lhr = await run(tab, lh, { device, mode, categories });
+      const { lhr, warnings } = await run(tab, lh, { device, mode, categories });
       const seconds = (Date.now() - started) / 1000;
       // Tracing is one per browser: a trace_start recording or DevTools' Performance panel in any tab blocks it.
       if (lhr.runtimeError?.code === 'TRACING_ALREADY_STARTED') throw new Error('Lighthouse could not trace the page: a trace is already recording in this browser (another session\'s trace or Lighthouse run, or DevTools\' Performance panel). Stop it, then run lighthouse again.');
@@ -269,6 +240,9 @@ export function registerLighthouse(tool, manager, { withTab, header, text, tabAr
       const json = path.join(dir, 'report.json');
       fs.writeFileSync(html, lh.generateReport(lhr, 'html'));
       fs.writeFileSync(json, JSON.stringify(lhr));
-      return text(`${await header(tab)}\n${formatResult(lhr, { device, mode, seconds, html, json })}`);
+      // Lighthouse's init scripts ran in the audited document and its frames (one wraps requestIdleCallback): after a
+      // navigation run the page loads once more, so the agent goes on with a clean document (refs start over).
+      if (mode === 'navigation') await tab.page.reload({ waitUntil: 'load' }).catch((error) => warnings.push(`The page could not be loaded again after the audit (${error.message.split('\n')[0]}): navigate to it before going on.`));
+      return text([await header(tab), formatResult(lhr, { device, mode, seconds, html, json }), ...warnings].join('\n'));
     }));
 }

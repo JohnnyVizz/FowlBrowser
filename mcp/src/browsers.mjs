@@ -52,13 +52,6 @@ export class Tab extends EventEmitter {
     this._calls = 0; // run() calls not yet settled
     this.activity = new Activity(); // when calls ran on the tab: input in the page then is the agent's (takeover.mjs)
     this._busy = null;
-    this.attachPage(page);
-  }
-
-  // The Playwright page of this chrome tab. A tool that drops the relay session for a while (lighthouse) sets
-  // `replacing` and gets a fresh page attached here afterwards, so the tab's id, queue and buffers stay.
-  attachPage(page) {
-    this.page = page;
     page.setDefaultTimeout(ACTION_TIMEOUT_MS);
     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
     page.on('dialog', (dialog) => {
@@ -227,7 +220,7 @@ export class Browser {
     let tab = null;
     // Registered before any await, so a page that closes during setup is never published (or is removed).
     page.once('close', () => {
-      if (!tab || tab.replacing || this.tabs.get(tab.tabId) !== tab) return;
+      if (!tab || this.tabs.get(tab.tabId) !== tab) return;
       this.tabs.delete(tab.tabId);
       if (!tab.ending) record({ type: 'tab', event: 'close', tab: tab.id, url: page.url() }); // found gone
     });
@@ -235,13 +228,7 @@ export class Browser {
       const session = await page.context().newCDPSession(page);
       const { tabId } = await session.send('FowlBrowser.getTabId');
       session.detach().catch(() => {});
-      // A Tab waiting for a replacement page (lighthouse: Playwright left the tab for the run) gets this one.
-      const replacing = this.tabs.get(tabId);
-      if (replacing?.replacing) {
-        tab = replacing;
-        tab.attachPage(page);
-        delete tab.replacing;
-      } else tab = new Tab(this, tabId, page);
+      tab = new Tab(this, tabId, page);
       // keep and release wait for this (adopting) to take out the popup scripts it installs; it sees one that came first.
       let adopted;
       this.adopting.set(tabId, new Promise((resolve) => { adopted = resolve; }));
@@ -266,10 +253,10 @@ export class Browser {
     }
   }
 
-  // Resolves the Tab once Playwright has a page for this chrome tab (`fresh`: once a replacement page is attached).
-  async waitForTab(tabId, timeout = ACTION_TIMEOUT_MS, { fresh = false } = {}) {
+  // Resolves the Tab once Playwright has a page for this chrome tab.
+  async waitForTab(tabId, timeout = ACTION_TIMEOUT_MS) {
     await this.playwright();
-    if (this.tabs.has(tabId) && !(fresh && this.tabs.get(tabId).replacing)) return this.tabs.get(tabId);
+    if (this.tabs.has(tabId)) return this.tabs.get(tabId);
     let resolve;
     const mapped = new Promise((r) => { resolve = r; });
     if (!this._waiters.has(tabId)) this._waiters.set(tabId, new Set());

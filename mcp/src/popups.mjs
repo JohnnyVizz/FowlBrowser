@@ -16,8 +16,10 @@ import crypto from 'node:crypto';
 import { cdp } from './cdp.mjs';
 import { debug } from './debug.mjs';
 
-const WORLD = 'fowlbrowser-popups';
-const BINDING = '__fowlbrowserPopup';
+export const POPUP_WORLD = 'fowlbrowser-popups';
+const WORLD = POPUP_WORLD;
+export const POPUP_BINDING = '__fowlbrowserPopup';
+const BINDING = POPUP_BINDING;
 const EVENT = `fowlbrowser-${crypto.randomBytes(6).toString('hex')}`; // MAIN -> isolated world; per process, unguessable
 const OFF_CAP_MS = 400;
 
@@ -191,6 +193,8 @@ const heard = new WeakSet(); // Tabs whose reports are listened to (once, howeve
 
 // Call when an agent tab comes under control, before it navigates. Reports: 'close' sets tab.closedByPageAt; 'open' (a
 // background tab the page just opened) is announced like a Page.windowOpen, so the action that caused it names the tab.
+export const popupsInstalled = (tab) => installed.has(tab);
+
 export async function installPopups(tab) {
   if (installed.has(tab)) return;
   installed.set(tab, []);

@@ -104,18 +104,20 @@ test('restore: emulation cleared, cache on, blocked URLs cleared, scripts remove
     ['Network.setUserAgentOverride', { userAgent: '' }],
     ['Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }],
     ['Emulation.setCPUThrottlingRate', { rate: 1 }],
+    ['Emulation.setScriptExecutionDisabled', { value: false }],
     ['Network.setCacheDisabled', { cacheDisabled: false }],
     ['Network.setBlockedURLs', { urls: [] }],
     ['Page.removeScriptToEvaluateOnNewDocument', { identifier: '1' }],
     ['Page.removeScriptToEvaluateOnNewDocument', { identifier: '2' }],
     ['Page.enable', {}], ['Page.setLifecycleEventsEnabled', { enabled: true }], ['Runtime.enable', {}], ['Network.enable', {}], ['Log.enable', {}],
+    ['Runtime.addBinding', { name: '__fowlbrowserUserInput', executionContextName: 'fowlbrowser-user' }],
   ]);
 });
 
 test('restore keeps going when commands fail', async () => {
   const tab = fakeTab(() => { throw new Error('Debugger is not attached'); });
   await restore(tab, [{ identifier: '1' }]);
-  assert.equal(tab.browser.host.calls.length, 13);
+  assert.equal(tab.browser.host.calls.length, 15);
 });
 
 test('a listener that throws or rejects (a child gone before its answer) neither breaks dispatch nor goes unhandled', async () => {
