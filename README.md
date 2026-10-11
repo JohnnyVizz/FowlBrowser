@@ -104,7 +104,7 @@ ask, and a tab an agent claimed goes back to you when it is done.
 
 ```sh
 npm ci --prefix mcp && npm install --prefix test   # once
-node --test extension/test/ mcp/test/ tools/test/ test/forms/test/
+node --test extension/test/ mcp/test/ tools/test/ test/forms/test/ test/demo/test/
 node tools/fake-extension.mjs --test
 ```
 
@@ -116,6 +116,16 @@ node tools/fake-extension.mjs --test
 - `node tools/rounds.mjs --tasks tools/agents/forms.json --serve "node test/forms/server.mjs"` puts 12 agents on six
   tricky forms (custom dropdowns, a virtualized list, a cross-origin card field, closed shadow DOM, drag to reorder)
   and checks every field and any mix-up between agents.
+- `--surface codex` runs the same tasks on Codex's browser extension instead (the same Claude model driving ChatGPT's
+  `cua_repl` through a `codex-cu` MCP server registered in Claude Code), graded the same way: `node tools/rounds.mjs --tasks
+  tools/agents/codex-h2h.json --serve "node test/demo/server.mjs --all" --surface codex`, then again with
+  `--surface fowlbrowser`. The 14 head-to-head tasks cover the forms, new tabs and popups, a sign-in popup, a phone-size
+  check, handing a checkout to the user, the user taking a tab back (`--gui`, test Mac only) and pages that try to make
+  the agent order or forward mail, on a local demo shop and inbox that log every visit, post and typed field.
+- `--remote <host>` puts the agents' browsers on a test Mac while `claude -p` stays here: every MCP server, the
+  `--serve` site and the takeover act run there over one ssh connection, which also forwards its FowlBrowser sockets
+  and the graded ports. The round holds that Mac's GUI lock (`--remote-held` when the caller already does) and refuses
+  to start unless its `~/Projects/FowlBrowser` is this tree.
 
 The full contract is in [SPEC.md](SPEC.md), the cursor in [docs/cursor-spec.md](docs/cursor-spec.md).
 

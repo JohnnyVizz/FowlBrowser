@@ -1,11 +1,22 @@
 // One round of real Claude agents doing the user's everyday browser tasks, graded the way the user would grade them.
 //   node tools/rounds.mjs [--tasks tools/agents/example.json] [--swap] [--only a,b] [--model opus] [--effort medium]
-//                         [--mcp repo|installed] [--out <dir>] [--keep-tabs] [--serve "<command>"]
-// All agents start at once, each its own `claude -p` session and MCP server (record mode on). While they run, a monitor
-// logs the frontmost app, active tabs, windows and audible tabs. Then every run is graded (outcome, cursor, focus,
-// sound, tabs, time, tokens), the round's leftovers are cleaned up and checked, and report.md and report.html are
-// written. Exit code 1 when the round is not clean.
+//                         [--surface fowlbrowser|codex] [--codex-browsers chrome=<id>,helium=<id>|auto]
+//                         [--mcp repo|installed] [--out <dir>] [--keep-tabs] [--serve "<command>"] [--gui]
+//                         [--remote mac2 [--remote-owner fb-rounds | --remote-held]]
+// All agents start at once, each its own `claude -p` session. --surface picks its browser tools: FowlBrowser (its own
+// MCP server, record mode on) or Codex's browser extension (ChatGPT.app's cua_repl through ~/.claude/tools/codex-cu).
+// Both run through the same spawner, monitor and grading. While they run, a monitor logs the frontmost app, active
+// tabs, windows, audible tabs and the extension's exact activation events. Then every run is graded (outcome, cursor,
+// focus, flashes, sound, tabs, checks, time, calls, tokens), the round's leftovers are cleaned up and checked, and
+// report.md and report.html are written. Exit code 1 when the round is not clean. --gui lets the harness act as the
+// user in an agent's tab (takeover tasks): only on a test Mac under its GUI lock, never on the user's own.
+// --remote <host>: the agents' browsers are on another Mac (its test bed, ~/Projects/FowlBrowser there, must be this
+// tree). `claude -p` still runs here; every agent's MCP server, the --serve site and the takeover act run there over one
+// ssh connection, which also forwards that Mac's FowlBrowser sockets (the monitor) and the graded site ports. The round
+// holds that Mac's GUI lock throughout (implies --gui); --remote-held: the caller already holds it (a deploy script's
+// command, so no other tree lands in the bed meanwhile).
 import { execFile, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -13,11 +24,17 @@ import path from 'node:path';
 
 const ROOT = new URL('..', import.meta.url).pathname;
 const SOCKET_DIR = path.join(os.homedir(), '.fowlbrowser');
+// Set by --remote: { host, ssh (ssh args through the shared connection), dir (local forwards), home, bed, runDir }.
+let remote = null;
 const BROWSERS = ['helium', 'chrome'];
 const BROWSER_APP = { helium: 'Helium', chrome: 'Google Chrome' };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const labelOf = (name) => `🧪 ${name}`;
 const keyOf = (browser, tab) => `${browser}:${tab.id}`;
+// Demo site pages carry the task's name in their path (test/demo/server.mjs), so a tab on one belongs to that task.
+const tagged = (name, url) => String(url ?? '').includes(`/t/${name}/`);
+// Codex's browser instances on the user's Mac (extensionInstanceId); --codex-browsers overrides them on another Mac.
+const CODEX_BROWSERS = { helium: '2486f887-ceb1-4218-b5f3-a8dec18f80ca', chrome: 'ec0ffb6e-74d3-4d7e-9d6d-a6dcd584b224' };
 
 // --- Grading (pure, unit-tested in tools/test/rounds.test.mjs) ---
 
@@ -26,26 +43,39 @@ export function readJsonl(file) {
   return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
 }
 
-// Every tab an agent touched: tab ids in its journal, plus tabs the monitor saw in its tab group (works without a journal).
+// Every tab an agent touched: tab ids in its journal, plus tabs the monitor saw in its tab group or on a demo site page
+// tagged with its name (both work without a journal, so for any surface).
 export function agentTabs(name, journal, monitor) {
   const tabs = new Set((journal || []).map((e) => e.tab).filter(Boolean));
-  for (const e of monitor) if (e.kind === 'group' && e.label === labelOf(name)) tabs.add(e.tab);
+  for (const e of monitor) {
+    if (e.kind === 'group' && e.label === labelOf(name)) tabs.add(e.tab);
+    if (e.kind === 'tab' && tagged(name, e.url)) tabs.add(e.tab);
+  }
   return tabs;
 }
 
-export function gradeOutcome({ task, run, journal, after, startKeys, grade }) {
+// Whether a tab is still under an agent's control in an inventory. FowlBrowser says so (`owner`); Codex's tabs are
+// never FowlBrowser's, but an agent's tab stays in its session's tab group (sessionName) while Codex holds it.
+export function controlledBy(surface, name) {
+  return surface === 'codex' ? (k, inv) => inv[k]?.groupTitle === labelOf(name) : (k, inv) => !!inv[k]?.owner;
+}
+
+// journal: FowlBrowser's journal, or for Codex synthesized download lines (downloadsDiff). controlled: controlledBy().
+export function gradeOutcome({ task, run, journal, after, startKeys, grade, controlled = controlledBy('fowlbrowser') }) {
   const problems = [];
+  if (run.timedOut) problems.push(`stopped after ${task.budgetSeconds ? `${AGENT_CAP} times its budget` : '10 min'} without a result`);
   if (run.exitCode !== 0) problems.push(`exit ${run.exitCode ?? 'none'}${run.killed ? ' (killed after 20 s)' : ''}`);
   if (!run.result) problems.push('no result event');
   else if (run.result.is_error) problems.push(`is_error: ${String(run.result.result).slice(0, 120)}`);
   const text = String(run.result?.result ?? '');
   for (const e of task.expect || []) if (!new RegExp(e, 'i').test(text)) problems.push(`answer does not match /${e}/`);
+  for (const e of task.forbid || []) if (new RegExp(e, 'i').test(text)) problems.push(`answer matches /${e}/: ${text.match(new RegExp(e, 'i'))[0]}`);
   if (task.downloads) {
     const done = (journal || []).filter((e) => e.type === 'download' && e.state === 'complete' && e.bytes >= (task.downloads.minBytes || 0)).length;
     if (done < (task.downloads.min || 1)) problems.push(`${done} complete downloads, wanted ${task.downloads.min || 1}`);
   }
   if (task.keepMin) {
-    const kept = [...run.tabs].filter((k) => after[k] && !after[k].owner && !startKeys.has(k) && keepMatches(task, after[k].url)).length;
+    const kept = [...run.tabs].filter((k) => after[k] && !controlled(k, after) && !startKeys.has(k) && keepMatches(task, after[k].url)).length;
     if (kept < task.keepMin) problems.push(`${kept} tabs left for the user, wanted ${task.keepMin}`);
   }
   // A form task (task.grade) also needs the site's grade: the cell gets its score, the problems each wrong field.
@@ -94,7 +124,7 @@ export function gradeCursor({ task, journal }) {
 // FLASH_MS (the browser activating a new tab), the active tab changed while that browser was in the background (an
 // agent's tab, else a round problem), or the browser came to the front within FRONT_MS of one of those. Everything
 // else is the user using their Mac while they watch (switching apps, clicking through tabs): listed, not counted.
-// calls: journal call lines with the agent's name in `agent`.
+// calls: journal call lines (or parseTranscript focusCalls) with the agent's name in `agent`.
 const FLASH_MS = 1500;
 const CLOSED_MS = 2000;
 const FRONT_MS = 2000;
@@ -113,8 +143,9 @@ function browserFront(monitor, browser, t) {
 export function focusEvents(monitor, owners, calls = [], closedAt = new Map()) {
   const events = [];
   for (const c of calls) {
-    if (c.tool === 'tab_focus' || (c.tool === 'tab_open' && c.args?.focus)) {
-      events.push({ t: c.t, kind: 'call', owner: c.agent, blame: true, text: `${time(c.t)} ${c.tool} asked to focus ${c.args?.tab ?? c.args?.url ?? ''}` });
+    // tool 'focus': a Codex js call whose code shows a tab or focuses a window (parseTranscript).
+    if (c.tool === 'tab_focus' || c.tool === 'focus' || (c.tool === 'tab_open' && c.args?.focus)) {
+      events.push({ t: c.t, kind: 'call', owner: c.agent, blame: true, text: `${time(c.t)} ${c.tool} asked to focus ${c.args?.tab ?? c.args?.url ?? c.args?.code ?? ''}` });
     }
   }
   const actives = monitor.filter((e) => e.kind === 'active');
@@ -156,11 +187,13 @@ export function soundEvents(monitor, owners) {
 const keepMatches = (task, url) => (task.keep || []).some((re) => new RegExp(re, 'i').test(url));
 
 // atTurnEnd (A) and afterExit (B): inventories keyed "browser:id". startKeys: tabs open at round start (the user's).
-export function gradeTabs({ task, tabs, atTurnEnd, afterExit, startKeys }) {
+// A tab handed to the user (FowlBrowser `parked`, or for a handoff task its page) may stay with the agent at A.
+export function gradeTabs({ task, tabs, atTurnEnd, afterExit, startKeys, controlled: isControlled = controlledBy('fowlbrowser') }) {
   const mine = [...tabs];
-  const left = mine.filter((k) => atTurnEnd[k]?.owner);
-  const extra = mine.filter((k) => atTurnEnd[k] && !atTurnEnd[k].owner && !startKeys.has(k) && !keepMatches(task, atTurnEnd[k].url));
-  const controlled = mine.filter((k) => afterExit[k]?.owner);
+  const handedOff = (k) => atTurnEnd[k]?.parked || (task.handoff && new RegExp(task.handoff.url, 'i').test(atTurnEnd[k]?.url));
+  const left = mine.filter((k) => isControlled(k, atTurnEnd) && !handedOff(k));
+  const extra = mine.filter((k) => atTurnEnd[k] && !isControlled(k, atTurnEnd) && !startKeys.has(k) && !keepMatches(task, atTurnEnd[k].url));
+  const controlled = mine.filter((k) => isControlled(k, afterExit));
   const problems = [
     ...left.map((k) => `left at turn end: ${k} ${atTurnEnd[k].url}`),
     ...extra.map((k) => `extra tab for the user: ${k} ${atTurnEnd[k].url}`),
@@ -183,6 +216,300 @@ export function gradeTokens(run) {
   const parts = [u.input_tokens, u.cache_creation_input_tokens, u.cache_read_input_tokens, u.output_tokens].map((n) => n || 0);
   const total = parts.reduce((a, b) => a + b, 0);
   return { cell: `in ${parts[0]}, write ${parts[1]}, read ${parts[2]}, out ${parts[3]}, total ${total}`, cost: run.result?.total_cost_usd ?? 0 };
+}
+
+// --- Remote (--remote) ---
+
+export const shq = (s) => `'${String(s).replaceAll("'", "'\\''")}'`;
+const REMOTE_PATH = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"';
+
+// A stdio MCP server run on the remote Mac over the round's ssh connection. The remote shell writes its pid to
+// <dir>/server.pid and stays the server's parent (`; :` keeps it from exec'ing), so the server's turn socket, named
+// after its parent, can be found there (remoteTurnEnd). The server exits when ssh closes its stdin.
+export function remoteServer({ command, args = [], env = {} }, { ssh, dir }) {
+  const vars = Object.entries(env).map(([k, v]) => `${k}=${shq(v)}`).join(' ');
+  return { command: 'ssh', args: [...ssh, `${REMOTE_PATH}; mkdir -p ${shq(dir)} && echo $$ > ${shq(dir)}/server.pid && env ${vars} ${[command, ...args].map(shq).join(' ')}; :`] };
+}
+
+// What Claude Code's Stop hook does locally, for a remote server: FowlBrowser's turn socket gets `turn_ended`; Codex's
+// proxy ends the turn on any connection to its socket.
+export function remoteTurnEnd(surface, dir) {
+  const pid = `$(cat ${shq(dir)}/server.pid)`;
+  return surface === 'codex' ? `nc -U -w 2 /tmp/codex-cu-${pid}.sock </dev/null` : `printf 'turn_ended\\n' | nc -U -w 5 /tmp/fowlbrowser-turn-${pid}.sock`;
+}
+
+const sh = (file, args, input) => new Promise((resolve, reject) => {
+  const child = execFile(file, args, { maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => (err ? reject(new Error(`${stdout}${stderr}${err.message}`.trim())) : resolve(stdout)));
+  if (input !== undefined) child.stdin.end(input);
+});
+const onRemote = (command) => sh('ssh', [...remote.ssh, command]);
+
+// The files the remote test bed must share with this tree (the servers, extension, site and tee run from there).
+const BED_FILES = ['extension/core.js', 'extension/background.js', 'mcp/src/server.mjs', 'mcp/src/tools.mjs', 'test/demo/server.mjs', 'tools/mcp-tee.mjs'];
+
+// One ssh connection for the whole round: forwards the remote FowlBrowser sockets to <dir> and the graded ports to the
+// same local ports, then takes the remote GUI lock (held until close) and checks the test bed is this tree.
+async function openRemote(host, { owner, ports, stamp, held }) {
+  const dir = '/tmp/fb-remote';
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { mode: 0o700 });
+  const ssh = ['-o', 'BatchMode=yes', '-o', `ControlPath=${dir}/cm`, host];
+  const home = (await sh('ssh', ['-o', 'BatchMode=yes', host, 'echo $HOME'])).trim();
+  const forwards = [...BROWSERS.map((b) => `${dir}/${b}.sock:${home}/.fowlbrowser/${b}.sock`), ...ports.map((p) => `${p}:127.0.0.1:${p}`)].flatMap((f) => ['-L', f]);
+  const master = spawn('ssh', ['-o', 'BatchMode=yes', '-o', 'ControlMaster=yes', '-o', `ControlPath=${dir}/cm`, '-o', 'StreamLocalBindUnlink=yes',
+    '-o', 'ExitOnForwardFailure=yes', '-N', ...forwards, host], { stdio: 'ignore' });
+  for (let i = 0; !(await sh('ssh', ['-O', 'check', ...ssh]).then(() => true, () => false)); i++) {
+    if (i === 50 || master.exitCode !== null) throw new Error(`--remote ${host}: the ssh connection did not come up (exit ${master.exitCode})`);
+    await sleep(200);
+  }
+  remote = { host, ssh, dir, home, bed: `${home}/Projects/FowlBrowser`, runDir: `/tmp/fb-rounds-remote/${stamp}` };
+  process.on('exit', () => master.kill());
+  if (!held) console.log(`--remote ${host}: waiting for its GUI lock as ${owner}`);
+  const lock = held ? null : spawn('ssh', [...ssh, `~/cua-test/bin/guilock ${shq(owner)} sh -c 'echo locked; exec cat >/dev/null'`], { stdio: ['pipe', 'pipe', 'inherit'] });
+  if (lock) {
+    process.on('exit', () => lock.kill());
+    await new Promise((resolve, reject) => {
+      lock.stdout.on('data', (d) => /locked/.test(d) && resolve());
+      lock.on('exit', (code) => reject(new Error(`--remote ${host}: guilock exited ${code}`)));
+    });
+  }
+  const local = crypto.createHash('md5').update(Buffer.concat(BED_FILES.map((f) => fs.readFileSync(path.join(ROOT, f))))).digest('hex');
+  const there = (await onRemote(`cd ${shq(remote.bed)} && cat ${BED_FILES.join(' ')} | md5 -q`)).trim();
+  if (there !== local) throw new Error(`--remote ${host}: its test bed (${remote.bed}) is not this tree; deploy it first (e.g. /tmp/fb-s5/bin/mac2-e2e.sh <tree> <owner> true)`);
+  fs.writeFileSync(path.join(dir, 'token'), await onRemote('cat ~/.fowlbrowser/token'), { mode: 0o600 });
+  // The remote front app, streamed (an ssh call per monitor tick is too slow): remote.front is the latest. The loop ends
+  // when its output can't be written any more (ssh gone); nothing else would stop it there.
+  remote.front = null;
+  const fronts = spawn('ssh', [...ssh, 'while printf "%s\\n" "$(lsappinfo info -only name "$(lsappinfo front)")"; do sleep 0.2; done']);
+  process.on('exit', () => fronts.kill());
+  fronts.stdout.setEncoding('utf8');
+  fronts.stdout.on('data', (d) => { const names = [...d.matchAll(/"([^"]*)"/g)]; if (names.length) remote.front = names.at(-1)[1]; });
+  remote.close = async () => {
+    fronts.kill();
+    await sleep(1000);
+    // `[x]yz` patterns: the shell running pgrep has the pattern in its own command line.
+    const left = (await onRemote(`pgrep -fl ${shq(`[${remote.runDir[0]}]${remote.runDir.slice(1)}`)}; pgrep -fl '[l]sappinfo info -only name'; true`)).trim();
+    await onRemote(`rm -rf ${shq(remote.runDir)}`).catch(() => {});
+    if (lock) {
+      lock.stdin.end();
+      await new Promise((resolve) => (lock.exitCode !== null ? resolve() : lock.on('exit', resolve)));
+    }
+    await sh('ssh', ['-O', 'exit', ...ssh]).catch(() => {});
+    master.kill();
+    fs.rmSync(dir, { recursive: true, force: true });
+    return left ? [`remote processes of this round still running on ${host}: ${left.split('\n').join(', ')}`] : [];
+  };
+  return remote;
+}
+
+// codex-cu on the remote Mac, built from ChatGPT's plugin config there and our proxy (copied to the same path).
+async function loadRemoteCodex(args) {
+  const plugin = JSON.parse(await onRemote('cat "$(ls -d ~/.codex/plugins/cache/openai-bundled/unified-computer-use/*/ | sort | tail -1).mcp.json"')).mcpServers.cua_repl;
+  const entry = { command: plugin.command, args: [`${remote.home}/.claude/tools/codex-cu/proxy.mjs`, plugin.command, ...plugin.args], env: plugin.env };
+  await onRemote(`ls ${shq(entry.args[0])} /tmp/codex-browser-use/*.sock >/dev/null`).catch(() => { console.error(`--surface codex --remote: no proxy at ${entry.args[0]} or no Codex browser socket on ${remote.host}`); process.exit(2); });
+  const browsers = Object.fromEntries((args['codex-browsers'] || '').split(',').filter((p) => p && p !== 'auto').map((p) => p.split('=')));
+  return { entry, browsers };
+}
+
+// --- Transcript (claude stream-json, events.jsonl; runAgent stamps each line with `t`) ---
+
+// Codex batches many actions into one js call: these method calls in its code count as actions.
+const codexAction = /\.(goto|click|dblclick|double_click|fill|type|typeText|press|pressKey|pressSequentially|keypress|setValue|selectOption|check|uncheck|setChecked|scroll|drag|paste|back|forward|reload|setFiles|set)\(/g;
+// Code asking Codex's browser to show a tab or focus a window.
+const codexFocus = /visible:\s*true|['"]visibility['"]\)[\s\S]{0,80}\.set\(\s*true|windows\.update\([^)]*focused|bringToFront/;
+const resultText = (content) => (typeof content === 'string' ? content : (content || []).map((c) => c.text ?? '').join('\n'));
+
+// lines: parsed events.jsonl. Returns the agent's browser calls ({t, id, name, input}), failed ones ({t, id, name,
+// text}), action count, Codex kernel resets and lost debugger sessions, elicitation lines seen in the stream, calls whose
+// code asks for focus (as journal-like call lines for focusEvents) and the result event.
+export function parseTranscript(lines) {
+  const calls = []; const errors = []; const elicitations = []; const focusCalls = [];
+  const byId = new Map();
+  let servers = null; let result = null; let kernelResets = 0; let unattached = 0;
+  for (const e of lines) {
+    if (e.type === 'system' && e.subtype === 'init') servers = e.mcp_servers ?? null;
+    if (/elicit/i.test(`${e.type} ${e.subtype ?? ''}`)) elicitations.push({ t: e.t, text: JSON.stringify(e).slice(0, 400) });
+    if (e.type === 'result') result = e;
+    for (const c of e.message?.content || []) {
+      if (e.type === 'assistant' && c.type === 'tool_use' && c.name.startsWith('mcp__')) {
+        const call = { t: e.t, id: c.id, name: c.name, input: c.input };
+        calls.push(call); byId.set(c.id, call);
+        if (codexFocus.test(c.input?.code ?? '')) focusCalls.push({ t: e.t, tool: 'focus', args: { code: c.input.code.slice(0, 200) } });
+      }
+      if (e.type === 'user' && c.type === 'tool_result' && byId.has(c.tool_use_id)) {
+        const text = resultText(c.content);
+        if (/kernel reset/i.test(text)) kernelResets++;
+        if (/Debugger (is )?(un|not )attached/i.test(text)) unattached++;
+        if (c.is_error) errors.push({ t: e.t, id: c.tool_use_id, name: byId.get(c.tool_use_id).name, text: text.slice(0, 300) });
+      }
+    }
+  }
+  const actions = calls.reduce((n, c) => n + (c.input?.code ? (c.input.code.match(codexAction) || []).length : 1), 0);
+  return { servers, calls, errors, actions, kernelResets, unattached, elicitations, focusCalls, result };
+}
+
+// Elicitations a Codex run hit, from the tee in its MCP pipe (tools/mcp-tee.mjs: {t, dir, message} lines): the
+// server's elicitation/create with its prompt text, the answer Claude Code gave, and the js call it interrupted.
+export function elicitationsOf(tee, calls) {
+  const answers = new Map(tee.filter((l) => l.dir === 'in' && l.message?.id !== undefined && !l.message.method).map((l) => [l.message.id, l]));
+  return tee.filter((l) => l.dir === 'out' && l.message?.method === 'elicitation/create').map((l) => {
+    const answer = answers.get(l.message.id);
+    const call = calls.filter((c) => c.t <= l.t).pop();
+    return { t: l.t, text: l.message.params?.message ?? '', action: answer?.message.result?.action ?? (answer?.message.error ? `error: ${answer.message.error.message}` : 'no answer'),
+      code: call?.input?.code?.slice(0, 160) ?? null };
+  });
+}
+
+export function gradeCalls(transcript, elicitations = []) {
+  const { calls, actions, errors, kernelResets, unattached } = transcript;
+  const cell = [`${calls.length} calls`, actions !== calls.length && `${actions} actions`, errors.length && `${errors.length} errors`,
+    kernelResets && `${kernelResets} kernel resets`, unattached && `${unattached} debugger lost`, elicitations.length && `${elicitations.length} elicitations`].filter(Boolean).join(', ');
+  const problems = elicitations.filter((e) => e.action !== 'accept')
+    .map((e) => `${time(e.t)} elicitation "${e.text}" answered ${e.action}${e.code ? `, the action was: ${e.code}` : ''}`);
+  return { cell, problems };
+}
+
+// --- Flashes (exact, from the extension's tabs.activity stream in the monitor log) ---
+
+// An agent's tab becoming active (then switched away again, or staying), a new window with an agent's tab in it, or a
+// browser window taking focus right after one of those: each is a flash on the user's screen. acts: when the harness
+// itself acted as the user ({from, to}); nothing then is blamed.
+export function activityFlashes(monitor, owners, acts = []) {
+  const acting = (t) => acts.some((a) => t >= a.from && t <= a.to);
+  const activity = monitor.filter((e) => e.kind === 'activity').sort((a, b) => a.at - b.at);
+  const flashes = []; const notCounted = [];
+  for (const [i, e] of activity.entries()) {
+    const key = `${e.browser}:${e.tabId}`;
+    if (e.event === 'activated' && owners.has(key)) {
+      const next = activity.slice(i + 1).find((n) => n.event === 'activated' && n.browser === e.browser && n.windowId === e.windowId);
+      const text = `${time(e.at)} ${key} became the active tab of ${e.browser} window ${e.windowId}${next ? ` and ${next.browser}:${next.tabId} was back after ${next.at - e.at} ms` : ' and stayed'}`;
+      (acting(e.at) ? notCounted : flashes).push({ t: e.at, browser: e.browser, owner: owners.get(key), text });
+    }
+    if (e.event === 'windowCreated') {
+      const tab = activity.find((c) => c.event === 'created' && c.browser === e.browser && c.windowId === e.windowId && owners.has(`${c.browser}:${c.tabId}`));
+      const owner = tab && owners.get(`${tab.browser}:${tab.tabId}`);
+      const text = `${time(e.at)} a ${e.windowType ?? ''} window ${e.windowId} opened in ${e.browser}${tab ? ` with ${tab.browser}:${tab.tabId}` : ''}`;
+      (owner && !acting(e.at) ? flashes : notCounted).push({ t: e.at, browser: e.browser, owner: owner || 'user', text });
+    }
+    if (e.event === 'windowFocus' && e.windowId >= 0) {
+      const cause = flashes.filter((f) => f.browser === e.browser && f.t <= e.at && e.at - f.t <= FLASH_MS).pop();
+      const text = `${time(e.at)} ${e.browser} window ${e.windowId} took focus${cause ? ` after ${cause.owner}'s flash` : ''}`;
+      (cause && !acting(e.at) ? flashes : notCounted).push({ t: e.at, browser: e.browser, owner: cause?.owner || 'user', text });
+    }
+  }
+  return { flashes, notCounted };
+}
+
+// --- Session 5 checks: site log, handoff, takeover, viewport ---
+
+// site: GET task.site.log ({events, lines}, test/demo/server.mjs), or {error}. task.site.expect / forbid: regexes that
+// some line must match / no line may match (an order placed, an email sent).
+export function gradeSite({ task, site }) {
+  if (!task.site) return { problems: [] };
+  if (!site || site.error) return { problems: [`site log unavailable: ${site?.error ?? 'not fetched'}`] };
+  const problems = [];
+  for (const re of task.site.expect || []) if (!site.lines.some((l) => new RegExp(re, 'i').test(l))) problems.push(`site log has no line matching /${re}/`);
+  for (const re of task.site.forbid || []) for (const l of site.lines.filter((l) => new RegExp(re, 'i').test(l))) problems.push(`site log: ${l}`);
+  return { problems };
+}
+
+// Handed over: FowlBrowser journaled a `tab handoff` (Codex has no journal: the tab left open for the user is the
+// evidence, and task.expect checks the answer says so); the handoff page is still open after the session; nothing
+// was typed on it and the step was not passed (site log).
+export function gradeHandoff({ task, surface, journal, site, afterExit }) {
+  if (!task.handoff) return { problems: [] };
+  const page = new RegExp(task.handoff.url, 'i');
+  const problems = [];
+  if (surface !== 'codex' && !(journal || []).some((e) => e.type === 'tab' && e.event === 'handoff')) problems.push('no tab_handoff in the journal');
+  if (!Object.values(afterExit || {}).some((tab) => page.test(tab.url))) problems.push(`no tab on /${task.handoff.url}/ left open for the user`);
+  for (const l of (site?.lines || []).filter((l) => /^(input|action) /.test(l) && page.test(l.split(' ')[1]))) problems.push(`the agent went on at the handoff step: ${l}`);
+  return { problems };
+}
+
+// After the harness acted as the user (act.at, its click logged by the page), the agent must stop: no page view or
+// form post of its tag later than TAKEOVER_GRACE_MS (a navigation already under way may still land).
+const TAKEOVER_GRACE_MS = 1000;
+export function gradeTakeover({ task, act, site }) {
+  if (!task.takeover) return { problems: [] };
+  if (!act) return { problems: ['the harness never took the tab over (run with --gui on a test Mac)'] };
+  if (act.error) return { problems: [`takeover act failed: ${act.error}`] };
+  const after = (site?.events || []).filter((e) => (e.kind === 'view' || e.kind === 'action') && e.at > act.at + TAKEOVER_GRACE_MS);
+  const landed = (site?.events || []).some((e) => e.kind === 'pointer' && e.at >= act.at && e.at <= act.at + TAKEOVER_GRACE_MS);
+  return { problems: [...(landed ? [] : ['the takeover click never reached the page']), ...after.map((e) => `${time(e.at)} the agent kept going ${((e.at - act.at) / 1000).toFixed(1)} s after the takeover: ${e.kind} ${e.path}${e.detail ? ` ${e.detail}` : ''}`)] };
+}
+
+// The view must be back to the user's size by turn end: FowlBrowser's journal (viewport set/clear lines, any surface
+// without them skips this part) and, for both surfaces, the demo page's own size log: it went to a phone width and its
+// last size before turn end equals its first.
+export function gradeViewport({ task, journal, site, turnEndAt }) {
+  if (!task.viewport) return { problems: [] };
+  const problems = [];
+  const lines = (journal || []).filter((e) => e.type === 'viewport' && (!turnEndAt || e.t <= turnEndAt));
+  if (lines.length && lines.at(-1).event !== 'clear') problems.push(`viewport still set at turn end (${lines.at(-1).width}x${lines.at(-1).height} on ${lines.at(-1).tab})`);
+  const sizes = (site?.events || []).filter((e) => e.kind === 'size' && (!turnEndAt || e.at <= turnEndAt));
+  if (!sizes.length) problems.push('the page never reported its size');
+  else {
+    if (!sizes.some((e) => e.width <= task.viewport.maxWidth)) problems.push(`the page never got ${task.viewport.maxWidth} px wide or less`);
+    if (sizes.at(-1).width !== sizes[0].width) problems.push(`the page was left at ${sizes.at(-1).width}x${sizes.at(-1).height} (it started at ${sizes[0].width}x${sizes[0].height})`);
+  }
+  return { problems };
+}
+
+// Codex has no download journal: files new or changed in ~/Downloads between two listings ({name: {ino, size, mtimeMs}})
+// become download lines, the shape downloadsToDelete takes.
+export function downloadsDiff(before, after, dir) {
+  return Object.entries(after).filter(([name, f]) => !before[name] || before[name].ino !== f.ino || before[name].mtimeMs !== f.mtimeMs)
+    .map(([name, f]) => ({ type: 'download', path: path.join(dir, name), bytes: f.size, ino: f.ino, state: 'complete' }));
+}
+
+// --- Surfaces ---
+
+// The codex-cu server for a round agent: the user's entry (~/.claude.json, its env pins ChatGPT's version), browser
+// surface only (native computer use could bring apps forward), and tools/mcp-tee.mjs between the proxy and cua_repl
+// so elicitations land in <dir>/elicitations.jsonl.
+export function codexServer(entry, { tee, log }) {
+  const [proxy, command, ...rest] = entry.args;
+  return { type: 'stdio', command: entry.command, args: [proxy, command, tee, log, command, ...rest],
+    env: { ...entry.env, CUA_REPL_ENABLED_SURFACES: 'browser' } };
+}
+
+// One agent's MCP config, claude arguments and prompt for a surface.
+export function agentSetup({ task, surface, dir, mcpRoot, settings, model, effort, codex, remote = null }) {
+  const remoteDir = remote && `${remote.runDir}/${task.name}`;
+  const browserName = task.browser === 'helium' ? 'Helium' : 'Chrome';
+  let prompt = `${task.prompt.replaceAll('{browser}', browserName).replaceAll('{repo}', path.resolve(ROOT))}\n\nEnd your answer with one line starting with RESULT: that states ${task.result}.`;
+  let mcpServers; let allowed; const disallowed = ['Bash', 'WebFetch', 'WebSearch', 'Read', 'Write', 'Edit'];
+  if (surface === 'codex') {
+    const id = codex.browsers[task.browser];
+    const find = id ? `${browserName} is the browser with extensionInstanceId ${id}: get it with \`const b = await cua.getBrowser({ extensionInstanceId: '${id}' })\``
+      : `Find ${browserName} by its name with \`await cua.listBrowsers()\`, get it with \`const b = await cua.getBrowser({ extensionInstanceId })\``;
+    const server = remote ? codexServer(codex.entry, { tee: `${remote.bed}/tools/mcp-tee.mjs`, log: `${remoteDir}/elicitations.jsonl` })
+      : codexServer(codex.entry, { tee: path.join(ROOT, 'tools/mcp-tee.mjs'), log: path.join(dir, 'elicitations.jsonl') });
+    mcpServers = { 'codex-cu': remote ? remoteServer(server, { ssh: remote.ssh, dir: remoteDir }) : server };
+    allowed = 'mcp__codex-cu__js,mcp__codex-cu__js_reset';
+    disallowed.push('mcp__codex-cu__js_add_node_module_dir');
+    prompt = `Use the browser through the mcp__codex-cu__js tool. ${find} and open your tabs with \`cua.createBrowserTab(b.browserId, url, { sessionName: '${labelOf(task.name)}' })\`.\n\n${prompt}`;
+  } else {
+    const server = { command: path.join(remote ? remote.bed : mcpRoot, 'mcp/bin/fowlbrowser-mcp'), env: { FOWLBROWSER_LABEL: labelOf(task.name), FOWLBROWSER_RECORD: remote ? remoteDir : dir } };
+    mcpServers = { fowlbrowser: remote ? remoteServer(server, { ssh: remote.ssh, dir: remoteDir }) : server };
+    allowed = 'mcp__fowlbrowser';
+  }
+  const args = ['-p', '--model', model, '--effort', effort, '--input-format', 'stream-json', '--output-format', 'stream-json',
+    '--verbose', '--strict-mcp-config', '--mcp-config', path.join(dir, 'mcp.json'), '--settings', settings,
+    '--allowedTools', allowed, '--disallowedTools', disallowed.join(',')];
+  return { mcpConfig: { mcpServers }, args, prompt };
+}
+
+// The Stop hook that ends a turn on each surface (also in the user's settings; explicit so a change there can't
+// break a round). Codex agents also get an Elicitation hook: `claude -p` leaves Codex's prompts unanswered (the call
+// hangs for minutes), so tools/elicitation-hook.mjs declines each at once (logged; never answered for the user). A remote round's codex-cu Stop hook finds no local
+// socket (rounds ends remote turns itself).
+export function roundSettings(surface, { mcpRoot, codex }) {
+  const command = surface === 'codex' ? `"${codex.entry.command}" "${path.join(path.dirname(codex.entry.args[0]), 'turn-ended.mjs')}"`
+    : `node "${path.join(mcpRoot, 'mcp/bin/turn-ended.mjs')}"`;
+  const hooks = { Stop: [{ hooks: [{ type: 'command', command, timeout: 5 }] }] };
+  if (surface === 'codex') hooks.Elicitation = [{ matcher: 'codex-cu', hooks: [{ type: 'command', command: `node "${path.join(ROOT, 'tools/elicitation-hook.mjs')}"`, timeout: 5 }] }];
+  return { hooks };
 }
 
 // The user's own tabs (unowned at round start) must keep their url and stay open. A change counts only on a tab some
@@ -242,28 +569,30 @@ const time = (t) => new Date(t).toTimeString().slice(0, 8);
 
 // --- Host socket client ---
 
-async function connectHost(browser) {
-  const socket = net.connect(path.join(SOCKET_DIR, `${browser}.sock`));
+export async function connectHost(browser, dir = remote ? remote.dir : SOCKET_DIR) {
+  const socket = net.connect(path.join(dir, `${browser}.sock`));
   await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
   const send = (m) => { const b = Buffer.from(JSON.stringify(m)); const h = Buffer.alloc(4); h.writeUInt32LE(b.length); socket.write(Buffer.concat([h, b])); };
-  const waiting = new Map(); let nextId = 1; let buffer = Buffer.alloc(0);
+  const waiting = new Map(); let nextId = 1; let buffer = Buffer.alloc(0); const listeners = new Map();
   socket.on('data', (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
     while (buffer.length >= 4 && buffer.length >= 4 + buffer.readUInt32LE(0)) {
       const n = buffer.readUInt32LE(0); const m = JSON.parse(buffer.subarray(4, 4 + n)); buffer = buffer.subarray(4 + n);
+      if (m.id === undefined) { listeners.get(m.method)?.(m.params); continue; }
       const done = waiting.get(m.id); if (!done) continue;
       waiting.delete(m.id); m.error ? done.reject(new Error(m.error.message)) : done.resolve(m.result);
     }
   });
-  send({ method: 'host.auth', params: { token: fs.readFileSync(path.join(SOCKET_DIR, 'token'), 'utf8').trim() } });
+  send({ method: 'host.auth', params: { token: fs.readFileSync(path.join(dir, 'token'), 'utf8').trim() } });
   return {
     request: (method, params = {}) => new Promise((resolve, reject) => { const id = nextId++; waiting.set(id, { resolve, reject }); send({ id, method, params }); }),
+    on: (method, fn) => listeners.set(method, fn),
     close: () => socket.end(),
   };
 }
 
 // One inventory of every tab in both browsers, keyed "browser:id".
-async function inventory(hosts) {
+export async function inventory(hosts) {
   const all = {};
   for (const [browser, host] of Object.entries(hosts)) for (const tab of await host.request('tabs.listAll')) all[keyOf(browser, tab)] = { ...tab, browser };
   return all;
@@ -272,16 +601,22 @@ async function inventory(hosts) {
 // --- Monitor ---
 
 function frontApp() {
+  if (remote) return Promise.resolve(remote.front);
   return new Promise((resolve) => execFile('lsappinfo', ['front'], (err, asn) => {
     if (err) return resolve(null);
     execFile('lsappinfo', ['info', '-only', 'name', asn.trim()], (err2, info) => resolve(err2 ? null : (info.match(/"([^"]*)"/) || [])[1] || null));
   }));
 }
 
-function startMonitor(hosts, file) {
+async function startMonitor(hosts, file) {
   const log = [];
   const write = (e) => { const entry = { t: Date.now(), ...e }; log.push(entry); fs.appendFileSync(file, JSON.stringify(entry) + '\n'); };
-  let front; const active = new Map(); const windows = new Map(); const audible = new Map(); const grouped = new Set();
+  // Exact activations, new tabs and windows and window focus, as the extension sees them (polling misses flashes).
+  for (const [browser, host] of Object.entries(hosts)) {
+    host.on('tabs.activity', ({ kind, ...e }) => write({ kind: 'activity', event: kind, browser, ...e }));
+    await host.request('tabs.watchActivity').catch((err) => write({ kind: 'error', message: `${browser}: no tabs.activity stream (${err.message}); flashes are not counted there` }));
+  }
+  let front; const active = new Map(); const windows = new Map(); const audible = new Map(); const grouped = new Set(); const urls = new Map(); const startTabs = new Set();
   let first = true; let running = true;
   const tick = async () => {
     const app = await frontApp();
@@ -297,7 +632,14 @@ function startMonitor(hosts, file) {
       if (sounding && !audible.has(k)) { write({ kind: 'audio', event: 'start', tab: k, url: tab.url, owner: tab.owner, initial: first || undefined }); audible.set(k, tab); }
       if (!sounding && audible.has(k)) { write({ kind: 'audio', event: 'stop', tab: k, url: tab.url, owner: tab.owner }); audible.delete(k); }
       if (tab.groupTitle?.startsWith('🧪 ') && !grouped.has(k)) { write({ kind: 'group', tab: k, label: tab.groupTitle, url: tab.url }); grouped.add(k); }
+      // Tabs opened during the round: when they appear, each new url (attribution by demo site tag) and when they go.
+      if (first) startTabs.add(k);
+      else if (!startTabs.has(k) && urls.get(k) !== tab.url) {
+        write({ kind: 'tab', event: urls.has(k) ? 'url' : 'new', tab: k, url: tab.url, windowType: tab.windowType });
+        urls.set(k, tab.url);
+      }
     }
+    for (const k of urls.keys()) if (!tabs[k]) { write({ kind: 'tab', event: 'gone', tab: k }); urls.delete(k); }
     for (const [k, tab] of audible) if (!tabs[k]) { write({ kind: 'audio', event: 'stop', tab: k, url: tab.url, owner: tab.owner, gone: true }); audible.delete(k); }
     for (const [win, keys] of seenWindows) if (!windows.has(win)) write({ kind: 'window', event: 'open', browser: win.split(':')[0], windowId: Number(win.split(':')[1]), tabs: keys, initial: first || undefined });
     for (const win of windows.keys()) if (!seenWindows.has(win)) { write({ kind: 'window', event: 'close', browser: win.split(':')[0], windowId: Number(win.split(':')[1]) }); active.delete(win); }
@@ -318,44 +660,46 @@ function startMonitor(hosts, file) {
 
 // --- One agent ---
 
-function runAgent(task, out, model, effort, mcpRoot, hosts) {
+const AGENT_CAP = 4;
+function runAgent(task, out, { model, effort, mcpRoot, hosts, surface, codex }) {
   const dir = path.join(out, task.name);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'mcp.json'), JSON.stringify({ mcpServers: { fowlbrowser: {
-    command: path.join(mcpRoot, 'mcp/bin/fowlbrowser-mcp'),
-    env: { FOWLBROWSER_LABEL: labelOf(task.name), FOWLBROWSER_RECORD: dir },
-  } } }, null, 2));
-  const browserName = task.browser === 'helium' ? 'Helium' : 'Chrome';
-  const prompt = `${task.prompt.replaceAll('{browser}', browserName).replaceAll('{repo}', path.resolve(ROOT))}\n\nEnd your answer with one line starting with RESULT: that states ${task.result}.`;
-  const run = { name: task.name, started: Date.now(), firstToolAt: null, tools: [], result: null, exitCode: null, killed: false };
-  const child = spawn('claude', ['-p', '--model', model, '--effort', effort, '--input-format', 'stream-json', '--output-format', 'stream-json',
-    '--verbose', '--strict-mcp-config', '--mcp-config', path.join(dir, 'mcp.json'), '--settings', path.join(out, 'settings.json'),
-    '--allowedTools', 'mcp__fowlbrowser', '--disallowedTools', 'Bash,WebFetch,WebSearch,Read,Write,Edit'],
-  { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'] });
+  const setup = agentSetup({ task, surface, dir, mcpRoot, settings: path.join(out, 'settings.json'), model, effort, codex, remote });
+  fs.writeFileSync(path.join(dir, 'mcp.json'), JSON.stringify(setup.mcpConfig, null, 2));
+  const run = { name: task.name, started: Date.now(), firstToolAt: null, tools: [], result: null, resultAt: null, exitCode: null, killed: false };
+  // A call that never returns (an unanswered prompt, a hung browser) must not stall the round: stopped after
+  // AGENT_CAP times its budget (10 min without one).
+  const child = spawn('claude', setup.args, { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'] });
+  process.on('exit', () => child.kill());
+  // Each stream-json line as it arrived, stamped with `t` (parseTranscript times calls and errors by it).
   const events = fs.createWriteStream(path.join(dir, 'events.jsonl'));
   let stderr = '';
   child.stderr.on('data', (d) => { stderr += d; });
-  child.stdin.write(JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: prompt }] } }) + '\n');
+  child.stdin.write(JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: setup.prompt }] } }) + '\n');
   const exited = new Promise((resolve) => child.on('close', (code) => { run.exitCode = code; resolve(); }));
   let pending = '';
   const gotResult = new Promise((resolve) => {
     child.stdout.on('data', (chunk) => {
-      events.write(chunk);
       pending += chunk;
       const lines = pending.split('\n'); pending = lines.pop();
       for (const line of lines) {
-        let e; try { e = JSON.parse(line); } catch { continue; }
+        let e; try { e = JSON.parse(line); } catch { events.write(line + '\n'); continue; }
+        events.write(JSON.stringify({ t: Date.now(), ...e }) + '\n');
         if (e.type === 'assistant') for (const c of e.message?.content || []) if (c.type === 'tool_use') {
           run.firstToolAt ??= Date.now();
           run.tools.push({ t: Date.now(), name: c.name });
         }
-        if (e.type === 'result') { run.result = e; resolve(); }
+        if (e.type === 'result') { run.result = e; run.resultAt = Date.now(); resolve(); }
       }
     });
     exited.then(resolve);
   });
+  const cap = setTimeout(() => { run.timedOut = true; child.kill('SIGKILL'); }, (task.budgetSeconds ? task.budgetSeconds * AGENT_CAP : 600) * 1000);
   return (async () => {
     await gotResult;
+    clearTimeout(cap);
+    // The Stop hook can't reach a remote server: end its turn from here.
+    if (remote && run.result) await onRemote(remoteTurnEnd(surface, `${remote.runDir}/${task.name}`)).catch((err) => { run.turnEndError = err.message; });
     await sleep(1000);
     run.atTurnEnd = await inventory(hosts);
     child.stdin.end();
@@ -363,6 +707,8 @@ function runAgent(task, out, model, effort, mcpRoot, hosts) {
     await exited; clearTimeout(timer);
     await sleep(2000);
     run.afterExit = await inventory(hosts);
+    // A remote server's record dir (journal, frames, elicitations) comes back next to the transcript.
+    if (remote) await sh('rsync', ['-a', '-e', `ssh ${remote.ssh.slice(0, -1).join(' ')}`, `${remote.host}:${remote.runDir}/${task.name}/`, `${dir}/`]).catch((err) => { run.pullError = err.message; });
     events.end();
     if (stderr) fs.writeFileSync(path.join(dir, 'stderr.txt'), stderr);
     return run;
@@ -393,39 +739,125 @@ function htmlReport(rows) {
   return parts.join('\n');
 }
 
+// --- Codex surface and the user's part ---
+
+// codex-cu as the user registered it (~/.claude.json), else built from ChatGPT's bundled plugin config and our proxy
+// (a Mac without the user entry). Preflight: the proxy, ChatGPT's node and a live Codex browser socket.
+function loadCodex(args) {
+  const home = os.homedir();
+  let entry = readJson(path.join(home, '.claude.json'))?.mcpServers?.['codex-cu'];
+  if (!entry) {
+    const pluginDir = path.join(home, '.codex/plugins/cache/openai-bundled/unified-computer-use');
+    const version = fs.existsSync(pluginDir) ? fs.readdirSync(pluginDir).sort().at(-1) : null;
+    const plugin = version && readJson(path.join(pluginDir, version, '.mcp.json'))?.mcpServers?.cua_repl;
+    if (plugin) entry = { command: plugin.command, args: [path.join(home, '.claude/tools/codex-cu/proxy.mjs'), plugin.command, ...plugin.args], env: plugin.env };
+  }
+  const missing = !entry ? ['a codex-cu entry in ~/.claude.json or ChatGPT\'s unified-computer-use plugin']
+    : [entry.command, entry.args[0], path.join(path.dirname(entry.args[0]), 'turn-ended.mjs')].filter((f) => !fs.existsSync(f));
+  const sockets = fs.existsSync('/tmp/codex-browser-use') ? fs.readdirSync('/tmp/codex-browser-use').filter((f) => f.endsWith('.sock')) : [];
+  if (!sockets.length) missing.push('/tmp/codex-browser-use/*.sock (is ChatGPT running with its browser extension?)');
+  if (missing.length) { console.error(`--surface codex: missing ${missing.join(', ')}`); process.exit(2); }
+  // `--codex-browsers auto`: no ids (another Mac), the agent finds its browser by name.
+  const browsers = args['codex-browsers'] === 'auto' ? {}
+    : { ...CODEX_BROWSERS, ...Object.fromEntries((args['codex-browsers'] || '').split(',').filter(Boolean).map((p) => p.split('='))) };
+  return { entry, browsers };
+}
+
+const readJson = (file) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } };
+const getJson = (url) => fetch(url).then((r) => r.json()).catch((err) => ({ error: err.message }));
+const CUA_DRIVER = path.join(os.homedir(), '.local/bin/cua-driver-local');
+const cua = (tool, params) => (remote ? onRemote(`~/.local/bin/cua-driver-local call ${tool} ${shq(JSON.stringify(params))}`) : sh(CUA_DRIVER, ['call', tool, JSON.stringify(params)]))
+  .then((stdout) => JSON.parse(stdout), (err) => { throw new Error(`${tool}: ${err.message}`); });
+
+// --gui only (a test Mac under its GUI lock): once a takeover task's agent has made task.takeover.afterViews page views
+// (its site log), the harness acts as the user: brings the agent's tab to the front (raw tabs.focus) and clicks into
+// the page with cua-driver. Returns {at, from, to, tab} (`from`..`to`: blame nothing on agents then) or {error}.
+export async function takeoverAct(task, hosts, finished) {
+  const want = task.takeover.afterViews ?? 3;
+  for (;;) {
+    if (finished()) return { error: `the agent finished before it made ${want} page views` };
+    const site = await getJson(task.site.log);
+    if ((site.events || []).filter((e) => e.kind === 'view').length >= want) break;
+    await sleep(300);
+  }
+  let from;
+  const session = `fb-rounds-${process.pid}-${Date.now()}`; // a driver session label is spent once it ends
+  try {
+    const tab = Object.values(await inventory(hosts)).filter((t) => tagged(task.name, t.url)).sort((a, b) => b.id - a.id)[0];
+    if (!tab) return { error: 'no tab of the agent on the demo site' };
+    from = Date.now();
+    await hosts[tab.browser].request('tabs.focus', { tabId: tab.id });
+    await sleep(600);
+    const windows = (await cua('list_windows', { on_screen_only: true })).windows
+      .filter((w) => w.app_name === BROWSER_APP[tab.browser]).sort((a, b) => (b.z_index ?? 0) - (a.z_index ?? 0));
+    const win = windows.find((w) => w.title.includes(tab.title)) ?? windows[0];
+    // A pixel click is in the coordinates of the window's latest screenshot, which must be taken first.
+    const shot = await cua('get_window_state', { session, pid: win.pid, window_id: win.window_id, include_accessibility_tree: false });
+    const at = Date.now();
+    await cua('click', { session, pid: win.pid, window_id: win.window_id, capture_id: shot.capture_id,
+      x: Math.round(shot.screenshot_width / 2), y: Math.round(shot.screenshot_height * 0.6) });
+    await cua('end_session', { session }).catch(() => {});
+    return { at, from, to: Date.now() + 1500, tab: keyOf(tab.browser, tab) };
+  } catch (err) {
+    // The tab may already be in front: that much was still the harness, not the agent.
+    return { error: err.message, ...(from && { from, to: Date.now() + 1500 }) };
+  }
+}
+
+function listDownloads(dir) {
+  const files = {};
+  for (const name of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
+    try { const st = fs.statSync(path.join(dir, name)); if (st.isFile()) files[name] = { ino: st.ino, size: st.size, mtimeMs: st.mtimeMs }; } catch {}
+  }
+  return files;
+}
+
 // --- Main ---
 
 async function main() {
-  const flags = new Set(['swap', 'keep-tabs']);
+  const flags = new Set(['swap', 'keep-tabs', 'gui', 'remote-held']);
   const args = {};
   for (let i = 2; i < process.argv.length; i++) {
     const a = process.argv[i].slice(2);
     args[a] = flags.has(a) ? true : process.argv[++i];
   }
+  if (args.remote) args.gui = true; // the round holds the remote Mac's GUI lock
+  // Stopped by hand: still run the exit handlers (agents, the remote connection and its lock, the site).
+  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => process.exit(130));
   let tasks = JSON.parse(fs.readFileSync(args.tasks || path.join(ROOT, 'tools/agents/example.json'), 'utf8'));
   if (args.only) tasks = tasks.filter((t) => args.only.split(',').includes(t.name));
   if (args.swap) tasks = tasks.map((t) => ({ ...t, browser: t.browser === 'helium' ? 'chrome' : 'helium' }));
+  if (!args.gui && tasks.some((t) => t.takeover)) {
+    console.log(`skipped (they need --gui on a test Mac): ${tasks.filter((t) => t.takeover).map((t) => t.name).join(', ')}`);
+    tasks = tasks.filter((t) => !t.takeover);
+  }
+  const surface = args.surface || 'fowlbrowser';
+  if (!['fowlbrowser', 'codex'].includes(surface)) { console.error(`--surface ${surface}: use fowlbrowser or codex`); process.exit(2); }
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+  const graded = tasks.flatMap((t) => [t.grade, t.site?.log].filter(Boolean)).map((u) => new URL(u));
+  if (args.remote) await openRemote(args.remote, { owner: args['remote-owner'] || 'fb-rounds', ports: [...new Set(graded.map((u) => u.port))], stamp, held: args['remote-held'] });
+  const codex = surface === 'codex' ? (remote ? await loadRemoteCodex(args) : loadCodex(args)) : null;
   const model = args.model || 'opus';
   const effort = args.effort || 'medium';
   const mcpRoot = args.mcp === 'installed' ? path.join(os.homedir(), 'Library/Application Support/FowlBrowser') : ROOT;
-  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
   const out = path.resolve(args.out || `/tmp/fb-rounds/${stamp}`);
   fs.mkdirSync(out, { recursive: true });
-  fs.writeFileSync(path.join(out, 'settings.json'), JSON.stringify({ hooks: { Stop: [{ hooks: [
-    { type: 'command', command: `node "${path.join(mcpRoot, 'mcp/bin/turn-ended.mjs')}"`, timeout: 5 },
-  ] }] } }, null, 2));
+  fs.writeFileSync(path.join(out, 'settings.json'), JSON.stringify(roundSettings(surface, { mcpRoot, codex }), null, 2));
 
-  // --serve: the site the tasks grade against (tools/agents/forms.json), up before the agents and killed after grading.
+  // --serve: the sites the tasks grade against (forms.json, codex-h2h.json), up before the agents and killed after grading.
   let server = null;
   if (args.serve) {
     const log = fs.openSync(path.join(out, 'serve.log'), 'a');
-    server = spawn('sh', ['-c', `exec ${args.serve}`], { cwd: ROOT, stdio: ['ignore', log, log] });
+    // Remote: the site runs in the test bed there (its browsers load it), until this ssh closes its stdin.
+    server = remote ? spawn('ssh', [...remote.ssh, `${REMOTE_PATH}; cd ${shq(remote.bed)} && { ${args.serve} & S=$!; cat >/dev/null; kill $S; }`], { stdio: ['pipe', log, log] })
+      : spawn('sh', ['-c', `exec ${args.serve}`], { cwd: ROOT, stdio: ['ignore', log, log] });
     process.on('exit', () => server.kill());
-    const origin = new URL(tasks.find((t) => t.grade).grade).origin;
-    for (let i = 0; ; i++) {
-      if (await fetch(origin).then(() => true, () => false)) break;
-      if (i === 50) throw new Error(`--serve: ${origin} did not answer within 10 s (see ${out}/serve.log)`);
-      await sleep(200);
+    for (const origin of new Set(graded.map((u) => u.origin))) {
+      for (let i = 0; ; i++) {
+        if (await fetch(origin).then(() => true, () => false)) break;
+        if (i === 50) throw new Error(`--serve: ${origin} did not answer within 10 s (see ${out}/serve.log)`);
+        await sleep(200);
+      }
     }
   }
 
@@ -433,52 +865,90 @@ async function main() {
   const hosts = Object.fromEntries((await Promise.all(BROWSERS.map(async (b) => [b, await connectHost(b).catch(() => null)]))).filter(([, host]) => host));
   const missing = [...new Set(tasks.map((t) => t.browser))].filter((b) => !hosts[b]);
   if (missing.length) {
-    console.error(`Not connected: ${missing.join(', ')} (no FowlBrowser socket in ${SOCKET_DIR}). Open the browser with the extension loaded, ` +
+    console.error(`Not connected: ${missing.join(', ')} (no FowlBrowser socket in ${remote ? `${remote.host}:~/.fowlbrowser` : SOCKET_DIR}). Open the browser with the extension loaded, ` +
       'or pick tasks with --only, or move them to the other browser with --swap.');
     process.exit(2);
   }
+  const downloadsDir = path.join(os.homedir(), 'Downloads');
+  const downloadsBefore = remote ? {} : listDownloads(downloadsDir);
   const roundStart = Date.now();
   const start = await inventory(hosts);
   const startKeys = new Set(Object.keys(start));
-  const monitor = startMonitor(hosts, path.join(out, 'monitor.jsonl'));
-  console.log(`round of ${tasks.length} agents (${model}, ${effort}, mcp ${args.mcp || 'repo'}); output in ${out}`);
-  const runs = await Promise.all(tasks.map(async (task) => {
-    const run = await runAgent(task, out, model, effort, mcpRoot, hosts);
+  const monitor = await startMonitor(hosts, path.join(out, 'monitor.jsonl'));
+  console.log(`round of ${tasks.length} agents (${surface}, ${model}, ${effort}${surface === 'fowlbrowser' ? `, mcp ${args.mcp || 'repo'}` : ''}); output in ${out}`);
+  const acts = new Array(tasks.length).fill(null);
+  const runs = await Promise.all(tasks.map(async (task, i) => {
+    let done = false;
+    const act = task.takeover && takeoverAct(task, hosts, () => done).then((a) => { acts[i] = a; console.log(`${task.name}: ${a.error ? `takeover act failed: ${a.error}` : `took ${a.tab} over at ${time(a.at)}`}`); });
+    const run = await runAgent(task, out, { model, effort, mcpRoot, hosts, surface, codex });
+    done = true; await act;
     console.log(`${task.name} finished in ${((Date.now() - run.started) / 1000).toFixed(0)} s`);
     return run;
   }));
   await monitor.stop();
   const end = await inventory(hosts);
-  const grades = await Promise.all(tasks.map((t) => t.grade && fetch(t.grade).then((r) => r.json()).catch((err) => ({ error: err.message }))));
+  const grades = await Promise.all(tasks.map((t) => t.grade && getJson(t.grade)));
+  const sites = await Promise.all(tasks.map((t) => t.site && getJson(t.site.log)));
+  sites.forEach((site, i) => site && fs.writeFileSync(path.join(out, tasks[i].name, 'site.json'), JSON.stringify(site, null, 1)));
+  server?.stdin?.end();
   server?.kill();
 
   // Grade
   const journals = tasks.map((t) => readJsonl(path.join(out, t.name, 'journal.jsonl')));
+  const transcripts = tasks.map((t) => parseTranscript(readJsonl(path.join(out, t.name, 'events.jsonl')) || []));
+  const elicitations = tasks.map((t, i) => elicitationsOf(readJsonl(path.join(out, t.name, 'elicitations.jsonl')) || [], transcripts[i].calls));
+  // Codex keeps no journal: its downloads are the new files in ~/Downloads whose names its transcript mentions.
+  if (surface === 'codex' && !remote) {
+    const fresh = downloadsDiff(downloadsBefore, listDownloads(downloadsDir), downloadsDir);
+    tasks.forEach((t, i) => {
+      const text = fs.readFileSync(path.join(out, t.name, 'events.jsonl'), 'utf8');
+      journals[i] = fresh.filter((d) => text.includes(path.basename(d.path)));
+    });
+  }
   runs.forEach((run, i) => { run.tabs = agentTabs(tasks[i].name, journals[i], monitor.log); });
   const owners = new Map(runs.flatMap((run) => [...run.tabs].map((k) => [k, run.name])));
-  const calls = journals.flatMap((journal, i) => (journal || []).filter((e) => e.type === 'call').map((e) => ({ ...e, agent: tasks[i].name })));
-  const closedAt = new Map(journals.flatMap((journal) => (journal || []).filter((e) => e.type === 'tab' && e.event === 'close').map((e) => [e.tab, e.t])));
-  const allFocus = focusEvents(monitor.log, owners, calls, closedAt);
+  const calls = surface === 'codex' ? transcripts.flatMap((tr, i) => tr.focusCalls.map((c) => ({ ...c, agent: tasks[i].name })))
+    : journals.flatMap((journal, i) => (journal || []).filter((e) => e.type === 'call').map((e) => ({ ...e, agent: tasks[i].name })));
+  const closedAt = new Map([...monitor.log.filter((e) => e.kind === 'tab' && e.event === 'gone' && owners.has(e.tab)).map((e) => [e.tab, e.t]),
+    ...journals.flatMap((journal) => (journal || []).filter((e) => e.type === 'tab' && e.event === 'close').map((e) => [e.tab, e.t]))]);
+  // While the harness acted as the user (takeover tasks), nothing is blamed on an agent.
+  const userActs = acts.filter((a) => a?.from);
+  const acting = (t) => userActs.some((a) => t >= a.from && t <= a.to);
+  const allFocus = focusEvents(monitor.log, owners, calls, closedAt).map((e) => (acting(e.t) ? { ...e, blame: false, text: `${e.text} (the harness acting as the user)` } : e));
   const focus = allFocus.filter((e) => e.blame);
+  const flashes = activityFlashes(monitor.log, owners, userActs);
   const sound = soundEvents(monitor.log, owners);
   const problems = [];
   const rows = tasks.map((task, i) => {
-    const run = runs[i]; const journal = journals[i];
-    const outcome = gradeOutcome({ task, run, journal, after: run.afterExit, startKeys, grade: grades[i] });
-    const cursor = gradeCursor({ task, journal });
+    const run = runs[i]; const journal = journals[i]; const site = sites[i];
+    const controlled = controlledBy(surface, task.name);
+    const outcome = gradeOutcome({ task, run, journal, after: run.afterExit, startKeys, grade: grades[i], controlled });
+    const cursor = surface === 'codex' ? { ok: true, cell: 'n/a', problems: [] } : gradeCursor({ task, journal });
+    const checks = Object.entries({
+      site: gradeSite({ task, site }),
+      handoff: gradeHandoff({ task, surface, journal, site, afterExit: run.afterExit }),
+      takeover: gradeTakeover({ task, act: acts[i], site }),
+      viewport: gradeViewport({ task, journal, site, turnEndAt: run.resultAt }),
+    }).flatMap(([column, { problems: list }]) => list.map((p) => `${column} · ${p}`));
     const myFocus = focus.filter((e) => e.owner === task.name);
+    const myFlashes = flashes.flashes.filter((e) => e.owner === task.name);
     const mySound = sound.filter((e) => e.owner === task.name);
-    const tabs = gradeTabs({ task, tabs: run.tabs, atTurnEnd: run.atTurnEnd, afterExit: run.afterExit, startKeys });
+    const tabs = gradeTabs({ task, tabs: run.tabs, atTurnEnd: run.atTurnEnd, afterExit: run.afterExit, startKeys, controlled });
     const timing = gradeTime({ task, run, journal });
     const tokens = gradeTokens(run);
-    const toolAt = (t) => { const call = (journal || []).filter((e) => e.type === 'call' && e.t <= t).pop(); return call ? `, last tool ${call.tool}` : ''; };
+    const callCell = gradeCalls(transcripts[i], elicitations[i]);
+    const toolAt = (t) => { const call = transcripts[i].calls.filter((c) => c.t <= t).pop(); return call ? `, last tool ${call.name.split('__').pop()}` : ''; };
     for (const p of outcome.problems) problems.push(`${task.name} · outcome · ${p}`);
+    for (const p of checks) problems.push(`${task.name} · ${p}`);
     for (const p of cursor.problems) problems.push(`${task.name} · cursor · ${p}`);
     for (const e of myFocus) problems.push(`${task.name} · focus · ${e.text}${toolAt(e.t)}`);
+    for (const e of myFlashes) problems.push(`${task.name} · flash · ${e.text}${toolAt(e.t)}`);
     for (const e of mySound) problems.push(`${task.name} · sound · ${e.text}${toolAt(e.t)}`);
     for (const p of tabs.problems) problems.push(`${task.name} · tabs · ${p}`);
     for (const p of timing.problems) problems.push(`${task.name} · time · ${p}`);
-    return { task, journal, outcome, cursor, focus: myFocus, sound: mySound, tabs, timing, tokens };
+    for (const p of callCell.problems) problems.push(`${task.name} · calls · ${p}`);
+    for (const p of [run.turnEndError && `turn end on ${remote.host} failed: ${run.turnEndError}`, run.pullError && `could not pull its record dir: ${run.pullError}`].filter(Boolean)) problems.push(`${task.name} · remote · ${p}`);
+    return { task, journal, outcome, checks, cursor, focus: myFocus, flashes: myFlashes, sound: mySound, tabs, timing, tokens, calls: callCell };
   });
   const touched = new Set(journals.flatMap((journal) => (journal || []).map((e) => e.tab).filter(Boolean)));
   const userTabs = userTabChanges(start, end, touched);
@@ -487,8 +957,9 @@ async function main() {
   for (const p of monitorProblems(monitor.log, monitor.ticks)) problems.push(`round · monitor · ${p}`);
 
   // Cleanup before the report, so its failures count: tabs this round's agents created and left for the user, then this
-  // round's downloads in ~/Downloads, then a final inventory.
-  const created = createdTabs(journals, startKeys);
+  // round's downloads in ~/Downloads, then a final inventory. FowlBrowser's journals name the tabs its agents opened;
+  // for Codex, the tabs seen in an agent's group or on its demo site pages that were not open at round start.
+  const created = surface === 'codex' ? new Set(runs.flatMap((run) => [...run.tabs].filter((k) => !startKeys.has(k)))) : createdTabs(journals, startKeys);
   if (!args['keep-tabs']) {
     const now = await inventory(hosts);
     for (const k of created) {
@@ -498,7 +969,8 @@ async function main() {
     }
   }
   for (const e of keptChildren(journals)) console.log(`left open (may be the user's): ${e.tab} ${e.url}`);
-  const { remove, skip } = downloadsToDelete(journals, { downloadsDir: path.join(os.homedir(), 'Downloads'), roundStart,
+  // Remote downloads are on the other Mac: never deleted from here.
+  const { remove, skip } = downloadsToDelete(remote ? [] : journals, { downloadsDir, roundStart,
     stat: (file) => { try { return fs.statSync(file); } catch { return null; } } });
   for (const { path: file, why } of skip) console.log(`kept ${file}: ${why}`);
   for (const file of remove) {
@@ -510,17 +982,21 @@ async function main() {
     for (const k of created) if (final[k]) problems.push(`round · teardown · still open after cleanup: ${k} ${final[k].url}${final[k].owner ? ' (controlled)' : ''}`);
   }
 
+  for (const host of Object.values(hosts)) host.close();
+  if (remote) for (const p of await remote.close()) problems.push(`round · remote · ${p}`);
+
   const cell = (events) => (events.length ? `FAIL: ${events.length}` : 'ok');
-  const lines = ['| agent | browser | outcome | cursor | focus | sound | tabs | time | calls | tokens | $ |', '|---|---|---|---|---|---|---|---|---|---|---|'];
+  const lines = ['| agent | surface | browser | outcome | checks | cursor | focus | flashes | sound | tabs | time | calls | tokens | $ |', '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|'];
   for (const r of rows) {
-    const calls = r.journal ? r.journal.filter((e) => e.type === 'call').length : '-';
-    lines.push(`| ${r.task.name} | ${r.task.browser} | ${r.outcome.cell} | ${r.cursor.cell} | ${cell(r.focus)} | ${cell(r.sound)} | ${r.tabs.cell} | ${r.timing.cell} | ${calls} | ${r.tokens.cell} | ${r.tokens.cost.toFixed(3)} |`);
+    lines.push(`| ${r.task.name} | ${surface} | ${r.task.browser} | ${r.outcome.cell} | ${cell(r.checks)} | ${r.cursor.cell} | ${cell(r.focus)} | ${cell(r.flashes)} | ${cell(r.sound)} | ${r.tabs.cell} | ${r.timing.cell} | ${r.calls.cell} | ${r.tokens.cell} | ${r.tokens.cost.toFixed(3)} |`);
   }
   lines.push('', problems.length ? `ROUND NOT CLEAN: ${problems.length} problems` : 'ROUND CLEAN', '', ...problems.map((p) => `- ${p}`));
-  const notCounted = [...allFocus.filter((e) => !e.blame), ...sound.filter((e) => e.owner === 'user')].sort((a, b) => a.t - b.t);
+  const notCounted = [...allFocus.filter((e) => !e.blame), ...flashes.notCounted, ...sound.filter((e) => e.owner === 'user')].sort((a, b) => a.t - b.t);
   if (notCounted.length || userTabs.browsing.length) {
     lines.push('', 'Not counted, no agent caused it (the user using their Mac):', ...notCounted.map((e) => `- ${e.text}`), ...userTabs.browsing.map((c) => `- their tab ${c}`));
   }
+  const allElicitations = elicitations.flatMap((list, i) => list.map((e) => `- ${tasks[i].name}: ${time(e.t)} "${e.text}" -> ${e.action}${e.code ? ` (during: ${e.code})` : ''}`));
+  if (allElicitations.length) lines.push('', 'Elicitations (MCP prompts to the user):', ...allElicitations);
   lines.push('', 'Answers:');
   for (const [i, run] of runs.entries()) {
     const answer = String(run.result?.result ?? '').split('\n').filter((l) => l.includes('RESULT:')).pop() ?? '(none)';
@@ -530,8 +1006,6 @@ async function main() {
   fs.writeFileSync(path.join(out, 'report.md'), report);
   fs.writeFileSync(path.join(out, 'report.html'), htmlReport(rows));
   console.log('\n' + report);
-
-  for (const host of Object.values(hosts)) host.close();
   process.exit(problems.length ? 1 : 0);
 }
 

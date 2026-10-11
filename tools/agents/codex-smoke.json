@@ -1,0 +1,6 @@
+[
+  { "name": "smoke-red", "browser": "chrome", "budgetSeconds": 150, "needsClicks": false,
+    "prompt": "open the demo shop at http://127.0.0.1:5420/t/smoke-red/shop/ in {browser} and tell me the price of the red mug",
+    "result": "the red mug's name and price", "expect": ["Ember", "\\$?16(\\.00)?\\b"],
+    "site": { "log": "http://127.0.0.1:5420/t/smoke-red/api/log", "expect": ["^view /shop/"] } }
+]
