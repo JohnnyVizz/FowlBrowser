@@ -6,8 +6,6 @@
 
 <p align="center">Let your AI agents use your real Chrome, in background tabs, without getting in your way.</p>
 
----
-
 FowlBrowser connects Claude Code (or any MCP client) to the browser you already use, with your logins, cookies and
 open tabs. Agents work in their own background tabs, several at once, while you keep working. When you want to watch,
 open an agent's tab and a cursor shows you exactly where it clicks.
@@ -22,7 +20,7 @@ open an agent's tab and a cursor shows you exactly where it clicks.
   share their session's tabs).
 - **A cursor you can follow.** In the tab you're looking at, an animated cursor travels to every click and labels the agent.
 - **Cleans up after itself.** When an agent finishes its turn, its work tabs close. Tabs it opened for you stay.
-- **No prompts or bars.** No "Allow remote debugging?" dialog, and no debugging bar with one launch flag.
+- **No permission prompts.** No "Allow remote debugging?" dialog, and one launch flag hides the debugging bar too.
 - **Built for agents.** Compact page snapshots with element refs, changes-only results, and fast errors that say why
   (for example, "covered by the cookie banner, dismiss it first").
 
@@ -78,9 +76,13 @@ End-of-turn cleanup uses Claude Code hooks; elsewhere, agent tabs close when the
 ## How it works
 
 ```
-Agent ── MCP ──> FowlBrowser server (one per session)
-                   └─ local socket, token-gated ──> helper started by the browser
-                                                       └─ native messaging ──> extension (chrome.debugger, chrome.tabs)
+Agent (Claude Code or any MCP client)
+  │  MCP
+FowlBrowser server, one per session
+  │  local socket, token-gated
+Helper, started by the browser
+  │  native messaging
+Extension: chrome.debugger and chrome.tabs
 ```
 
 The extension drives only the tabs a session opened or was given, through `chrome.debugger`, so the browser never
