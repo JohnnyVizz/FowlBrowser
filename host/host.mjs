@@ -64,24 +64,39 @@ function log(...parts) {
 
 // Calls onMessage for each complete frame; readLength picks the endianness of the 4-byte header.
 // An oversized frame, bad JSON or a throwing onMessage stops the reader and goes to onError.
+// Chunks are joined only once a frame is whole: a multi-megabyte message arrives in many small chunks, and joining
+// on each would copy it again and again.
 function frameReader(readLength, onMessage, onError, maxFrame = Infinity) {
-  let buffer = Buffer.alloc(0);
+  let chunks = [];
+  let bytes = 0;
+  let length = null;
   let failed = false;
+  // The next n bytes of the chunks, joined once; what is left stays queued.
+  const take = (n) => {
+    const joined = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
+    chunks = joined.length > n ? [joined.subarray(n)] : [];
+    bytes = joined.length - n;
+    return joined.subarray(0, n);
+  };
   return (chunk) => {
     if (failed) return;
-    buffer = buffer.length ? Buffer.concat([buffer, chunk]) : chunk;
+    chunks.push(chunk);
+    bytes += chunk.length;
     try {
-      while (buffer.length >= 4) {
-        const length = readLength(buffer);
-        if (length > maxFrame) throw new Error(`frame of ${length} bytes is over the limit`);
-        if (buffer.length < 4 + length) break;
-        const body = buffer.subarray(4, 4 + length).toString('utf8');
-        buffer = buffer.subarray(4 + length);
+      for (;;) {
+        if (length === null) {
+          if (bytes < 4) break;
+          length = readLength(take(4));
+          if (length > maxFrame) throw new Error(`frame of ${length} bytes is over the limit`);
+        }
+        if (bytes < length) break;
+        const body = take(length).toString('utf8');
+        length = null;
         onMessage(JSON.parse(body));
       }
     } catch (error) {
       failed = true;
-      buffer = Buffer.alloc(0);
+      chunks = [];
       onError(error);
     }
   };
@@ -201,7 +216,15 @@ process.stdout.on('error', () => shutdown('stdout error'));
 
 // Clients must prove they can read ~/.fowlbrowser/token (0600) before anything reaches the browser.
 const tokenFile = path.join(DIR, 'token');
-if (!fs.existsSync(tokenFile)) fs.writeFileSync(tokenFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600, flag: 'wx' });
+// Two hosts starting at once (Chrome and Helium at login) may both create it: each writes its own file and links it
+// into place, so the token appears whole in one step and the loser (EEXIST) reads the winner's.
+if (!fs.existsSync(tokenFile)) {
+  const draft = `${tokenFile}.${process.pid}`;
+  fs.writeFileSync(draft, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
+  try { fs.linkSync(draft, tokenFile); }
+  catch (error) { if (error.code !== 'EEXIST') throw error; }
+  finally { fs.rmSync(draft, { force: true }); }
+}
 const token = Buffer.from(fs.readFileSync(tokenFile, 'utf8').trim());
 const tokenMatches = (value) => {
   const given = Buffer.from(String(value ?? ''));

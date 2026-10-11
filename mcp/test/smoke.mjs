@@ -5,6 +5,7 @@
 import assert from 'node:assert/strict';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { fileURLToPath } from 'node:url';
 
 const wanted = process.argv.slice(2).length ? process.argv.slice(2) : ['chrome', 'helium'];
 const YOUTUBE = 'https://www.youtube.com/watch?v=aqz-KE-bpKQ'; // Big Buck Bunny, Blender Foundation
@@ -12,7 +13,7 @@ const YOUTUBE = 'https://www.youtube.com/watch?v=aqz-KE-bpKQ'; // Big Buck Bunny
 const client = new Client({ name: 'fowlbrowser-smoke', version: '0' });
 await client.connect(new StdioClientTransport({
   command: 'sh',
-  args: [new URL('../bin/fowlbrowser-mcp', import.meta.url).pathname],
+  args: [fileURLToPath(new URL('../bin/fowlbrowser-mcp', import.meta.url))],
   env: { ...process.env, FOWLBROWSER_LABEL: 'smoke' },
   stderr: 'inherit',
 }));

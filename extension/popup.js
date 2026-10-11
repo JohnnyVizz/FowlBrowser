@@ -1,28 +1,9 @@
 // FowlBrowser popup: connection status, the name agents see for this browser profile, and a setup prompt per agent.
+import { AGENTS } from './setup-prompts.js';
+
 const NAMES = { chrome: 'Chrome', helium: 'Helium', chromium: 'Chromium', brave: 'Brave', edge: 'Edge' };
-const REPO = 'https://github.com/argofowl/FowlBrowser';
-const SERVER = '"$HOME/Library/Application Support/FowlBrowser/mcp/bin/fowlbrowser-mcp"';
 const SAVE_DELAY_MS = 300;
 const COPIED_MS = 1500;
-
-const INSTALL = `Set up FowlBrowser so you can use my browsers. Clone ${REPO} (or pull it if I already have it)`;
-const AGENTS = {
-  claude: {
-    hint: 'Copy, then paste it into Claude Code.',
-    prompt: `${INSTALL}, run \`sh install.sh\` in it and tell me what it changed. Then tell me to restart Claude Code.`,
-  },
-  codex: {
-    hint: 'Copy, then paste it into Codex.',
-    prompt: `${INSTALL}, run \`FOWLBROWSER_SKIP_CLAUDE=1 sh install.sh\` in it, then run ` +
-      `\`codex mcp add fowlbrowser --env FOWLBROWSER_LABEL=Codex -- ${SERVER}\`. Tell me what changed, then tell me to restart Codex.`,
-  },
-  other: {
-    hint: 'Copy, then paste it into your agent.',
-    prompt: `${INSTALL} and run \`FOWLBROWSER_SKIP_CLAUDE=1 sh install.sh\` in it. Then add an MCP server named fowlbrowser to your ` +
-      `config: command ${SERVER} (full path, no arguments), env FOWLBROWSER_LABEL set to your name. ` +
-      'Tell me what changed and whether I need to restart you.',
-  },
-};
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $('status');
@@ -46,7 +27,8 @@ function seenAs() {
 
 function render() {
   statusEl.dataset.state = status.state;
-  statusEl.lastElementChild.textContent = { connected: 'Connected', missing: 'Not set up' }[status.state] ?? 'Connecting…';
+  statusEl.lastElementChild.textContent = { connected: 'Connected', missing: 'Not set up', broken: 'Can’t start' }[status.state] ?? 'Connecting…';
+  $('problem').hidden = status.state !== 'broken';
   const preview = $('preview');
   preview.textContent = 'Agents see this browser as ';
   const name = document.createElement('b');
@@ -116,7 +98,7 @@ async function refreshStatus() {
   // Setup starts open while it is needed and folded away once this browser is connected; then it is the user's.
   if (!setupDecided && status.state !== 'connecting') {
     setupDecided = true;
-    setupEl.open = status.state === 'missing';
+    setupEl.open = status.state === 'missing' || status.state === 'broken';
   }
   render();
 }

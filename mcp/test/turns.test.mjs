@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { mock, test } from 'node:test';
 import { findSocket } from '../bin/turn-ended.mjs';
 import { Tab } from '../src/browsers.mjs';
@@ -236,7 +237,7 @@ test('the hook talks to its claude parent only, one line per known event, nothin
   const outerLines = [];
   const outer = net.createServer((socket) => socket.on('data', (chunk) => { outerLines.push(String(chunk)); socket.end('{}\n'); }));
   await new Promise((resolve) => outer.listen(turnSocketPath(process.pid), resolve));
-  const hook = new URL('../bin/turn-ended.mjs', import.meta.url).pathname;
+  const hook = fileURLToPath(new URL('../bin/turn-ended.mjs', import.meta.url));
   const script = `
     const net = require('node:net');
     const { execFile } = require('node:child_process');

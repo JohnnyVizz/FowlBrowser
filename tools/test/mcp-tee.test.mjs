@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { readJsonl } from '../rounds.mjs';
 
@@ -21,7 +22,7 @@ process.stdin.on('data', (d) => {
 
 test('mcp-tee passes every line through and logs elicitations with their answers', async () => {
   const log = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'tee-')), 'elicitations.jsonl');
-  const tee = spawn(process.execPath, [new URL('../mcp-tee.mjs', import.meta.url).pathname, log, process.execPath, '-e', fakeServer]);
+  const tee = spawn(process.execPath, [fileURLToPath(new URL('../mcp-tee.mjs', import.meta.url)), log, process.execPath, '-e', fakeServer]);
   const out = [];
   tee.stdout.setEncoding('utf8');
   const answered = new Promise((resolve) => tee.stdout.on('data', (d) => {

@@ -9,10 +9,13 @@ OMIT=""
 for arg in "$@"; do [ "$arg" = --lite ] && OMIT="--omit=optional"; done
 SRC=$(cd "$(dirname "$0")" && pwd)
 APP="$HOME/Library/Application Support/FowlBrowser"
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+# The user's own node comes first; Homebrew's folders are only a fallback for a minimal PATH.
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
 [ "$(uname)" = Darwin ] || { echo "FowlBrowser runs on macOS only." >&2; exit 1; }
-command -v node >/dev/null && node -e 'process.exit(parseInt(process.versions.node) < 22 ? 1 : 0)' ||
-  { echo "FowlBrowser needs Node.js 22 or newer (https://nodejs.org)." >&2; exit 1; }
+# 22.19 is what the locked Lighthouse needs (mcp/package.json engines says the same).
+command -v node >/dev/null && node -e 'const [a, b] = process.versions.node.split(".").map(Number); process.exit(a > 22 || (a === 22 && b >= 19) ? 0 : 1)' ||
+  { echo "FowlBrowser needs Node.js 22.19 or newer (https://nodejs.org)." >&2; exit 1; }
+NODE=$(command -v node)
 
 mkdir -p "$APP"
 rsync -a --delete --exclude test --exclude NOTES.md "$SRC/extension/" "$APP/extension/"
@@ -20,6 +23,15 @@ rsync -a --delete --exclude fowlbrowser-host --exclude NOTES.md "$SRC/host/" "$A
 rsync -a --delete --exclude node_modules --exclude test --exclude NOTES.md "$SRC/mcp/" "$APP/mcp/"
 rsync -a "$SRC/tools/fb.mjs" "$APP/fb.mjs"
 (cd "$APP/mcp" && npm ci --omit=dev $OMIT --no-audit --no-fund --silent)
+# Desktop apps and IDEs start MCP servers with a minimal PATH, so the installed launcher runs this node by its full
+# path (the repo's own launcher, for development, uses the node on PATH). Quoted for sh whatever the paths contain.
+LAUNCHER=$(cat <<'JS'
+const [file, node, server] = process.argv.slice(1);
+const sh = (s) => "'" + s.replaceAll("'", "'\\''") + "'";
+require('fs').writeFileSync(file, '#!/bin/sh\n# FowlBrowser MCP server launcher, written by install.sh.\nexec ' + sh(node) + ' ' + sh(server) + ' "$@"\n');
+JS
+)
+"$NODE" -e "$LAUNCHER" "$APP/mcp/bin/fowlbrowser-mcp" "$NODE" "$APP/mcp/src/server.mjs"
 HOST_OUT=$(sh "$APP/host/install.sh") # a failed registration stops the install here
 REGISTERED=$(printf '%s\n' "$HOST_OUT" | grep '^registered ' || true)
 echo "${REGISTERED:-No supported browser found (Chrome, Chromium, Helium, Brave, Edge, Arc or Vivaldi).}"
@@ -35,7 +47,7 @@ else
   echo "Claude Code: added MCP server fowlbrowser (user scope): $APP/mcp/bin/fowlbrowser-mcp"
   # Hooks: at each turn end the session's agent tabs close and claimed and kept tabs go back to the user; while a
   # subagent runs (SubagentStart until SubagentStop) turn ends leave everything alone.
-  node "$SRC/tools/claude-hooks.mjs" add "${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}" "$(command -v node)" "$APP/mcp/bin/turn-ended.mjs"
+  node "$SRC/tools/claude-hooks.mjs" add "${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}" "$NODE" "$APP/mcp/bin/turn-ended.mjs"
   echo "To opt out: sh uninstall.sh removes these, and FOWLBROWSER_SKIP_CLAUDE=1 sh install.sh skips them."
 fi
 

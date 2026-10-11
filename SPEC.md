@@ -29,7 +29,9 @@ extension/ MV3 service worker (plain JS ES modules, no build step) --> chrome.de
   socket, `<browser>-2.sock`, `-3`... Logs in `~/.fowlbrowser/logs/<browser>.log` (keep under 5 MB, rotate once).
 - Browser names: from the host's parent process path: contains `Helium` -> `helium`, `Google Chrome` -> `chrome`,
   `Chromium` -> `chromium`, `Brave` -> `brave`, `Microsoft Edge` -> `edge`, else lowercased app name.
-- Node: absolute path baked in at install time (`command -v node`, e.g. /opt/homebrew/bin/node).
+- Node: 22.19 or newer (the locked Lighthouse needs it; `mcp/package.json` engines). Its absolute path is baked in at
+  install time (`command -v node`, the user's PATH first and Homebrew's folders after it) into the host wrapper and the
+  installed MCP launcher, so a browser or a desktop app with a minimal PATH still starts them.
 
 ## Wire protocol
 
@@ -62,9 +64,12 @@ event. Once listening, the host sends the extension `{method:"host.listening", p
 e.g. chrome-2>}}`.
 
 Popup (`extension/popup.*`): status (Connected; Not set up when connectNative says the host is not found or
-forbidden, also a "!" badge on the toolbar icon; else Connecting…), the label field (saved to chrome.storage.local,
-no autofocus) with what agents see ("Chrome (Work)", else "Chrome (2)" for a `-2` socket), and "Set up an agent":
-Claude Code, Codex and Other tabs, each a setup prompt copied by a click. Setup starts open only when not set up.
+forbidden; Can't start when the host's port ends before it sent `host.listening` (its node or app folder moved), with
+the line "Can't start FowlBrowser's helper. Run install.sh again."; both with a "!" badge on the toolbar icon; else
+Connecting…), the label field (saved to chrome.storage.local, no autofocus) with what agents see ("Chrome (Work)",
+else "Chrome (2)" for a `-2` socket), and "Set up an agent": Claude Code, Codex and Other tabs, each a setup prompt
+copied by a click (`extension/setup-prompts.js`, written for a fresh Mac; `docs/agent-setup.md` quotes them word for
+word). Setup starts open only when not set up or the host can't start.
 Each profile runs its own extension and host, so profiles are separate browsers (`chrome`, `chrome-2`). The host answers every new socket client first with
 `{method:"host.hello", params:{browser, browserPath, browserPid, silentDebugger:<bool: parent command line contains
 --silent-debugger-extension-api>, extension:<last extension.hello params or null>}}`. A client that authenticates
@@ -298,8 +303,10 @@ to give a window back the tab that was active before an agent popup took its pla
 `allowed_origins: ["chrome-extension://lpfcnmmimgcillacmnibffooadlofjhj/"]`) into `NativeMessagingHosts/` of every
 installed browser's folder in `~/Library/Application Support` (Google Chrome, Chrome Beta and Canary, Chromium, Helium
 `net.imput.helium`, Brave, Microsoft Edge, Arc `Arc/User Data`, Vivaldi; folders that don't exist are skipped); `--remove`
-deletes those files again (`uninstall.sh`). `host/fowlbrowser-host` is a sh wrapper
-exec'ing the baked node path on `host/host.mjs`. The extension itself is loaded once per browser via "Load unpacked"
+deletes those files again, and the folders it created for them once empty (`uninstall.sh`). `host/fowlbrowser-host` is
+a sh wrapper exec'ing the baked node path on `host/host.mjs`; install.sh writes the installed `mcp/bin/fowlbrowser-mcp`
+the same way (the repo's copy, for development, runs the node on PATH). `FOWLBROWSER_SKIP_CLAUDE=1` keeps install.sh
+and uninstall.sh away from Claude Code's settings entirely (MCP server and hooks). The extension itself is loaded once per browser via "Load unpacked"
 (Developer mode) plus "Allow access to file URLs" (needed for uploads).
 Silence: launching a browser with `--silent-debugger-extension-api` hides Chrome's "started debugging this browser"
 bar and Helium's "Debugging started" chip.

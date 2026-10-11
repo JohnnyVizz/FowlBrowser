@@ -5,6 +5,7 @@
 // (fast page, and a page whose document answers 1.5 s late), so serialization shows up as a growing staircase.
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { fileURLToPath } from 'node:url';
 import { ensureSite, parseArgs, SITE, browsersFrom } from '../../test/lib.mjs';
 
 const args = parseArgs(process.argv.slice(2), { browser: 'both', runs: 10 });
@@ -12,7 +13,7 @@ const RUNS = Number(args.runs);
 const stopSite = await ensureSite();
 const client = new Client({ name: 'fowlbrowser-bench', version: '0' });
 await client.connect(new StdioClientTransport({
-  command: 'sh', args: [new URL('../bin/fowlbrowser-mcp', import.meta.url).pathname],
+  command: 'sh', args: [fileURLToPath(new URL('../bin/fowlbrowser-mcp', import.meta.url))],
   env: { ...process.env, FOWLBROWSER_LABEL: 'bench' }, stderr: 'inherit',
 }));
 

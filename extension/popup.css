@@ -69,8 +69,9 @@ h1 { margin: 0; font-size: 13px; font-weight: 600; }
 }
 
 .status[data-state="connected"] i { background: var(--green); opacity: 1; }
-.status[data-state="missing"] i { background: var(--orange); opacity: 1; }
-.status[data-state="missing"] { color: var(--text); }
+.status:is([data-state="missing"], [data-state="broken"]) i { background: var(--orange); opacity: 1; }
+.status:is([data-state="missing"], [data-state="broken"]) { color: var(--text); }
+.problem { margin-top: 12px; }
 
 .name { padding-top: 12px; }
 
@@ -167,6 +168,14 @@ details[open] summary { margin-bottom: 10px; }
   line-height: 1.45;
   overflow-wrap: anywhere;
   transition: background-color 150ms ease, transform 100ms ease;
+}
+
+/* The whole prompt is copied; six lines are enough to see what it does. */
+#prompt-text {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 6;
+  overflow: hidden;
 }
 
 .prompt:hover { background: var(--field-hover); }

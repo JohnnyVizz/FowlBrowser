@@ -4,12 +4,13 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { activityFlashes, agentSetup, agentTabs, codexServer, controlledBy, downloadsDiff, elicitationsOf, gradeCalls, gradeHandoff,
   gradeOutcome, gradeSite, gradeTabs, gradeTakeover, gradeViewport, parseTranscript, readJsonl, remoteServer, remoteTurnEnd, roundSettings } from '../rounds.mjs';
 
 const t = 1_760_000_000_000;
-const fixture = (name) => readJsonl(new URL(`./fixtures/${name}`, import.meta.url).pathname);
+const fixture = (name) => readJsonl(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url)));
 const codexEntry = {
   command: '/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node',
   args: ['/Users/u/.claude/tools/codex-cu/proxy.mjs', '/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node', '/x/cua-repl.mjs'],
@@ -235,7 +236,7 @@ test('elicitations: Codex\'s prompts are never answered for the user, every one 
   assert.equal(answer({ message: 'Allow Browser use to access http://127.0.0.1:5420?' }), 'decline');
   assert.equal(answer({ message: 'Allow download from http://127.0.0.1:5420/a.pdf?' }), 'decline');
   assert.equal(answer({ message: 'Allow Browser use to use your browsing history for this task?' }), 'decline');
-  const out = execFileSync(process.execPath, [new URL('../elicitation-hook.mjs', import.meta.url).pathname],
+  const out = execFileSync(process.execPath, [fileURLToPath(new URL('../elicitation-hook.mjs', import.meta.url))],
     { input: JSON.stringify({ hook_event_name: 'Elicitation', mcp_server_name: 'codex-cu', message: 'Allow Browser use to access http://127.0.0.1:5420?' }), encoding: 'utf8' });
   assert.deepEqual(JSON.parse(out), { hookSpecificOutput: { hookEventName: 'Elicitation', action: 'decline', content: {} } });
   const codex = { entry: codexEntry };

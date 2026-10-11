@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "FowlBrowser MCP server: lets Claude agents drive Chrome and Helium tabs in the background",
+  "description": "FowlBrowser MCP server: lets AI agents drive Chrome and Helium tabs in the background",
   "bin": {
     "fowlbrowser-mcp": "bin/fowlbrowser-mcp"
   },
@@ -13,7 +13,7 @@
     "smoke": "node test/smoke.mjs"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.19"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",

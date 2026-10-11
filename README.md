@@ -49,7 +49,7 @@ Ask in plain words. The agent picks the browser you name, or the one where you'r
 
 ## Install
 
-You need a Mac, [Node.js](https://nodejs.org) 22 or newer, Google Chrome or [Helium](https://helium.computer), and
+You need a Mac, [Node.js](https://nodejs.org) 22.19 or newer, Google Chrome or [Helium](https://helium.computer), and
 [Claude Code](https://claude.com/claude-code) or another AI agent that supports MCP. Chromium, Brave, Edge, Arc and
 Vivaldi work too, but are less tested.
 
@@ -93,8 +93,9 @@ pages; every other tool still works, and the `lighthouse` tool says how to add i
 ## Using other agents
 
 FowlBrowser works with any agent that supports MCP (Model Context Protocol, the standard way agents connect to tools).
-The easiest route: click the FowlBrowser icon, open **Set up an agent**, choose your agent and paste the prompt into
-it. Or set it up by hand:
+The easiest route: paste the prompt for your agent from [docs/agent-setup.md](docs/agent-setup.md) into it. It
+installs everything, even on a Mac with nothing set up yet. The same prompts are in the FowlBrowser popup under
+**Set up an agent**. Or set it up by hand:
 
 - **Claude Code:** done by the installer.
 - **Codex:**
@@ -187,6 +188,7 @@ by browser and id (`chrome:52`, `helium:1834`). There is no "current tab", so pa
 npm ci --prefix mcp && npm install --prefix test   # once
 node --test extension/test/ mcp/test/ tools/test/ test/forms/test/ test/demo/test/
 node tools/fake-extension.mjs --test
+node --test test/install/   # install.sh then uninstall.sh in a temp HOME (needs the network)
 ```
 
 - `node test/run.mjs --browser both` runs the end-to-end scenarios against a local test site in real browsers

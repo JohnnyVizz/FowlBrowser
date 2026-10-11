@@ -12,8 +12,9 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const hostPath = new URL('../host/host.mjs', import.meta.url).pathname;
+const hostPath = fileURLToPath(new URL('../host/host.mjs', import.meta.url));
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fowlbrowser-'));
 // Hosts whose extension never says hello live here, so they don't hold node-2.sock for the rest of the test.
 const helloDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fowlbrowser-hello-'));

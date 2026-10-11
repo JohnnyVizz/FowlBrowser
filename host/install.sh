@@ -25,7 +25,13 @@ const browsers = [
 if (mode === '--remove') {
   for (const [name, dir] of browsers) {
     const file = path.join(support, dir, 'NativeMessagingHosts', 'com.fowl.browser.json');
-    if (fs.existsSync(file)) { fs.rmSync(file); console.log('removed ' + name + ': ' + file); }
+    if (!fs.existsSync(file)) continue;
+    fs.rmSync(file);
+    console.log('removed ' + name + ': ' + file);
+    // Folders the install created for this file go too, once empty (a browser never opened had none).
+    for (let d = path.dirname(file); d !== support; d = path.dirname(d)) {
+      try { fs.rmdirSync(d); } catch { break; }
+    }
   }
   process.exit(0);
 }

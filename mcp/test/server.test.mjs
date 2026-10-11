@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -67,7 +68,7 @@ await new Promise((resolve) => broken.listen(path.join(dir, 'chrome.sock'), reso
 const client = new Client({ name: 'unit', version: '0' });
 await client.connect(new StdioClientTransport({
   command: process.execPath,
-  args: [new URL('../src/server.mjs', import.meta.url).pathname],
+  args: [fileURLToPath(new URL('../src/server.mjs', import.meta.url))],
   env: { ...process.env, FOWLBROWSER_DIR: dir, FOWLBROWSER_LABEL: 'unit' },
 }));
 const call = async (name, args = {}) => (await client.callTool({ name, arguments: args })).content[0].text;

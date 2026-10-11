@@ -8,9 +8,10 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((acc, a, i, all) => (a.startsWith('--') ? [...acc, [a.slice(2), all[i + 1]?.startsWith('--') ? true : all[i + 1] ?? true]] : acc), []));
-const ROOT = new URL('..', import.meta.url).pathname;
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const DIR = args.dir || path.join(os.homedir(), '.fowlbrowser');
 const CONCURRENCY = Number(args.concurrency || 10);
 let tasks = JSON.parse(fs.readFileSync(args.tasks || path.join(ROOT, 'tools/agents/tasks.json'), 'utf8'));
