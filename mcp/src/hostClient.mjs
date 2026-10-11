@@ -24,7 +24,9 @@ export class HostClient extends EventEmitter {
     this.closed = false;
     this._pending = new Map();
     this._nextId = 1;
-    this._buffer = Buffer.alloc(0);
+    this._chunks = []; // socket data not yet a whole frame, and how much of it there is
+    this._chunkBytes = 0;
+    this._frameLength = null;
     this._inbox = [];
     this._draining = false;
   }
@@ -83,15 +85,30 @@ export class HostClient extends EventEmitter {
     this._socket.write(Buffer.concat([header, body]));
   }
 
+  // Frames are assembled only once whole: a multi-megabyte message (a trace's events) arrives in hundreds of small
+  // chunks, and joining the buffer on each would copy it again and again (the host drops a client whose backlog grows
+  // past 64 MB while it is busy copying).
   _onData(chunk) {
-    this._buffer = this._buffer.length ? Buffer.concat([this._buffer, chunk]) : chunk;
-    while (this._buffer.length >= 4) {
-      const length = this._buffer.readUInt32LE(0);
-      if (this._buffer.length < 4 + length) break;
-      this._inbox.push(JSON.parse(this._buffer.subarray(4, 4 + length).toString('utf8')));
-      this._buffer = this._buffer.subarray(4 + length);
+    this._chunks.push(chunk);
+    this._chunkBytes += chunk.length;
+    for (;;) {
+      if (this._frameLength === null) {
+        if (this._chunkBytes < 4) break;
+        this._frameLength = this._take(4).readUInt32LE(0);
+      }
+      if (this._chunkBytes < this._frameLength) break;
+      this._inbox.push(JSON.parse(this._take(this._frameLength).toString('utf8')));
+      this._frameLength = null;
     }
     this._drain();
+  }
+
+  // The next n bytes of the chunks, joined once; what is left stays queued.
+  _take(n) {
+    const joined = this._chunks.length === 1 ? this._chunks[0] : Buffer.concat(this._chunks);
+    this._chunks = joined.length > n ? [joined.subarray(n)] : [];
+    this._chunkBytes = joined.length - n;
+    return joined.subarray(0, n);
   }
 
   // One message per tick, in arrival order. A CDP reply reaches Playwright through a short promise chain while

@@ -43,3 +43,37 @@ test('a rename between host.hello and extension.initialized is not lost', async 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a frame of several megabytes arriving in small chunks, then two frames in one chunk, come through whole and fast', async () => {
+  const big = { method: 'chrome.debugger.onEvent', params: [{ tabId: 1 }, 'Tracing.dataCollected', { value: 'x'.repeat(6 * 1024 * 1024) }] };
+  const small = [{ method: 'tabs.changed', params: [] }, { method: 'tabs.changed', params: [1] }];
+  let socketIn;
+  const server = net.createServer((socket) => {
+    socketIn = socket;
+    socket.on('data', (chunk) => {
+      const message = JSON.parse(chunk.subarray(4).toString());
+      if (message.method === 'host.auth') socket.write(frame({ method: 'host.hello', params: { browser: 'chrome', extension: null } }));
+      else if (message.method === 'client.hello') { socket.write(frame({ id: message.id, result: { ok: true } })); socket.write(frame({ method: 'extension.initialized', params: [] })); }
+    });
+  });
+  const sock = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'fb-hostclient-big-')), 'big.sock');
+  await new Promise((resolve) => server.listen(sock, resolve));
+  const client = new HostClient(sock);
+  await client.connect('unit');
+  const got = [];
+  client.on('event', (method, params) => got.push({ method, params }));
+  try {
+    const started = Date.now();
+    const whole = frame(big);
+    for (let at = 0; at < whole.length; at += 16 * 1024) socketIn.write(whole.subarray(at, at + 16 * 1024));
+    socketIn.write(Buffer.concat(small.map(frame)));
+    for (let i = 0; i < 200 && got.length < 3; i++) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(got.length, 3, `events: ${got.map((e) => e.method).join(', ')}`);
+    assert.equal(got[0].params[2].value.length, 6 * 1024 * 1024);
+    assert.deepEqual(got.slice(1).map((e) => e.params), [[], [1]]);
+    assert.ok(Date.now() - started < 3000, `took ${Date.now() - started} ms`);
+  } finally {
+    client.close();
+    server.close();
+  }
+});

@@ -153,7 +153,16 @@ async function run(tab, lh, { device, mode, categories }) {
     const url = await page.url();
     await root.send('Network.enable');
     await root.send('Network.setCacheDisabled', { cacheDisabled: true });
-    const result = mode === 'navigation' ? await lh.navigation(page, url, { flags, config }) : await lh.snapshot(page, { flags, config });
+    // Lighthouse waits for trace and page events that never come once the browser's connection is gone.
+    let onClose;
+    const closed = new Promise((_, reject) => { onClose = () => reject(new Error('The browser\'s FowlBrowser connection closed during the audit (the tab is no longer controlled).')); tab.browser.host.once('close', onClose); });
+    closed.catch(() => {});
+    let result;
+    try {
+      result = await Promise.race([mode === 'navigation' ? lh.navigation(page, url, { flags, config }) : lh.snapshot(page, { flags, config }), closed]);
+    } finally {
+      tab.browser.host.off('close', onClose);
+    }
     return { lhr: result.lhr, warnings };
   } catch (error) {
     failure = error;
