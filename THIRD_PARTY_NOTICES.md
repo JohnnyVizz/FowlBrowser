@@ -12,8 +12,9 @@ package under the same license.
 
 ## Cua
 
-The agent cursor in `mcp/src/cursor/overlay.js` follows the default cursor theme and `signature_arc` motion of Cua
-(https://github.com/trycua/cua), including its arrow shape. Cua is licensed under the MIT License:
+The agent cursor's travel in `mcp/src/cursor/overlay.js` (a curved, Fitts-timed path with a small follow-through) is
+adapted from the `signature_arc` motion of Cua (https://github.com/trycua/cua). The cursor's look is FowlBrowser's own.
+Cua is licensed under the MIT License:
 
 ```
 MIT License

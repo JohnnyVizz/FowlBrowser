@@ -4,8 +4,9 @@
 //                                           (for a fresh document), w,h the target's box (bigger targets are quicker),
 //                                           until the wall-clock ms by which it must arrive
 //   land(x, y, opts) -> changed             the tip on (x, y) at full opacity at once (travel and appear fade cut short)
-//   cue(kind, opts) / cueEnd()             action cue beside the tip: observe, scroll, text, key, navigate, drag, transfer
-//   click()                                squish, ripple and click burst at the current point
+//   cue(kind, opts) / cueEnd()             the action as a word in the label: observe, scroll, text, key, navigate, drag,
+//                                          transfer ("Claude · typing")
+//   click()                                press and ring at the current point
 //   follow(on, record)                     while on, travels to and clicks on clicks a script makes (an agent's evaluate);
 //                                          record: also keep them for drainClicks
 //   hide()                                 exit animation, then the host is removed; resolves when gone
@@ -15,62 +16,42 @@
 (() => {
   if (globalThis.__fbCursor) return;
 
-  // Cua Driver's default cursor (MIT, github.com/trycua/cua: cursor-overlay/assets/build_default_theme.py) in its
-  // 128-unit canvas, shown at 32 px instead of Cua's 42, with its signature_arc motion (cua-cursor-motion).
-  const S = 32 / 128;
-  const K = 32 / 42; // Cua's point sizes (effects, badge) at our size
-  const TIP = { x: 46, y: 32 }; // the hotspot: the arrow's visual tip, in canvas units
-  const ARROW = 'M55 30C48 28 42 33 43 41L64 98C67 106 73 106 77 99L86 79C88 75 91 72 95 70L108 63C115 59 114 53 107 50Z';
-  const GLOW = [[44, 0.02], [36, 0.024], [29, 0.03], [23, 0.038], [18, 0.048], [14, 0.06], [10, 0.075], [7, 0.095]];
-  const CUE_GLOW = [[13, 0.024], [9, 0.031], [6, 0.04], [3, 0.052]];
-  const BLUE = [94, 192, 232];
-  const PALETTE = [[178, 132, 255], [247, 132, 170], [96, 218, 174], [244, 178, 66], [76, 204, 224], [221, 113, 236],
-    [232, 82, 98], [184, 220, 54], [80, 126, 236]];
-  const LOTTIE = 'cubic-bezier(0.2, 0.75, 0.25, 1)'; // the theme's keyframe easing
+  // FowlBrowser's pointer: a rounded arrow filled with the session's colour, a white rim and a soft shadow. Drawn in
+  // a 24-unit box with the tip's corner at 0,0 and shown at SCALE px per unit; TIP is the rounded tip's apex, which
+  // sits on the target point.
+  const POINTER = 'M1.52 1.59Q0 0 0 2.2L0 13.6Q0 17 2.76 15.01L3.21 14.69Q5 13.4 7.19 13.15L8.62 12.99Q12 12.6 9.66 10.14Z';
+  const SCALE = 1.2;
+  const TIP = { x: 0.38, y: 0.95 };
+  const BLUE = [10, 132, 255];
+  const PALETTE = [[255, 159, 10], [48, 209, 88], [191, 90, 242], [255, 55, 95], [64, 200, 224], [94, 92, 230],
+    [255, 69, 58], [172, 142, 104]];
   const CURVE = 'cubic-bezier(0.23, 1, 0.32, 1)';
-  const IDLE_MS = 15_000; // Cua's agent cursor idle timeout
-  const TIMING = 0.9; // Cua's signature_arc uses 1.1x Fitts; a little quicker here, agents wait for arrival
+  const IDLE_MS = 15_000; // the cursor fades this long after the last action
+  const TIMING = 0.9; // Fitts' law durations, a little quick: agents wait for arrival
   const MAX_MOVE_MS = 850;
   const MIN_MOVE_MS = 120; // less time left than this before the action: the cursor appears at the target
-  const TIP_ANGLE = -0.75 * Math.PI; // where the tip points at rest (up and to the left)
-  const ANCHOR = 16 * K; // the arrow's body sits this far behind the tip, along the heading
-  const MIN_CUE_MS = 600; // a cue for a quick action stays long enough to be seen
+  const TIP_ANGLE = -0.63 * Math.PI; // where the tip points at rest (up and a little to the left)
+  const LEAN = 0.5; // at most this far (radians) the tip leans into the direction of travel
+  const BADGE = { x: 12 * SCALE + 2, y: 18 * SCALE + 2 }; // the label, from the tip
+  const MIN_CUE_MS = 600; // an action word for a quick action stays long enough to be read
+  const ONE_SHOT_MS = 1200; // a key press or a page load: its word shows this long
   const reduced = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-  // Action cues of the same theme (paths in canvas units around the layer anchor 64,64; keyframes [frame, value] at
-  // 30 fps). loop: repeats while the action runs (Cua's loop and held cues); otherwise plays once.
-  const CUES = {
-    click: { frames: 20, paths: ['M35 20L34 11', 'M27 25L19 19', 'M25 34L15 34'], at: [[0, [74, 67]]],
-      scale: [[0, 1.1], [8, 1.3], [20, 1.5]], opacity: [[0, 0], [4, 1], [11, 1], [20, 0]] },
-    observe: { frames: 48, loop: true, paths: ['M38 28C27 29 20 38 20 49', 'M42 19C23 19 11 33 11 51'], at: [[0, [72, 54]]],
-      scale: [[0, 0.88], [24, 1], [48, 1.08]], opacity: [[0, 0], [7, 1], [34, 1], [44, 0], [48, 0]] },
-    scroll: { frames: 48, loop: true, paths: ['M23 31L31 22L39 31', 'M23 49L31 58L39 49'],
-      at: [[0, [59, 68]], [24, [59, 60]], [48, [59, 68]]], opacity: [[0, 0.42], [24, 1], [48, 0.42]] },
-    text: { frames: 48, loop: true, linear: true, paths: ['M31 22L31 58', 'M24 22L38 22', 'M24 58L38 58'], at: [[0, [60, 64]]],
-      opacity: [[0, 1], [16, 1], [17, 0.18], [30, 0.18], [31, 1], [48, 1]] },
-    key: { frames: 48, width: 3.5,
-      paths: ['M20 25H36A6 6 0 0 1 42 31V47A6 6 0 0 1 36 53H20A6 6 0 0 1 14 47V31A6 6 0 0 1 20 25Z', 'M23 32L23 46', 'M24 39L33 32', 'M25 39L34 46'],
-      at: [[0, [55, 64]], [8, [55, 67]], [17, [55, 63]], [26, [55, 64]], [48, [55, 64]]],
-      scale: [[0, 1], [8, 0.92], [17, 1.03], [26, 1], [48, 1]], opacity: [[0, 0], [4, 1], [30, 1], [42, 0], [48, 0]] },
-    navigate: { frames: 48, paths: ['M15 29L25 40L15 51', 'M29 29L39 40L29 51'],
-      at: [[0, [54, 64]], [18, [59, 64]], [30, [63, 64]], [48, [63, 64]]], opacity: [[0, 0], [8, 1], [28, 1], [42, 0], [48, 0]] },
-    drag: { frames: 48, loop: true, paths: ['M28 38L16 35', 'M26 48L12 45'],
-      at: [[0, [64, 64]], [8, [64, 64]], [30, [71, 67]], [40, [71, 67]], [48, [64, 64]]], opacity: [[0, 0.2], [15, 1], [36, 1], [48, 0.2]] },
-    transfer: { frames: 48, loop: true, paths: ['M22 50L22 20L14 28L22 20L30 28', 'M37 28L37 58L29 50L37 58L45 50'],
-      at: [[0, [55, 70]], [24, [55, 58]], [48, [55, 70]]], opacity: [[0, 0.38], [24, 1], [48, 0.38]] },
-  };
+  // Actions shown as a word after the label. Held words stay while the action runs; the others show for a moment.
+  const VERBS = { observe: 'reading', scroll: 'scrolling', text: 'typing', key: 'pressing keys', navigate: 'loading',
+    drag: 'dragging', transfer: 'uploading' };
+  const HELD = new Set(['observe', 'scroll', 'text', 'drag', 'transfer']);
 
-  // Cua's session colours: the default cursor is Cua blue, other labels hash into its palette.
+  // Session colours: "Claude" (the default label) is blue, other labels hash into the palette, so parallel agents
+  // are told apart. Labels on light fills are written in ink.
   function fillFor(label) {
     if (!label || label === 'Claude') return BLUE;
-    const suffix = label.split(/[-_.]/).pop();
-    if (/^\d+$/.test(suffix) && Number(suffix) > 0) return PALETTE[(Number(suffix) - 1) % PALETTE.length];
-    if (/^[a-z]$/i.test(suffix)) return PALETTE[(suffix.toLowerCase().charCodeAt(0) - 97) % PALETTE.length];
     let hash = 2166136261;
     for (const ch of label) hash = Math.imul(hash ^ ch.codePointAt(0), 16777619) >>> 0;
     return PALETTE[hash % PALETTE.length];
   }
-  const mix = (base, fill, weight) => base.map((c, i) => Math.round(c * (1 - weight) + fill[i] * weight));
+  const luminance = (c) => c.map((v) => { const s = v / 255; return s <= 0.04045 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4; })
+    .reduce((sum, v, i) => sum + v * [0.2126, 0.7152, 0.0722][i], 0);
   const rgb = (c, a = 1) => `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${a})`;
 
   const STYLE = `
@@ -78,21 +59,17 @@
       z-index: 2147483647 !important; contain: strict !important; display: block !important; }
     @media print { :host { display: none !important; } }
     .cursor, .fx { position: absolute; left: 0; top: 0; will-change: transform; }
-    .body, .float, .art, .press { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+    .body, .art, .press { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
     svg { position: absolute; overflow: visible; }
-    .theme { left: ${-TIP.x * S}px; top: ${-TIP.y * S}px; width: ${128 * S}px; height: ${128 * S}px; }
-    .glow path { fill: none; stroke: var(--fill); stroke-linejoin: round; }
-    .arrow { fill: var(--fill); stroke: #fff; stroke-width: 5; stroke-linejoin: round; }
-    .cue path { fill: none; stroke-linecap: round; stroke-linejoin: round; }
-    .cue .tint { stroke: var(--fill); }
-    .cue .rim { stroke: #fff; }
-    .speed { position: absolute; left: 0; top: 0; border-radius: 50%; opacity: 0; }
-    .badge { position: absolute; left: 0; top: 0; height: 20px; padding: 0 8px; box-sizing: border-box; border-radius: 10px;
-      font: 500 11px/18px -apple-system, BlinkMacSystemFont, system-ui, sans-serif; color: #fff; letter-spacing: 0.01em;
-      max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 1px solid var(--rim);
-      background: linear-gradient(to bottom right, var(--pill0) 0%, var(--pill1) 46%, var(--pill2) 100%);
-      box-shadow: 0 1px 6px rgba(0, 0, 0, 0.2), 0 0 8px var(--halo); }
-    .badge:empty { display: none; }`;
+    .pointer { left: ${(-4 - TIP.x) * SCALE}px; top: ${(-4 - TIP.y) * SCALE}px; width: ${24 * SCALE}px; height: ${28 * SCALE}px;
+      filter: drop-shadow(0 1px 1.2px rgba(0, 0, 0, 0.32)); }
+    .arrow { fill: var(--fill); stroke: #fff; stroke-width: ${1.7 / SCALE}; stroke-linejoin: round; paint-order: stroke; }
+    .edge { fill: none; stroke: #131110; stroke-opacity: 0.3; stroke-width: ${0.45 / SCALE}; }
+    .badge { position: absolute; left: 0; top: 0; height: 17px; padding: 0 7px; box-sizing: border-box; border-radius: 8.5px;
+      font: 600 10.5px/17px -apple-system, BlinkMacSystemFont, system-ui, sans-serif; color: var(--text); letter-spacing: 0.01em;
+      max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: var(--fill);
+      box-shadow: 0 0 0 1.5px #fff, 0 1px 3px rgba(0, 0, 0, 0.3); }
+    .verb { font-weight: 500; opacity: 0.8; }`;
 
   let host = null; // the <fowlbrowser-cursor> element while shown
   let parts = null;
@@ -104,11 +81,11 @@
   let badgeWidth = 0;
   let pos = { x: 0, y: 0 }; // where the tip is drawn
   let rot = 0; // the arrow's turn away from its rest pose, radians
-  let travel = null; // the planned move: Cua bezier, arc-length table, duration
+  let travel = null; // the planned move: bezier, arc-length table, duration
   let frame = 0;
   let frameAt = 0;
   let waiting = []; // resolvers of move() promises for the current target
-  let cueing = null; // { el, kind, started, ending }
+  let cueing = null; // { kind, started, ending }: the action word shown
   let following = 0; // follow(true) calls not yet ended (script clicks shown)
   let scriptClicks = []; // script clicks shown in follow mode, until the server drains them (record mode)
   let keepClicks = false; // record mode: the last follow(true) asked to keep them
@@ -149,30 +126,20 @@
       root.append(node('style', {}, [STYLE]), captureStyle = node('style'));
     }
     const div = (name, children = []) => node('div', { class: name }, children);
-    const cues = svgNode('g', { class: 'cues' });
-    const theme = svgNode('svg', { class: 'theme', viewBox: '0 0 128 128' }, [
-      svgNode('g', { class: 'glow' }, GLOW.map(([w, o]) => svgNode('path', { d: ARROW, 'stroke-width': w, 'stroke-opacity': o }))),
-      svgNode('path', { class: 'arrow', d: ARROW }),
-      cues,
+    const pointer = svgNode('svg', { class: 'pointer', viewBox: '-4 -4 24 28' }, [
+      svgNode('path', { class: 'arrow', d: POINTER }),
+      svgNode('path', { class: 'edge', d: POINTER }),
     ]);
-    const press = div('press', [theme]);
+    const press = div('press', [pointer]);
     const art = div('art', [press]);
-    const float = div('float', [art]);
-    const speed = div('speed');
-    const badge = div('badge');
-    const body = div('body', [speed, float, badge]);
+    const name = node('span');
+    const verb = node('span', { class: 'verb' });
+    const badge = div('badge', [name, verb]);
+    const body = div('body', [art, badge]);
     const cursor = div('cursor', [body]);
     const fx = div('fx');
     root.append(fx, cursor);
-    parts = { root, cursor, body, float, art, press, cues, speed, badge, fx, hiding, captureStyle };
-    if (!reduced()) {
-      // Cua's shared float: a slow 4 s drift of a few px and 2.5 degrees around the tip.
-      const drift = Array.from({ length: 17 }, (_, i) => {
-        const a = (i / 16) * 2 * Math.PI;
-        return { transform: `translate(${(Math.sin(a) * 5 * S).toFixed(3)}px, ${((6 * Math.cos(a) - 5) * S).toFixed(3)}px) rotate(${(2.5 * Math.cos(a)).toFixed(3)}deg)` };
-      });
-      parts.float.animate(drift, { duration: 4000, iterations: Infinity });
-    }
+    parts = { root, cursor, body, art, press, name, verb, badge, fx, hiding, captureStyle };
     attach();
     setLabel(label, true); // after attaching, so the badge can be measured
   }
@@ -227,14 +194,19 @@
     const fill = fillFor(label);
     const style = parts.cursor.style; // inside the closed root, never on the page-visible host
     style.setProperty('--fill', rgb(fill));
-    style.setProperty('--pill0', rgb(mix([94, 151, 178], fill, 0.66), 0.925));
-    style.setProperty('--pill1', rgb(mix([43, 92, 119], fill, 0.52), 0.937));
-    style.setProperty('--pill2', rgb(mix([13, 27, 38], fill, 0.26), 0.96));
-    style.setProperty('--rim', rgb(mix([255, 255, 255], fill, 0.55), 0.75));
-    style.setProperty('--halo', rgb(fill, 0.25));
-    parts.effect = fill.map((c) => Math.round(c + (255 - c) * 0.45)); // Cua's effect colour: the fill lifted to white
-    parts.badge.textContent = label;
+    style.setProperty('--text', luminance(fill) > 0.4 ? '#131110' : '#fff');
+    parts.fill = fill;
+    parts.name.textContent = label;
+    parts.badge.style.display = label ? '' : 'none';
     badgeWidth = parts.badge.offsetWidth;
+  }
+
+  // The action word after the label ("Claude · typing"); '' takes it away.
+  function setVerb(text) {
+    if (!parts) return;
+    parts.verb.textContent = text ? ` · ${text}` : '';
+    badgeWidth = parts.badge.offsetWidth;
+    render();
   }
 
   function viewport() {
@@ -249,30 +221,16 @@
     return { x: Math.min(Math.max(point.x, 2), Math.max(w - 2, 2)), y: Math.min(Math.max(point.y, 2), Math.max(h - 2, 2)) };
   }
 
-  function render(speed = 0, vx = 0, vy = 0) {
+  function render() {
     last = { x: pos.x, y: pos.y };
     if (!parts) return;
     parts.cursor.style.transform = `translate3d(${pos.x}px, ${pos.y}px, 0)`;
     parts.art.style.transform = rot ? `rotate(${rot}rad)` : '';
-    // The label sits under the arrow's body, kept inside the viewport.
+    // The label sits below and to the right of the pointer, kept inside the viewport.
     const { w, h } = viewport();
-    const bx = Math.min(Math.max(ANCHOR * Math.SQRT1_2 - badgeWidth / 2, 2 - pos.x), w - 2 - badgeWidth - pos.x);
-    const by = Math.min(ANCHOR * Math.SQRT1_2 + 19, h - 22 - pos.y);
+    const bx = Math.min(BADGE.x, w - 2 - badgeWidth - pos.x);
+    const by = Math.min(BADGE.y, h - 19 - pos.y);
     parts.badge.style.transform = `translate(${bx}px, ${by}px)`;
-    // Cua's speed glow: a soft light behind the moving arrow, stronger and wider the faster it goes.
-    const alpha = Math.min(speed * 0.00014, 0.42);
-    if (alpha <= 0.02) {
-      parts.speed.style.opacity = '0';
-      return;
-    }
-    const heading = Math.PI / 4 + rot;
-    const back = Math.min(speed * 0.009, 18) * K;
-    const r = 30 * K * (1 + Math.min(speed * 0.00024, 0.44));
-    const cx = Math.cos(heading) * ANCHOR - (vx / speed) * back;
-    const cy = Math.sin(heading) * ANCHOR - (vy / speed) * back;
-    Object.assign(parts.speed.style, { opacity: String(alpha), width: `${2 * r}px`, height: `${2 * r}px`,
-      transform: `translate(${cx - r}px, ${cy - r}px)`,
-      background: `radial-gradient(closest-side, ${rgb(parts.effect, 1)}, ${rgb(parts.effect, 0)})` });
   }
 
   // Current opacity and scale of an element, so a new animation starts where the running one is.
@@ -295,7 +253,7 @@
     // An action still running (its cue loops until the server ends it) is no idle time: a long wait_for or
     // evaluate keeps the cursor up.
     // (A cue whose end never arrived stops counting as running after 2 minutes.)
-    idleTimer = setTimeout(() => (cueing && !cueing.ending && CUES[cueing.kind]?.loop && performance.now() - cueing.started < 120_000
+    idleTimer = setTimeout(() => (cueing && !cueing.ending && HELD.has(cueing.kind) && performance.now() - cueing.started < 120_000
       ? resetIdle() : hide()), IDLE_MS);
   }
 
@@ -306,7 +264,7 @@
   }
 
   // Shows the cursor (first call, or after it faded): at the last known point, else where the server last had it,
-  // else Cua's rest point (58% x, 55% y of the viewport).
+  // else a little right of and below the viewport's centre.
   function ensure(opts = {}) {
     let fresh = false;
     if (!host) {
@@ -331,7 +289,7 @@
     resetIdle();
   }
 
-  // --- travel (Cua signature_arc) ---
+  // --- travel (a curved, Fitts-timed path, after Cua's signature_arc; MIT, see THIRD_PARTY_NOTICES.md) ---
 
   const minJerk = (t) => t * t * t * (10 - 15 * t + 6 * t * t);
   // A smooth bump that peaks at `at`: the follow-through past the target, then back.
@@ -346,7 +304,7 @@
     return r;
   };
 
-  // Cua's arc: a cubic Bezier bending upward for horizontal moves, timed by Fitts' law, walked by arc length.
+  // A cubic Bezier bending upward for horizontal moves, timed by Fitts' law, walked by arc length.
   function plan(to, box, left) {
     const from = { ...pos };
     const dx = to.x - from.x;
@@ -380,7 +338,7 @@
     const width = Math.max(Math.min(box?.w ?? 24, box?.h ?? 24), 4);
     const ms = Math.min(Math.min(Math.max(150 + 120 * Math.log2(d / width + 1), 300), 1000) * TIMING, MAX_MOVE_MS, left);
     return {
-      to, ms, over: Math.min(0.018, (8 * K) / d), start: performance.now(), arrived: false,
+      to, ms, over: Math.min(0.018, 6 / d), start: performance.now(), arrived: false,
       // The point `frac` of the way along by distance; past 1 it carries on along the end tangent.
       at(frac) {
         if (frac > 1) return { x: to.x + ((to.x - near.x) / tail) * (frac - 1) * total, y: to.y + ((to.y - near.y) / tail) * (frac - 1) * total };
@@ -420,7 +378,7 @@
       const profile = (t) => m.at(minJerk(t) + m.over * bump(t));
       const t = Math.min((now - m.start) / m.ms, 1);
       pos = profile(t);
-      // Velocity from the neighbouring samples (about 17 ms either side), as Cua does for the heading.
+      // Velocity from the neighbouring samples (about 17 ms either side), for the lean.
       const h = 1000 / 60 / m.ms;
       const t0 = Math.max(t - h, 0);
       const t1 = Math.min(t + h, 1);
@@ -442,11 +400,12 @@
         settle(true);
       }
     }
-    // The tip leads along the direction of travel once it moves fast enough, and turns back to rest after.
-    const want = speed > 0 ? wrap(Math.atan2(vy, vx) - TIP_ANGLE) * Math.min(Math.max((speed - 40) / 260, 0), 1) : 0;
+    // The tip leans a little into the direction of travel once it moves fast enough, and settles back after.
+    const toward = Math.min(Math.max(wrap(Math.atan2(vy, vx) - TIP_ANGLE), -LEAN), LEAN);
+    const want = speed > 0 ? toward * Math.min(Math.max((speed - 40) / 260, 0), 1) : 0;
     rot += wrap(want - rot) * (1 - Math.exp(-dt * 22));
     if (!travel && Math.abs(rot) < 0.002) rot = 0;
-    render(speed, vx, vy);
+    render();
     frame = travel || rot ? requestAnimationFrame(tick) : 0;
   }
 
@@ -465,64 +424,29 @@
       .then(() => true, () => true);
   }
 
-  // --- cues ---
+  // --- action words ---
 
-  function track(pairs, frames, linear, css) {
-    const keys = pairs.map(([f, v]) => ({ offset: f / frames, easing: linear ? 'linear' : LOTTIE, ...css(v) }));
-    if (keys[0].offset > 0) keys.unshift({ ...keys[0], offset: 0 });
-    if (keys[keys.length - 1].offset < 1) keys.push({ ...keys[keys.length - 1], offset: 1 });
-    return keys;
-  }
-
+  // The word goes once the action has shown long enough to be read (at once when another action takes over).
   function endCue(fast) {
     const c = cueing;
     if (!c || c.ending) return;
     c.ending = true;
     const wait = fast ? 0 : Math.max(0, MIN_CUE_MS - (performance.now() - c.started));
     setTimeout(() => {
-      const fade = c.el.animate([{ opacity: 1 }, { opacity: 0 }], { duration: fast ? 120 : 200, easing: CURVE, fill: 'forwards' });
-      fade.finished.catch(() => {}).then(() => {
-        c.el.remove();
-        if (cueing === c) cueing = null;
-      });
+      if (cueing !== c) return;
+      cueing = null;
+      setVerb('');
     }, wait);
   }
 
   function playCue(kind) {
-    const spec = CUES[kind];
-    if (!spec || !parts) return;
-    if (spec.loop && cueing?.kind === kind && !cueing.ending) return; // already playing
-    endCue(true);
-    const width = (spec.width ?? 4) * 1.4; // bolder than Cua's, so the glyphs still read at our smaller size
-    const d = spec.paths.join('');
-    const layers = [
-      ...CUE_GLOW.map(([e, o]) => svgNode('path', { class: 'tint', d, 'stroke-width': width + e, 'stroke-opacity': o })),
-      svgNode('path', { class: 'rim', d, 'stroke-width': width + 1.5 }),
-      svgNode('path', { class: 'tint', d, 'stroke-width': Math.max(width - 1, 1.5) }),
-    ];
-    const grow = svgNode('g', { class: 'grow' }, [svgNode('g', { transform: 'translate(-64 -64)' }, layers)]);
-    const at = svgNode('g', { class: 'at' }, [grow]);
-    const el = svgNode('g', { class: 'cue' }, [at]);
-    parts.cues.appendChild(el);
-    const c = { el, kind, started: performance.now(), ending: false };
+    const verb = VERBS[kind];
+    if (!verb || !parts) return;
+    if (cueing?.kind === kind && !cueing.ending) return; // already showing
+    const c = { kind, started: performance.now(), ending: false };
     cueing = c;
-    const place = ([x, y]) => ({ transform: `translate(${x}px, ${y}px)` });
-    if (reduced()) {
-      at.style.transform = place(spec.at[0][1]).transform;
-      if (!spec.loop) setTimeout(() => cueing === c && endCue(false), MIN_CUE_MS);
-      return;
-    }
-    const timing = { duration: (spec.frames / 30) * 1000, iterations: spec.loop ? Infinity : 1, fill: 'forwards' };
-    if (spec.at.length > 1) at.animate(track(spec.at, spec.frames, spec.linear, place), timing);
-    else at.style.transform = place(spec.at[0][1]).transform;
-    if (spec.scale) grow.animate(track(spec.scale, spec.frames, spec.linear, (s) => ({ transform: `scale(${s})` })), timing);
-    const shown = at.animate(track(spec.opacity, spec.frames, spec.linear, (o) => ({ opacity: o })), timing);
-    if (!spec.loop) {
-      shown.finished.catch(() => {}).then(() => {
-        el.remove();
-        if (cueing === c) cueing = null;
-      });
-    }
+    setVerb(verb);
+    if (!HELD.has(kind)) setTimeout(() => cueing === c && endCue(false), ONE_SHOT_MS);
   }
 
   // --- API ---
@@ -597,7 +521,7 @@
   }
 
   function cueEnd() {
-    if (cueing && CUES[cueing.kind]?.loop) endCue(false);
+    if (cueing && HELD.has(cueing.kind)) endCue(false);
   }
 
   // x, y: where the click happened. A cursor that hasn't got there yet (a late or slow move) jumps there first, so
@@ -609,22 +533,20 @@
       const at = inside({ x, y });
       if (Math.hypot(at.x - pos.x, at.y - pos.y) > 12) snap(at); // (a few px off is the follow-through settling)
     }
-    playCue('click');
     if (reduced()) return;
-    // Cua's click: the arrow squishes 12% around its tip, and a ring spreads from the point.
+    // The pointer presses in around its tip, and a ring of the session's colour spreads from the point.
     for (const a of parts.press.getAnimations()) a.cancel();
     parts.press.animate([
       { transform: 'scale(1)', easing: 'ease-out' },
-      { transform: 'scale(0.88)', offset: 50 / 165 },
-      { transform: 'scale(0.88)', offset: 90 / 165, easing: 'cubic-bezier(0.37, 0, 0.63, 1)' },
-      { transform: 'scale(1)' },
-    ], { duration: 165 });
-    const circle = svgNode('circle', { cx: 0, cy: 0, r: 8 * K, fill: 'none', stroke: rgb(parts.effect), 'stroke-width': 5 * K });
+      { transform: 'scale(0.86)', offset: 0.35 },
+      { transform: 'scale(1)', easing: 'cubic-bezier(0.34, 1.56, 0.64, 1)' },
+    ], { duration: 220 });
+    const circle = svgNode('circle', { cx: 0, cy: 0, r: 5, fill: 'none', stroke: rgb(parts.fill), 'stroke-width': 2.4 });
     const ring = svgNode('svg', { width: 1, height: 1 }, [circle]);
     ring.style.transform = `translate(${pos.x}px, ${pos.y}px)`;
     parts.fx.appendChild(ring);
-    circle.animate([{ r: `${8 * K}px` }, { r: `${52 * K}px` }], { duration: 520, easing: 'cubic-bezier(0.33, 1, 0.68, 1)', fill: 'forwards' });
-    circle.animate([{ strokeWidth: `${5 * K}px`, opacity: 0.75 }, { strokeWidth: `${1 * K}px`, opacity: 0 }], { duration: 520, fill: 'forwards' })
+    circle.animate([{ r: '5px' }, { r: '22px' }], { duration: 420, easing: 'cubic-bezier(0.33, 1, 0.68, 1)', fill: 'forwards' });
+    circle.animate([{ strokeWidth: '2.4px', opacity: 0.85 }, { strokeWidth: '0.6px', opacity: 0 }], { duration: 420, fill: 'forwards' })
       .finished.then(() => ring.remove(), () => ring.remove());
   }
 

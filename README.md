@@ -121,7 +121,7 @@ The full contract is in [SPEC.md](SPEC.md), the cursor in [docs/cursor-spec.md](
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Includes code adapted from Playwright and a cursor based on Cua, see
+MIT, see [LICENSE](LICENSE). Includes code adapted from Playwright and cursor motion adapted from Cua, see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 Made by [Fowl Labs](https://fowllabs.com).

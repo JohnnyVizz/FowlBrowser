@@ -197,10 +197,10 @@ Never call tabs.update({active:true}) or windows.update({focused:true}) except i
   opener or by the Page.windowOpen URL (up to 2 s), so slow popups are reported too.
 - A call on a tab starts only after work left over from an answered dialog has finished; the dialog tool runs outside
   the queue. A dialog clears when it closes or the page navigates.
-- Agent cursor ([docs/cursor-spec.md](docs/cursor-spec.md), `mcp/src/cursor/`): Cua Driver's cursor, smaller. In a tab
+- Agent cursor ([docs/cursor-spec.md](docs/cursor-spec.md), `mcp/src/cursor/`): a rounded pointer in the session's colour with a name label (motion after Cua's signature_arc). In a tab
   `tabs.isShown` says the user can see, every action shows it: it travels to the target before pointer actions (click,
-  hover, drag, type/fill, select_option, press_key with a ref, scroll, upload) and plays Cua's cue for the action
-  (click, look, scroll, text, key, navigate, drag, transfer); hidden for screenshots, gone after 15 s idle or when
+  hover, drag, type/fill, select_option, press_key with a ref, scroll, upload) and shows the action as a word in its label
+  (reading, scrolling, typing, pressing keys, loading, dragging, uploading), with a press and a ring for clicks; hidden for screenshots, gone after 15 s idle or when
   control ends. Not shown: nothing is injected. Best effort: never fails an action or delays it more than 1050 ms
   (900 ms to arrive, 150 ms to land on the target fully shown).
 - Turn end (`mcp/src/turns.mjs`, Codex's per-turn cleanup): the server listens on `/tmp/fowlbrowser-turn-<parent pid>.sock`
