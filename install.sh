@@ -1,9 +1,12 @@
 #!/bin/sh
 # FowlBrowser installer (macOS). Copies the app into ~/Library/Application Support/FowlBrowser, registers the
 # native host for every installed Chromium browser, and registers the MCP server and hooks with Claude Code.
-# Re-run to update. FOWLBROWSER_SKIP_CLAUDE=1 leaves Claude Code alone; uninstall.sh undoes it all.
+# Re-run to update. --lite skips Lighthouse. FOWLBROWSER_SKIP_CLAUDE=1 leaves Claude Code alone; uninstall.sh undoes it all.
 # Nothing keeps running on its own: the browser starts the host, Claude starts the MCP server.
 set -eu
+# --lite leaves Lighthouse out (about 160 MB on disk): every other tool works, and `lighthouse` says how to add it.
+OMIT=""
+for arg in "$@"; do [ "$arg" = --lite ] && OMIT="--omit=optional"; done
 SRC=$(cd "$(dirname "$0")" && pwd)
 APP="$HOME/Library/Application Support/FowlBrowser"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -16,7 +19,7 @@ rsync -a --delete --exclude test --exclude NOTES.md "$SRC/extension/" "$APP/exte
 rsync -a --delete --exclude fowlbrowser-host --exclude NOTES.md "$SRC/host/" "$APP/host/"
 rsync -a --delete --exclude node_modules --exclude test --exclude NOTES.md "$SRC/mcp/" "$APP/mcp/"
 rsync -a "$SRC/tools/fb.mjs" "$APP/fb.mjs"
-(cd "$APP/mcp" && npm ci --omit=dev --no-audit --no-fund --silent)
+(cd "$APP/mcp" && npm ci --omit=dev $OMIT --no-audit --no-fund --silent)
 HOST_OUT=$(sh "$APP/host/install.sh") # a failed registration stops the install here
 REGISTERED=$(printf '%s\n' "$HOST_OUT" | grep '^registered ' || true)
 echo "${REGISTERED:-No supported browser found (Chrome, Chromium, Helium, Brave, Edge, Arc or Vivaldi).}"

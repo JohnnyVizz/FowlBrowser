@@ -87,7 +87,8 @@ open -a "Google Chrome" --args --silent-debugger-extension-api --restore-last-se
 ```
 
 To update, run `git pull` and then `sh install.sh` again. To remove FowlBrowser, run `sh uninstall.sh`, then remove the
-extension from each browser.
+extension from each browser. `sh install.sh --lite` leaves Lighthouse out (about 160 MB on disk) if you never audit
+pages; every other tool still works, and the `lighthouse` tool says how to add it.
 
 ## Using other agents
 

@@ -115,7 +115,11 @@ export async function restore(tab, scripts) {
 let loading;
 const load = () => loading ??= (async () => {
   const [lighthouse, { userAgents }, logger] = await Promise.all([
-    import('lighthouse'), import('lighthouse/core/config/constants.js'), import('lighthouse-logger')]);
+    import('lighthouse'), import('lighthouse/core/config/constants.js'), import('lighthouse-logger')]).catch((error) => {
+    loading = null;
+    if (error?.code !== 'ERR_MODULE_NOT_FOUND') throw error;
+    throw new Error('Lighthouse is not installed: FowlBrowser was installed with --lite. Run its install.sh again without --lite to add it (about 160 MB); traces and memory work without it.');
+  });
   logger.default.setLevel(process.env.FOWLBROWSER_LH_LOG || 'error');
   return { navigation: lighthouse.navigation, snapshot: lighthouse.snapshot, generateReport: lighthouse.generateReport, desktopConfig: lighthouse.desktopConfig, mobileUA: userAgents.mobile };
 })();

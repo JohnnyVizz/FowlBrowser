@@ -528,7 +528,8 @@ clears every Emulation and Network override; `clearEmulation` clears them while 
 session has no `HeapProfiler`, `Profiler`, `Memory` or `Animation` domain (Chrome 155 answers "wasn't found"): no heap
 snapshots and no JS coverage this way; `Browser.*` stays blocked (the Lighthouse shim answers `Browser.getVersion` from
 the extension's user agent). Dependencies, imported lazily on first use: `@paulirish/trace_engine` (DevTools' trace engine
-and insights, BSD-3-Clause, the version Lighthouse pins) and `lighthouse` (Apache-2.0). Chrome records one trace per
+and insights, BSD-3-Clause, the version Lighthouse pins) and `lighthouse` (Apache-2.0; an optional dependency, left out
+by `install.sh --lite`: the `lighthouse` tool then errors saying how to add it, the other tools are unaffected). Chrome records one trace per
 browser and the trace engine parses one trace at a time per process (its handlers are module state), so recordings and
 Lighthouse runs of one server take turns (`tracingSlot`, process-wide; a holder that never releases is skipped after 10
   min); a recording of another session or of DevTools makes `Tracing.start` fail and the tool says so. A tab the user owns
