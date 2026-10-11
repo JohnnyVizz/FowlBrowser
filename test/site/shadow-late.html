@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Late closed shadow root</title>
+<link rel="stylesheet" href="style.css">
+<h1>Late closed shadow root</h1>
+<div id="late-host"></div>
+<button id="attach">Attach late root</button>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  // The host is in the page from the start; its closed root (and the button in it) only comes later, so the light
+  // DOM never changes.
+  document.getElementById('attach').onclick = () => {
+    const root = document.getElementById('late-host').attachShadow({ mode: 'closed' });
+    root.innerHTML = '<button>Late save</button>';
+    root.querySelector('button').onclick = () => { document.getElementById('result').textContent = 'late:clicked'; };
+  };
+</script>

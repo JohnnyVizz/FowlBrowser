@@ -19,11 +19,12 @@ const viewportLines = () => fs.readFileSync(path.join(dir, 'journal.jsonl'), 'ut
 
 let nextId = 1;
 // One browser with one controlled tab of the given origin. cdp lists the CDP methods sent (and their params), sent
-// every host request in order.
+// every host request in order; a CDP method put in `failing` fails once.
 function setup({ origin = 'agent', kept = false } = {}) {
   const tabId = nextId++;
   const cdp = [];
   const sent = [];
+  const failing = new Set();
   const page = Object.assign(new EventEmitter(), {
     setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, url: () => 'http://127.0.0.1:5411/mobile.html',
     evaluate: async () => ({ w: 390, h: 844, dpr: 3 }),
@@ -32,12 +33,15 @@ function setup({ origin = 'agent', kept = false } = {}) {
   const host = {
     async request(method, params) {
       sent.push(method === 'chrome.debugger.sendCommand' ? params[1] : method);
-      if (method === 'tabs.listAll') return [{ id: tabId, owner: owned ? 'you' : null, origin, kept, handedOver: kept, url: page.url() }];
+      const info = { id: tabId, owner: owned ? 'you' : null, origin, kept, handedOver: kept, url: page.url() };
+      if (method === 'tabs.info') return info;
+      if (method === 'tabs.listAll') return [info];
       if (method === 'tabs.release' || method === 'chrome.tabs.remove') return void (owned = false);
       if (method !== 'chrome.debugger.sendCommand') throw new Error(`unexpected ${method}`);
       const [, name, args] = params;
       if (name === 'Target.getTargetInfo') return { targetInfo: { title: 'Mobile' } };
       cdp.push([name, args]);
+      if (failing.delete(name)) throw new Error(`${name} failed`);
       return {};
     },
   };
@@ -52,7 +56,7 @@ function setup({ origin = 'agent', kept = false } = {}) {
     const result = await handlers[name]({ tab: tab.id, snapshot: false, ...args });
     return { ...result, text: result.content.map((c) => c.text).join('\n') };
   };
-  return { tab, cdp, sent, call, browser };
+  return { tab, cdp, sent, call, browser, failing };
 }
 
 test('mobile: metrics override with the given scale and touch on, remembered and journaled', async () => {
@@ -98,6 +102,20 @@ test('reset clears the override and touch; a second reset says nothing was set a
   cdp.length = 0;
   assert.match((await call('viewport', { reset: true })).text, /No viewport was set/);
   assert.deepEqual(cdp, []);
+});
+
+test('a reset that fails keeps what is left to clear, so another reset finishes it', async () => {
+  for (const step of ['Emulation.clearDeviceMetricsOverride', 'Emulation.setTouchEmulationEnabled']) {
+    const { tab, cdp, call, failing } = setup();
+    await call('viewport', { width: 390, height: 844, mobile: true });
+    failing.add(step);
+    assert.match((await call('viewport', { reset: true })).text, /failed/);
+    assert.equal(tab.viewport?.mobile, true, `kept after ${step} failed`);
+    cdp.length = 0;
+    assert.match((await call('viewport', { reset: true })).text, /Viewport reset/);
+    assert.deepEqual(cdp, [['Emulation.clearDeviceMetricsOverride', {}], ['Emulation.setTouchEmulationEnabled', { enabled: false }]]);
+    assert.equal(tab.viewport, null);
+  }
 });
 
 test('a missing height is refused before anything is sent', async () => {

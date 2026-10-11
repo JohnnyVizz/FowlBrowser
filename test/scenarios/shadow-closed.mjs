@@ -55,5 +55,16 @@ export default {
     t.step('closed root only inside a frame');
     await t.call('navigate', { tab, url: `${t.site}/shadow-framed.html`, snapshot: false });
     await t.until(async () => /^s\d+$/.test(await t.refOf(tab, 'button', 'Frame shadow save').catch(() => '')), 'frame closed root listed as an s ref');
+
+    t.step('claimed tab: closed root attached later to an existing host');
+    // The user's tab gets no hook, and the light DOM stays the same: only the periodic rescan (every 10 s) finds it.
+    const own = await t.userTab(`${t.site}/shadow-late.html`);
+    await t.call('tab_claim', { tab: own, snapshot: false });
+    t.ok(!/\[ref=s\d+\]/.test(await t.snapshot(own)), 'no s refs before the late attach');
+    await t.call('click', { tab: own, ref: await t.refOf(own, 'button', 'Attach late root'), snapshot: false });
+    const late = await t.until(async () => t.ref(await t.snapshot(own), 'button', 'Late save'), 'late closed root listed as an s ref', 20_000);
+    t.ok(/^s\d+$/.test(late), `late closed root button should be an s ref, got ${late}`);
+    await t.call('click', { tab: own, ref: late, snapshot: false });
+    t.eq(await t.resultOf(own), 'late:clicked', 'late closed root button clicked');
   },
 };

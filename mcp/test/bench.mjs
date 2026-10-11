@@ -77,7 +77,27 @@ try {
     await measure('press_key (no snapshot)', () => ({ tab, key: 'Shift', snapshot: false }));
     await measure('scroll (no snapshot)', () => ({ tab, direction: 'down', pages: 0.2, snapshot: false }));
     await measure('navigate (no snapshot)', (i) => ({ tab, url: `${SITE}/index.html?n=${i}`, snapshot: false }));
+    await measure('navigate (with snapshot)', (i) => ({ tab, url: `${SITE}/form.html?n=${i}` }));
+    const again = (await call('snapshot', { tab })).body;
+    const check = refOf(again, 'checkbox');
+    if (check) await measure('click (ref, with snapshot)', () => ({ tab, ref: check }));
+    const shown = /heading "([^"]+)"/.exec(again)?.[1] ?? 'Form';
+    await measure('wait_for (text there, no snapshot)', () => ({ tab, text: shown, snapshot: false }));
+    await measure('wait_for (text there, with snapshot)', () => ({ tab, text: shown }));
     await measure('screenshot', () => ({ tab }));
+
+    const { tab: dialogs } = await open(browser, `${SITE}/dialogs.html`);
+    const alertButton = refOf((await call('snapshot', { tab: dialogs })).body, 'button "Show alert"');
+    if (alertButton) {
+      const list = [];
+      for (let i = 0; i < RUNS; i++) {
+        await call('click', { tab: dialogs, ref: alertButton, snapshot: false });
+        list.push((await call('dialog', { tab: dialogs, accept: true, snapshot: false })).ms);
+      }
+      row(browser, 'dialog (accept, no snapshot)', list);
+    }
+    const { tab: video } = await open(browser, `${SITE}/video.html`);
+    await measure('media (status)', () => ({ tab: video, action: 'status' }));
   }
 } finally {
   for (const tab of opened) await client.callTool({ name: 'tab_close', arguments: { tab } }).catch(() => {});

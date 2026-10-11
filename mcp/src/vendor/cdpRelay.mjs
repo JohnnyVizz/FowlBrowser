@@ -20,7 +20,7 @@
 // guarded by a random path token, and `newCDPSession(page)` is answered locally so the server can ask
 // which chrome tab a Playwright page is (`FowlBrowser.getTabId`). Page.bringToFront and page emulation
 // (color scheme, user agent, locale, timezone, metrics, touch) are swallowed, and so are Runtime.bindingCalled
-// events of FowlBrowser's own page scripts. Input.* commands are reported per tab to `onInput` (set by the server),
+// events of FowlBrowser's own page scripts. Input.* commands are reported per tab to `onInput` (tabId, method, params; set by the server),
 // so it can tell the agent's input from the user's.
 // Browser.getVersion reports the real browser user agent (Playwright picks macOS key handling from it), and
 // when Playwright disconnects, the debugger is detached from its tabs (attached or still attaching) before
@@ -186,7 +186,7 @@ export class CDPRelay {
     }
     if (!sessionId) return await this.model.sendBrowserCommand(method, params);
     const done = method.startsWith('Input.')
-      ? this.onInput?.(this.model._findTabSession((s) => s.sessionId === sessionId || s.childSessions.has(sessionId))?.tabId)
+      ? this.onInput?.(this.model._findTabSession((s) => s.sessionId === sessionId || s.childSessions.has(sessionId))?.tabId, method, params)
       : null;
     let result;
     try {

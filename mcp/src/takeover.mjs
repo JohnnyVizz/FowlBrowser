@@ -1,6 +1,7 @@
 // Taking a tab back and handing a tab over (SPEC "Taking a tab back, handing a tab over, viewport (session 5)").
-// The server decides takeovers, since only it knows when the agent acted: every tool call's run on a tab and every
-// Input.* command the relay forwards for it are agent windows. Signals: trusted input in the page (an isolated-world
+// The server decides takeovers, since only it knows when the agent acted: every Input.* command the relay forwards for
+// a tab is an agent window, and so are the agent's own navigations (navigate, Lighthouse's reload) for commits. A read,
+// a wait or a queued call is none: the user's input then is theirs. Signals: trusted input in the page (an isolated-world
 // listener), the user's navigations (the extension's tabs.committed), the debugger taken away, and the tab closed.
 // A taken-over or handed-off tab is parked (extension tabs.park): still this session's, but the user's until the
 // agent resumes it with tab_claim {resume: true}. Notices for the agent live here too.
@@ -10,6 +11,7 @@ import * as cursor from './cursor/index.mjs';
 import { debug } from './debug.mjs';
 import { uninstallPopups } from './popups.mjs';
 import { tabEvent } from './record.mjs';
+import { sleep, tabInfo } from './util.mjs';
 import { clearViewport } from './viewport.mjs';
 
 const BEFORE_MS = 50; // an agent window starts this much before its command was sent (clock skew)
@@ -93,13 +95,29 @@ const parking = new Map(); // "chrome:52" -> its takeover's or handoff's cleanup
 const calls = new AsyncLocalStorage(); // the tool call code runs for: { tabKey, onParked } (see inCall)
 
 const keyOf = (browser, tabId) => `${browser.key}:${tabId}`;
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const recently = (map, key, ms) => Date.now() - (map.get(key) ?? -Infinity) <= ms;
 const clock = (at) => new Date(at).toTimeString().slice(0, 5);
 
-// Whether the agent acted on the tab around `at` (any tool call on it, or input the relay forwarded for it).
+// Whether input in the page around `at` was the agent's: an Input.* command the relay forwarded for the tab (clicks,
+// keys, Playwright's fill and insertText, the keyboard on closed-shadow refs) was in flight then.
+export function agentInput(browser, tabId, at) {
+  return !!inputs.get(keyOf(browser, tabId))?.covers(at);
+}
+
+// Whether a navigation committing around `at` may be the agent's: its input (a link, a key), or one of its own
+// navigations (Tab.navigations, see navigating).
 export function agentActed(browser, tabId, at, after = AFTER_MS) {
-  return [browser.tabs.get(tabId)?.activity, inputs.get(keyOf(browser, tabId))].some((a) => a?.covers(at, after));
+  return [browser.tabs.get(tabId)?.navigations, inputs.get(keyOf(browser, tabId))].some((a) => a?.covers(at, after));
+}
+
+// Runs one of the agent's own navigations on the tab (back, forward, reload: they commit like the user's).
+export async function navigating(tab, fn) {
+  const done = tab.navigations.begin();
+  try {
+    return await fn();
+  } finally {
+    done();
+  }
 }
 
 const INPUT_HOW = {
@@ -260,7 +278,7 @@ export async function handOff(tab, reason) {
     });
   } catch (error) {
     // A park can fail after it took effect (an ungroup refused while the user drags a tab): then the record stays.
-    const now = (await tab.browser.host.request('tabs.listAll', {}).catch(() => [])).find((t) => t.id === record.tabId);
+    const now = await tabInfo(tab.browser, record.tabId).catch(() => null);
     if (!now?.parked && records.get(key) === record) records.delete(key);
     throw error;
   }
@@ -289,20 +307,22 @@ async function onReport(tab, payload) {
   const { browser, tabId } = tab;
   if (report.type === 'navigate') return void selfNavigated.set(tab.id, Date.now());
   const how = inputHow(report);
-  if (!how || records.has(tab.id) || agentActed(browser, tabId, report.at)) return;
+  if (!how || records.has(tab.id) || agentInput(browser, tabId, report.at)) return;
   // Agent input is trusted too; only input in the tab the user is looking at, in the window they are in, can be theirs.
   const seen = await browser.host.request('tabs.isShown', { tabId }).catch(() => null);
-  if (!seen?.shown || !seen.focused || agentActed(browser, tabId, report.at)) return;
+  if (!seen?.shown || !seen.focused || agentInput(browser, tabId, report.at)) return;
   await takeOver(browser, tabId, how, { tab });
 }
 
 // Extension events of a browser. Registered before the relay's handler, so the tab is still known to the model when
 // its removal comes in.
 export function watchTakeovers(browser) {
-  browser.relay.onInput = (tabId) => {
+  browser.relay.onInput = (tabId, method, params) => {
     const key = keyOf(browser, tabId);
     if (!inputs.has(key)) inputs.set(key, new Activity());
-    return inputs.get(key).begin();
+    const done = inputs.get(key).begin();
+    browser.tabs.get(tabId)?.emit('input', method, params); // as it is sent: the cursor's click feedback (tools.mjs pointed)
+    return done;
   };
   browser.host.on('event', (method, params) => {
     if (method === 'chrome.debugger.onDetach') onDetach(browser, params?.[0]?.tabId, params?.[1]).catch((e) => debug('takeover: detach', e.message));
@@ -333,8 +353,8 @@ async function onDetach(browser, tabId, reason) {
   if (reason !== 'target_closed' || recently(crashed, key, CRASH_MS)) return;
   await sleep(SETTLE_MS);
   if (records.has(key)) return;
-  const info = (await browser.host.request('tabs.listAll', {}).catch(() => [])).find((t) => t.id === tabId && t.owner === 'you');
-  if (!info || info.parked) return;
+  const info = await tabInfo(browser, tabId).catch(() => null);
+  if (info?.owner !== 'you' || info.parked) return;
   const how = BROWSER_PAGE.test(info.url) && info.url !== 'about:blank' ? `opened a browser page (${info.url.slice(0, 60)})` : 'took the tab out of the agent\'s control';
   await takeOver(browser, tabId, how, { tab, detached: true });
 }
@@ -343,11 +363,11 @@ async function onRemoved(browser, tabId, removeInfo) {
   const key = keyOf(browser, tabId);
   const tab = browser.tabs.get(tabId) ?? lastTabs.get(key);
   const known = !!tab || browser.relay.model.hasTab(tabId);
-  histories.delete(key);
-  inputs.delete(key);
+  const ours = recently(ending, key, ENDING_MS);
+  for (const map of [histories, inputs, ending, selfNavigated, crashed]) map.delete(key);
   if (removeInfo?.replacedBy !== undefined) return moveRecord(key, keyOf(browser, removeInfo.replacedBy), removeInfo.replacedBy);
   if (records.get(key)?.kind === 'handoff') return forget(key); // the user closed what they were handed
-  if (!known || records.has(key) || recently(ending, key, ENDING_MS)) return;
+  if (!known || records.has(key) || ours) return;
   if (Date.now() - (tab?.closedByPageAt ?? -Infinity) <= CLOSED_BY_PAGE_MS) return; // the page closed itself
   await takeOver(browser, tabId, 'closed the tab', { tab, gone: true });
 }

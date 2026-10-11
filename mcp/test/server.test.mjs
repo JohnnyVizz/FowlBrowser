@@ -41,11 +41,12 @@ const server = net.createServer((socket) => {
       } else if (message.method === 'client.hello') {
         socket.write(frame({ id: message.id, result: { ok: true } }));
         socket.write(frame({ method: 'extension.initialized', params: [] }));
-      } else if (message.method === 'tabs.listAll') {
-        socket.write(frame({ id: message.id, result: [
+      } else if (message.method === 'tabs.listAll' || message.method === 'tabs.info') {
+        const all = [
           { id: 7, windowId: 1, index: 0, url: 'https://example.com/', title: 'Example', active: true, pinned: false, audible: false, muted: false, groupTitle: null, owner: null, origin: null },
           { id: 8, windowId: 1, index: 1, url: 'https://mail.example.com/', title: 'Mail', active: false, pinned: false, audible: false, muted: false, groupTitle: null, owner: 'you', origin: 'user' },
-        ] }));
+        ];
+        socket.write(frame({ id: message.id, result: message.method === 'tabs.info' ? all.find((t) => t.id === message.params.tabId) ?? null : all }));
       } else if (message.method === 'chrome.tabs.remove' || message.method === 'tabs.closeUnowned') {
         socket.write(frame({ id: message.id, result: null }));
       }

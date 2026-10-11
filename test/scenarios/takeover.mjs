@@ -53,8 +53,9 @@ export default {
       if (!found) throw new Error(`no ${APPS[t.browser]} window titled "${title}"`);
       return found;
     };
-    const realClick = async (tab, selector, title) => {
-      const point = await t.eval(tab, SCREEN_POINT_FN(selector));
+    // The point is read first: an agent call running on the tab would queue the read behind it.
+    const realClick = async (tab, selector, title) => realClickAt(await t.eval(tab, SCREEN_POINT_FN(selector)), title);
+    const realClickAt = async (point, title) => {
       const win = windowOf(title);
       const state = cua('get_window_state', { pid: win.pid, window_id: win.window_id, include_accessibility_tree: false });
       const bounds = state.window_bounds ?? win.bounds;
@@ -146,6 +147,17 @@ export default {
       t.eq(await t.resultOf(tab), 'added 1', 'the user\'s click landed (one more than the agent\'s, which were before the reload)');
       const back = (await t.listMine()).find((x) => x.tab === tab);
       t.ok(back.parked === null && back.group && back.muted, `back in its group and muted: ${JSON.stringify(back)}`);
+
+      t.step('3b: a real click while the agent\'s wait_for runs on the tab is a takeover too');
+      const point = await t.eval(tab, SCREEN_POINT_FN('#add'));
+      const waitStarted = Date.now();
+      const waiting = t.call('wait_for', { tab, seconds: 15, snapshot: false }).then(() => null, (e) => e);
+      await realClickAt(point, 'Takeover test');
+      await t.until(async () => (await parkedOf(tab)) === 'takeover', 'parked while wait_for ran', 5000);
+      const waitError = await waiting;
+      t.ok(waitError instanceof ToolError && /The user took over .* \(clicked "Add to cart"\)/.test(waitError.message), `wait_for ends with the notice: ${waitError?.message ?? 'it succeeded'}`);
+      console.log(`WAIT_FOR ${t.browser}: ended ${Date.now() - waitStarted} ms after it started (15 s asked)`);
+      await t.call('tab_claim', { tab, resume: true, snapshot: false });
 
       t.step('4: real typing in a field');
       await t.call('click', { tab, ref: await t.refOf(tab, 'textbox', 'Search'), snapshot: false });

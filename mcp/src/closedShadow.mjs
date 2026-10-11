@@ -10,12 +10,15 @@
 //   calls no JS, so each frame's document response is checked for it (fetched in the background as it loads).
 //   A document the hook missed the start of (`late`) gets one full scan.
 // - the user's claimed tabs (nothing is patched in their pages): a full scan per document, then again on each
-//   snapshot if it found roots, or, if it found none, at most every RESCAN_MS once the element count changed.
+//   snapshot if it found roots, or, if it found none, at most every RESCAN_MS. Nothing cheap seen from outside the
+//   page reliably signals a closed root attached later to an element already there (the light DOM is unchanged).
 // Refs belong to one main-frame document (Tab.documentGeneration): a navigation voids them, and a scan that
 // finishes after a navigation is dropped. s numbers are never reused in a tab: a control keeps its number for the
 // life of its document, and a new document's controls get numbers above every one shown before.
 
 import crypto from 'node:crypto';
+import { cdp } from './cdp.mjs';
+import { sleep, within } from './util.mjs';
 
 const KEY = `__fb${crypto.randomBytes(6).toString('hex')}`; // per server process, so pages cannot guess it
 const ROLES = new Set(['textbox', 'searchbox', 'button', 'link', 'checkbox', 'radio', 'combobox', 'menuitem', 'tab', 'switch', 'slider', 'option']);
@@ -24,8 +27,6 @@ const RESCAN_MS = 10_000;
 const FRAME_READ_MS = 1000;
 const BODY_WAIT_MS = 2000;
 const HIT_WAIT_MS = 1500;
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const within = (promise, ms, fallback) => Promise.race([promise.catch(() => fallback), sleep(ms).then(() => fallback)]);
 
 // Installs the counter in the current document if missing and returns it. `late` = installed after the
 // document had already run scripts, so closed roots made before it are unknown until one full scan.
@@ -58,11 +59,7 @@ function hook(key, late) {
 const refsByTab = new WeakMap();
 const hooked = new WeakSet(); // Tabs with the attachShadow hook
 const declarativeByTab = new WeakMap(); // agent Tab -> WeakMap(frame -> Promise<boolean>) for its current document
-const claimedState = new WeakMap(); // claimed Tab -> { generation, hosts, at, elements } of the last full scan
-
-function send(tab, method, params = {}) {
-  return tab.browser.host.request('chrome.debugger.sendCommand', [{ tabId: tab.tabId }, method, params]);
-}
+const claimedState = new WeakMap(); // claimed Tab -> { generation, hosts, at } of the last full scan
 
 // Call once per adopted tab, before it navigates. Agent tabs (inject) get the hook in every new document,
 // and every document response is checked for declarative closed roots.
@@ -77,7 +74,7 @@ export async function watchClosedShadow(tab, inject) {
     const check = response.text().then((body) => DECLARATIVE.test(body), () => false);
     declarative.set(response.frame(), check);
   });
-  await send(tab, 'Page.addScriptToEvaluateOnNewDocument', { source: `(${hook})(${JSON.stringify(KEY)}, false)` });
+  await cdp(tab, 'Page.addScriptToEvaluateOnNewDocument', { source: `(${hook})(${JSON.stringify(KEY)}, false)` });
 }
 
 export const isShadowRef = (ref) => /^s\d+$/.test(cleanRef(ref));
@@ -96,18 +93,10 @@ async function agentNeedsScan(tab) {
   return { scan: closed > 0 || late.length > 0 || unknown, late, expected: closed };
 }
 
-// Claimed tabs: first snapshot of a document, every snapshot while it has roots, else bounded rescans.
-async function claimedNeedsScan(tab) {
+// Claimed tabs: first snapshot of a document, every snapshot while it has roots, else once RESCAN_MS has passed.
+function claimedNeedsScan(tab) {
   const last = claimedState.get(tab);
-  if (!last || last.generation !== tab.documentGeneration || last.hosts > 0) return { scan: true };
-  if (Date.now() - last.at < RESCAN_MS) return { scan: false };
-  const elements = await countElements(tab);
-  return { scan: elements !== last.elements, elements };
-}
-
-async function countElements(tab) {
-  const { result } = await send(tab, 'Runtime.evaluate', { expression: 'document.getElementsByTagName("*").length', returnByValue: true }).catch(() => ({}));
-  return result?.value ?? -1;
+  return { scan: !last || last.generation !== tab.documentGeneration || last.hosts > 0 || Date.now() - last.at >= RESCAN_MS };
 }
 
 // YAML lines for interactive controls inside closed shadow roots ('' when there are none). Regenerates the tab's s refs.
@@ -116,15 +105,11 @@ export async function closedShadowSection(tab) {
   const state = refStateOf(tab);
   state.refs = new Map();
   const agent = hooked.has(tab);
-  const need = agent ? await agentNeedsScan(tab) : await claimedNeedsScan(tab);
-  if (!need.scan) {
-    if (!agent && need.elements !== undefined) claimedState.set(tab, { ...claimedState.get(tab), at: Date.now(), elements: need.elements });
-    return '';
-  }
+  const need = agent ? await agentNeedsScan(tab) : claimedNeedsScan(tab);
+  if (!need.scan) return '';
 
-  const elements = agent ? undefined : await countElements(tab);
-  const { root } = await send(tab, 'DOM.getDocument', { depth: -1, pierce: true });
-  await send(tab, 'DOM.disable'); // getDocument turns on DOM mutation events; nobody here wants them
+  const { root } = await cdp(tab, 'DOM.getDocument', { depth: -1, pierce: true });
+  await cdp(tab, 'DOM.disable'); // getDocument turns on DOM mutation events; nobody here wants them
   const hosts = []; // outermost hosts of closed roots
   const inside = new Set(); // backendNodeIds inside closed roots
   let roots = 0; // closed roots, nested ones included
@@ -142,7 +127,7 @@ export async function closedShadowSection(tab) {
   };
   walk(root, false);
   if (tab.documentGeneration !== generation) return ''; // navigated meanwhile: these nodes belong to the old document
-  if (!agent) claimedState.set(tab, { generation, hosts: hosts.length, at: Date.now(), elements });
+  if (!agent) claimedState.set(tab, { generation, hosts: hosts.length, at: Date.now() });
   else {
     // Documents the hook joined late are now known; keep scanning them only if roots exist.
     await Promise.all(need.late.map((frame) => frame.evaluate(([key, found]) => {
@@ -159,7 +144,7 @@ export async function closedShadowSection(tab) {
   const refs = new Map();
   const lines = [];
   for (const backendNodeId of hosts) {
-    const { nodes } = await send(tab, 'Accessibility.queryAXTree', { backendNodeId });
+    const { nodes } = await cdp(tab, 'Accessibility.queryAXTree', { backendNodeId });
     for (const node of nodes) {
       if (node.ignored || !ROLES.has(node.role?.value) || !inside.has(node.backendDOMNodeId)) continue;
       let ref = state.byNode.get(node.backendDOMNodeId);
@@ -173,7 +158,7 @@ export async function closedShadowSection(tab) {
       lines.push(`  - ${node.role.value}${name}${flags} [ref=${ref}]${value}`);
     }
   }
-  await send(tab, 'Accessibility.disable');
+  await cdp(tab, 'Accessibility.disable');
   if (tab.documentGeneration !== generation) return '';
   state.refs = refs;
   if (!lines.length) return unreachable ? `\n- group "Inside closed shadow roots":${unreachable}` : '';
@@ -205,7 +190,7 @@ function backendNodeFor(tab, ref) {
 async function onNode(tab, ref, method, params = {}) {
   const backendNodeId = backendNodeFor(tab, ref);
   try {
-    return await send(tab, method, { ...params, backendNodeId });
+    return await cdp(tab, method, { ...params, backendNodeId });
   } catch (error) {
     if (/no node|backend id|box model|layout object|not attached|detached/i.test(error.message)) throw new Error(staleMessage(cleanRef(ref)));
     throw error;
@@ -215,7 +200,7 @@ async function onNode(tab, ref, method, params = {}) {
 // The node's flat-tree subtree: backendNodeIds of its children, shadow roots, pseudo-elements (a switch's ::after
 // knob) and what its slots show, plus the slotted text nodes (a hit on text reports the text's DOM parent, the host, instead).
 async function flatSubtree(tab, backendNodeId, tree = { ids: new Set(), texts: [] }) {
-  const { node } = await send(tab, 'DOM.describeNode', { backendNodeId, depth: -1, pierce: true });
+  const { node } = await cdp(tab, 'DOM.describeNode', { backendNodeId, depth: -1, pierce: true });
   const slotted = [];
   const walk = (n) => {
     tree.ids.add(n.backendNodeId);
@@ -230,14 +215,14 @@ async function flatSubtree(tab, backendNodeId, tree = { ids: new Set(), texts: [
 async function parentId(tab, backendNodeId) {
   const objects = [];
   try {
-    const { object } = await send(tab, 'DOM.resolveNode', { backendNodeId });
+    const { object } = await cdp(tab, 'DOM.resolveNode', { backendNodeId });
     objects.push(object.objectId);
-    const { result } = await send(tab, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: 'function () { return this.parentNode; }' });
+    const { result } = await cdp(tab, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: 'function () { return this.parentNode; }' });
     if (!result?.objectId) return null;
     objects.push(result.objectId);
-    return (await send(tab, 'DOM.describeNode', { objectId: result.objectId })).node.backendNodeId;
+    return (await cdp(tab, 'DOM.describeNode', { objectId: result.objectId })).node.backendNodeId;
   } finally {
-    for (const objectId of objects) send(tab, 'Runtime.releaseObject', { objectId }).catch(() => {});
+    for (const objectId of objects) cdp(tab, 'Runtime.releaseObject', { objectId }).catch(() => {});
   }
 }
 
@@ -245,15 +230,15 @@ async function parentId(tab, backendNodeId) {
 async function hitTest(tab, ref, { x, y }) {
   const backendNodeId = backendNodeFor(tab, ref);
   // getNodeForLocation takes document coordinates; the box model (and the click) are in viewport coordinates.
-  const { cssLayoutViewport: scrolled } = await send(tab, 'Page.getLayoutMetrics');
-  const hit = await send(tab, 'DOM.getNodeForLocation', { x: Math.round(x + scrolled.pageX), y: Math.round(y + scrolled.pageY), includeUserAgentShadowDOM: false, ignorePointerEventsNone: false })
+  const { cssLayoutViewport: scrolled } = await cdp(tab, 'Page.getLayoutMetrics');
+  const hit = await cdp(tab, 'DOM.getNodeForLocation', { x: Math.round(x + scrolled.pageX), y: Math.round(y + scrolled.pageY), includeUserAgentShadowDOM: false, ignorePointerEventsNone: false })
     .catch(() => null);
   if (!hit?.backendNodeId) return 'nothing (off screen)';
   if (hit.backendNodeId === backendNodeId) return true;
   const { ids, texts } = await flatSubtree(tab, backendNodeId).catch(() => ({ ids: new Set(), texts: [] }));
   if (ids.has(hit.backendNodeId)) return true;
   for (const text of texts.slice(0, 5)) if (await parentId(tab, text).catch(() => null) === hit.backendNodeId) return true;
-  const { node } = await send(tab, 'DOM.describeNode', { backendNodeId: hit.backendNodeId }).catch(() => ({}));
+  const { node } = await cdp(tab, 'DOM.describeNode', { backendNodeId: hit.backendNodeId }).catch(() => ({}));
   if (!node) return 'another element';
   const attrs = Object.fromEntries((node.attributes ?? []).flatMap((v, i, a) => (i % 2 ? [] : [[v, a[i + 1]]])));
   return `<${node.localName || node.nodeName.toLowerCase()}${attrs.id ? `#${attrs.id}` : ''}${attrs.class ? `.${attrs.class.trim().split(/\s+/).join('.')}` : ''}>`;
@@ -291,8 +276,8 @@ export const focusShadowRef = (tab, ref) => onNode(tab, ref, 'DOM.focus');
 export async function callOnShadowRef(tab, ref, fn) {
   const { object } = await onNode(tab, ref, 'DOM.resolveNode');
   try {
-    await send(tab, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: String(fn) });
+    await cdp(tab, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: String(fn) });
   } finally {
-    send(tab, 'Runtime.releaseObject', { objectId: object.objectId }).catch(() => {});
+    cdp(tab, 'Runtime.releaseObject', { objectId: object.objectId }).catch(() => {});
   }
 }

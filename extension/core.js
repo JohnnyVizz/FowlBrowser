@@ -4,7 +4,7 @@
 const NO_REPLY = Symbol('no reply');
 const DEFAULT_LABEL = 'Claude';
 const COMMAND_TIMEOUT_MS = 30_000;
-const CHANGED_DELAY_MS = 200;
+const LISTED_WINDOW_TYPES = ['normal', 'popup', 'app'];
 // CDP policy: a client drives its own tab and that tab's child targets (iframes, workers), never the browser,
 // other tabs, the user's focus or the whole profile's cookies and storage. Refused for every client; the relay
 // answers what Playwright needs from these itself.
@@ -81,7 +81,6 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // Bumped when the native port closes: the next host restarts client and request ids, so work and replies
   // from the old port must never reach the new one.
   let generation = 0;
-  let changedTimer = null;
   let instanceIdPromise = null;
   const activityWatchers = new Set(); // clients that asked for tabs.activity events (tools/rounds.mjs monitors)
 
@@ -402,31 +401,21 @@ export function createCore({ chrome, send, timers = globalThis }) {
 
     // Tabs of normal, popup and app windows (an owned tab can sit in a popup), never DevTools or incognito ones.
     async 'tabs.listAll'(_params, { client }) {
-      const windows = new Map((await chrome.windows.getAll({ windowTypes: ['normal', 'popup', 'app'] }))
+      const windows = new Map((await chrome.windows.getAll({ windowTypes: LISTED_WINDOW_TYPES }))
         .filter((w) => !w.incognito).map((w) => [w.id, w.type]));
       const tabs = (await chrome.tabs.query({})).filter((t) => !t.incognito && windows.has(t.windowId));
       const titles = new Map((await chrome.tabGroups.query({})).map((g) => [g.id, g.title]));
-      return tabs.map((t) => {
-        const owner = owners.get(t.id);
-        return {
-          id: t.id,
-          windowId: t.windowId,
-          windowType: windows.get(t.windowId),
-          index: t.index,
-          url: t.url || t.pendingUrl || '',
-          title: t.title ?? '',
-          active: t.active,
-          pinned: t.pinned,
-          audible: !!t.audible,
-          muted: !!t.mutedInfo?.muted,
-          groupTitle: titles.get(t.groupId) ?? null,
-          owner: owner ? (owner.client === client ? 'you' : 'other') : null,
-          origin: owner?.origin ?? null,
-          handedOver: !!owner?.handedOver,
-          kept: !!owner?.kept,
-          parked: owner?.parked?.kind ?? null,
-        };
-      });
+      return tabs.map((t) => tabEntry(t, windows.get(t.windowId), titles.get(t.groupId), client));
+    },
+
+    // One tab as tabs.listAll lists it, or null where listAll would leave it out (gone, incognito, DevTools).
+    async 'tabs.info'({ tabId } = {}, { client }) {
+      const t = await chrome.tabs.get(tabId).catch(() => null);
+      if (!t || t.incognito) return null;
+      const window = await chrome.windows.get(t.windowId).catch(() => null);
+      if (!window || window.incognito || !LISTED_WINDOW_TYPES.includes(window.type)) return null;
+      const group = t.groupId >= 0 ? await chrome.tabGroups.get(t.groupId).catch(() => null) : null;
+      return tabEntry(t, window.type, group?.title, client);
     },
 
     async 'tabs.open'(params, ctx) {
@@ -832,12 +821,27 @@ export function createCore({ chrome, send, timers = globalThis }) {
     }
   }
 
-  function scheduleChanged() {
-    if (changedTimer) return;
-    changedTimer = timers.setTimeout(() => {
-      changedTimer = null;
-      send({ method: 'tabs.changed', params: [] });
-    }, CHANGED_DELAY_MS);
+  // A tab as tabs.listAll and tabs.info describe it to `client`.
+  function tabEntry(t, windowType, groupTitle, client) {
+    const owner = owners.get(t.id);
+    return {
+      id: t.id,
+      windowId: t.windowId,
+      windowType,
+      index: t.index,
+      url: t.url || t.pendingUrl || '',
+      title: t.title ?? '',
+      active: t.active,
+      pinned: t.pinned,
+      audible: !!t.audible,
+      muted: !!t.mutedInfo?.muted,
+      groupTitle: groupTitle ?? null,
+      owner: owner ? (owner.client === client ? 'you' : 'other') : null,
+      origin: owner?.origin ?? null,
+      handedOver: !!owner?.handedOver,
+      kept: !!owner?.kept,
+      parked: owner?.parked?.kind ?? null,
+    };
   }
 
   async function onDebuggerEvent(source, method, params) {
@@ -1005,7 +1009,6 @@ export function createCore({ chrome, send, timers = globalThis }) {
 
   async function onTabRemoved(tabId, removeInfo) {
     await ready;
-    scheduleChanged();
     childTargets.delete(tabId);
     expectations.delete(tabId);
     windowOf.delete(tabId);
@@ -1023,7 +1026,6 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // does a cleanup still due for it (the one queued for the old id finds the record gone and does nothing).
   async function onTabReplaced(addedTabId, removedTabId) {
     await ready;
-    scheduleChanged();
     folded.delete(removedTabId);
     const owner = owners.get(removedTabId);
     if (!owner) return;
@@ -1035,11 +1037,6 @@ export function createCore({ chrome, send, timers = globalThis }) {
     // replacedBy: nobody closed it (the owner must not take it for the user closing the tab).
     emitToOwner(owner, 'chrome.tabs.onRemoved', [removedTabId, { windowId: tab.windowId, isWindowClosing: false, replacedBy: addedTabId }]);
     if (!owner.parked) emitToOwner(owner, 'chrome.tabs.onCreated', [tab]); // a parked one attaches only when resumed
-  }
-
-  async function onTabUpdated(_tabId, changeInfo) {
-    await ready;
-    if ('url' in changeInfo || 'title' in changeInfo) scheduleChanged();
   }
 
   // --- Popups that Chrome opens as the active tab ---
@@ -1085,8 +1082,6 @@ export function createCore({ chrome, send, timers = globalThis }) {
     }
     activity('created', { tabId: tab?.id, windowId: tab?.windowId, active: !!tab?.active });
     switchBackFromPopup(tab);
-    await ready;
-    scheduleChanged();
   }
 
   async function onNavigationTarget({ sourceTabId, tabId }) {
@@ -1194,6 +1189,11 @@ export function createCore({ chrome, send, timers = globalThis }) {
     activity('windowFocus', { tabId: null, windowId, active: windowId >= 0 });
   }
 
+  function onWindowRemoved(windowId) {
+    activeByWindow.delete(windowId);
+    armedWindows.delete(windowId);
+  }
+
   // The host and every client it served are gone; whatever is still in flight belongs to the old port.
   async function portClosed() {
     generation++;
@@ -1221,10 +1221,10 @@ export function createCore({ chrome, send, timers = globalThis }) {
     onNavigationCommitted,
     onTabRemoved,
     onTabReplaced,
-    onTabUpdated,
     onTabActivated,
     onWindowCreated,
     onWindowFocusChanged,
+    onWindowRemoved,
     onDownloadCreated,
     onDownloadChanged,
     // for tests

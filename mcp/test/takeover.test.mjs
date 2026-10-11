@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 import { Browser, Tab } from '../src/browsers.mjs';
-import { Activity, agentActed, inputHow, markEnding, navigationHow, USER_BINDING, watchTakeovers, watchUserInput } from '../src/takeover.mjs';
+import { Activity, agentActed, agentInput, inputHow, markEnding, navigating, navigationHow, USER_BINDING, watchTakeovers, watchUserInput } from '../src/takeover.mjs';
 import { registerTools } from '../src/tools.mjs';
 import { endTurn } from '../src/turns.mjs';
 
@@ -31,6 +31,7 @@ async function fakeBrowser({ ids = [1], seen = { shown: true, focused: true }, l
       await hold[method === 'chrome.debugger.sendCommand' ? params[1] : method];
       if (method === 'tabs.isShown') return seen;
       if (method === 'tabs.listAll') return listed();
+      if (method === 'tabs.info') return listed().find((t) => t.id === params.tabId) ?? null;
       if (method === 'tabs.claim') return { id: params.tabId };
       if (method === 'chrome.debugger.sendCommand' && params[1] === 'Target.getTargetInfo') return { targetInfo: { title: 'Checkout' } };
       if (method === 'chrome.debugger.sendCommand' && params[1] !== 'Runtime.addBinding' && params[1] !== 'Page.addScriptToEvaluateOnNewDocument'
@@ -66,7 +67,7 @@ function toolsFor(browser) {
 const parks = (browser) => browser.requests.filter(([m]) => m === 'tabs.park').map(([, p]) => p);
 const report = (tab, type, at, what = '') => tab.emit('binding', USER_BINDING, JSON.stringify({ type, at, what }));
 
-test('agent windows: a call on the tab or relayed input covers [start - 50, end + 250] ms', async () => {
+test('agent windows: relayed input covers [sent - 50, replied + 250] ms; the agent\'s navigations count for commits only', async () => {
   const activity = new Activity();
   const done = activity.begin();
   const start = Date.now();
@@ -79,11 +80,20 @@ test('agent windows: a call on the tab or relayed input covers [start - 50, end 
   assert.ok(activity.covers(end + 1700, 1750), 'navigation margin');
 
   const browser = await fakeBrowser({ ids: [4] });
-  const input = browser.relay.onInput(4);
-  assert.ok(agentActed(browser, 4, Date.now()));
+  const input = browser.relay.onInput(4, 'Input.dispatchKeyEvent', { type: 'keyDown' });
+  assert.ok(agentInput(browser, 4, Date.now()) && agentActed(browser, 4, Date.now()));
   input();
-  assert.ok(!agentActed(browser, 4, Date.now() + 400));
-  assert.ok(!agentActed(browser, 5, Date.now()), 'other tabs are not covered');
+  assert.ok(!agentInput(browser, 4, Date.now() + 400) && !agentActed(browser, 4, Date.now() + 400));
+  assert.ok(!agentInput(browser, 5, Date.now()), 'other tabs are not covered');
+
+  const tab = browser.tabs.get(4);
+  let finish;
+  const running = tab.run(() => navigating(tab, () => new Promise((resolve) => { finish = resolve; })));
+  await sleep(5);
+  assert.ok(agentActed(browser, 4, Date.now()), 'a navigation of the agent covers a commit');
+  assert.ok(!agentInput(browser, 4, Date.now() + 400), 'but not input in the page');
+  finish();
+  await running;
 });
 
 test('what the user did, in words', () => {
@@ -116,16 +126,14 @@ test('navigation rules: address bar and bookmarks always; reload and back/forwar
   assert.equal(how('typed', ['forward_back'], { agentActed: true }), null);
 });
 
-test('input in the page is the user\'s only outside agent windows, in the shown tab of the focused window', async () => {
+test('input in the page is the user\'s outside the input the agent sends, in the shown tab of the focused window', async () => {
   const browser = await fakeBrowser({ ids: [1] });
   const tab = browser.tabs.get(1);
-  let finish;
-  const running = tab.run(() => new Promise((resolve) => { finish = resolve; }));
+  const input = browser.relay.onInput(1, 'Input.dispatchMouseEvent', { type: 'mousePressed' });
   report(tab, 'pointerdown', Date.now(), 'Pay now');
   await sleep(10);
-  assert.deepEqual(parks(browser), [], 'during a call');
-  finish();
-  await running;
+  assert.deepEqual(parks(browser), [], 'during the agent\'s input');
+  input();
   report(tab, 'pointerdown', Date.now() + 100, 'Pay now');
   await sleep(10);
   assert.deepEqual(parks(browser), [], 'right after it');
@@ -142,6 +150,24 @@ test('input in the page is the user\'s only outside agent windows, in the shown 
   const result = await call('console', { tab: `${browser.key}:1` });
   assert.equal(result.error, true);
   assert.match(result.text, new RegExp(`The user took over ${browser.key}:1 at \\d\\d:\\d\\d \\(typed in "Search"\\)\\. Stop working in that tab, tell the user where you got to, and ask before going on\\. If they say to carry on there, call tab_claim on it with resume: true\\.`));
+});
+
+test('a read or wait running on the tab, or calls queued behind it, do not mask the user\'s input; the queued call gets the notice', async () => {
+  const browser = await fakeBrowser({ ids: [1] });
+  const tab = browser.tabs.get(1);
+  const call = toolsFor(browser);
+  let finish;
+  const waiting = tab.run(() => new Promise((resolve) => { finish = resolve; })); // e.g. wait_for seconds: 120
+  const queued = call('console', { tab: `${browser.key}:1` });
+  await sleep(10);
+  report(tab, 'pointerdown', Date.now(), 'Pay now');
+  await sleep(10);
+  assert.deepEqual(parks(browser), [{ tabId: 1, kind: 'takeover' }], 'taken over while the call ran');
+  finish();
+  await waiting;
+  const result = await queued;
+  assert.equal(result.error, true);
+  assert.match(result.text, /took over .*:1 at .* \(clicked "Pay now"\)/);
 });
 
 test('notices: once at the start of the next result of any other tool, and on every call of the taken-over tab', async () => {

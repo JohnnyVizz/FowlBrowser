@@ -122,7 +122,7 @@ function fakeTab(fail = {}) {
   const params = [];
   const counts = {};
   host.request = async (method, args) => {
-    if (method === 'tabs.listAll') return [];
+    if (method === 'tabs.info') return null;
     const [, command, p] = args;
     sent.push(command);
     params.push(p);
@@ -239,12 +239,37 @@ test('trace_stop end to end: summary and file, and the close listener goes with 
   assert.notEqual(await slotIsFree(), null, 'slot released');
 });
 
-test('trace_stop: a failing Tracing.end stops waiting for tracingComplete and ends the recording', async () => {
+test('trace_stop: a refused Tracing.end stops waiting for tracingComplete and keeps the recording for a retry', async () => {
+  const tab = fakeTab({ 'Tracing.end': (n) => (n === 1 ? 'end failed' : undefined) });
+  await tools.trace_start(tab, { reload: false, auto_stop: false });
+  await assert.rejects(tools.trace_stop(tab), /^Error: Chrome did not stop the recording: end failed\. Call trace_stop again\.$/);
+  assert.equal(tab.browser.host.listenerCount('chrome.debugger.onEvent'), 0);
+  assert.ok(tab.trace.startedAt, 'still tracked');
+  assert.equal(tab.page.listenerCount('close'), 1);
+  assert.equal(await slotState(), 'held', 'slot still held');
+  const out = await tools.trace_stop(tab);
+  fs.rmSync(/^File: (\S+)/m.exec(out)[1]);
+  assert.match(out, /^INP: 231 ms /m);
+  assert.deepEqual(tab.sent, ['Tracing.start', 'Tracing.end', 'Tracing.end', 'IO.read', 'IO.close']);
+  assert.equal(tab.page.listenerCount('close'), 0);
+  assert.ok(!tab.trace.startedAt);
+  assert.equal(await slotState(), 'free', 'slot released by the retry');
+});
+
+test('trace_stop: a refused Tracing.end in a tab that closed meanwhile lets the recording go', async () => {
   const tab = fakeTab({ 'Tracing.end': 'end failed' });
   await tools.trace_start(tab, { reload: false, auto_stop: false });
-  await assert.rejects(tools.trace_stop(tab), /end failed/);
-  assert.equal(tab.browser.host.listenerCount('chrome.debugger.onEvent'), 0);
+  tab.page.isClosed = () => true;
+  await assert.rejects(tools.trace_stop(tab), /^Error: end failed$/);
   assert.equal(tab.page.listenerCount('close'), 0);
+  assert.ok(!tab.trace.startedAt);
+  assert.notEqual(await slotIsFree(), null, 'slot released');
+});
+
+test('trace_stop: Chrome saying no trace is running lets the recording go', async () => {
+  const tab = fakeTab({ 'Tracing.end': 'Tracing is not started' });
+  await tools.trace_start(tab, { reload: false, auto_stop: false });
+  await assert.rejects(tools.trace_stop(tab), /^Error: Tracing is not started$/);
   assert.ok(!tab.trace.startedAt);
   assert.notEqual(await slotIsFree(), null, 'slot released');
 });
