@@ -78,6 +78,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
   let generation = 0;
   let changedTimer = null;
   let instanceIdPromise = null;
+  const activityWatchers = new Set(); // clients that asked for tabs.activity events (tools/rounds.mjs monitors)
 
   const ready = restore();
 
@@ -661,6 +662,13 @@ export function createCore({ chrome, send, timers = globalThis }) {
       return reload(msg, reply, { reloaded: true });
     },
 
+    // A monitor's exact view of focus: every tab activation and creation, window creation and window focus change,
+    // as `tabs.activity` events to this client until it disconnects. Polling tabs.listAll misses short flashes.
+    async 'tabs.watchActivity'(_params, { client }) {
+      activityWatchers.add(client);
+      return { ok: true };
+    },
+
     async 'extension.info'() {
       const ownedTabs = {};
       for (const { client } of owners.values()) ownedTabs[client] = (ownedTabs[client] ?? 0) + 1;
@@ -946,6 +954,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
   }
 
   async function onTabActivated({ tabId, windowId }) {
+    activity('activated', { tabId, windowId, active: true });
     await ready;
     const record = activeByWindow.get(windowId);
     if (record?.current !== tabId) activeByWindow.set(windowId, { current: tabId, previous: record?.current });
@@ -955,6 +964,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // Only webNavigation's navigation-target event decides whose it is: Helium reports the window's active tab as
   // openerTabId, which can be the user's or another session's, so openerTabId is never used.
   async function onTabCreated(tab) {
+    activity('created', { tabId: tab?.id, windowId: tab?.windowId, active: !!tab?.active });
     switchBackFromPopup(tab);
     await ready;
     scheduleChanged();
@@ -1021,6 +1031,31 @@ export function createCore({ chrome, send, timers = globalThis }) {
     log('adopt: handed to client', tabId, owner.client);
   }
 
+  // tabs.activity for watchers: `at` is taken when the event arrives, the window type looked up after (in a chain, so
+  // events leave in the order they came).
+  let activitySent = Promise.resolve();
+  function activity(kind, fields) {
+    if (!activityWatchers.size) return;
+    const at = Date.now();
+    const typed = fields.windowType !== undefined || !(fields.windowId >= 0) ? Promise.resolve(fields.windowType ?? null)
+      : chrome.windows.get(fields.windowId).then((w) => w.type, () => null);
+    activitySent = activitySent.then(() => typed).then((windowType) => {
+      for (const client of activityWatchers) {
+        if (liveClients.has(client)) emit(client, 'tabs.activity', { kind, ...fields, windowType, at });
+        else activityWatchers.delete(client);
+      }
+    });
+  }
+
+  function onWindowCreated(window) {
+    activity('windowCreated', { tabId: null, windowId: window.id, active: !!window.focused, windowType: window.type });
+  }
+
+  // windowId is chrome.windows.WINDOW_ID_NONE (-1) when the browser itself lost focus.
+  function onWindowFocusChanged(windowId) {
+    activity('windowFocus', { tabId: null, windowId, active: windowId >= 0 });
+  }
+
   // The host and every client it served are gone; whatever is still in flight belongs to the old port.
   async function portClosed() {
     generation++;
@@ -1049,6 +1084,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
     onTabReplaced,
     onTabUpdated,
     onTabActivated,
+    onWindowCreated,
+    onWindowFocusChanged,
     onDownloadCreated,
     onDownloadChanged,
     // for tests
