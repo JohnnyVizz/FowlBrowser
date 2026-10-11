@@ -476,12 +476,11 @@ async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenT
   return report(tab, { lines, newTabs, snapshot: snapshot && !tab.dialog, changes: true });
 }
 
-// checkRefs: false for tools whose action already fails fast on a gone ref (quickly, selectOnce).
-function withTab(manager, handler, { checkRefs: check = true } = {}) {
+function withTab(manager, handler) {
   return async (args) => {
     const tab = await resolveTab(manager, args.tab);
     return tab.run(async () => {
-      if (check) await checkRefs(tab, args);
+      await checkRefs(tab, args);
       return handler(tab, args);
     }).catch((error) => {
       // Playwright names the ref it was given; the agent knows it by the number it was shown.
@@ -1197,7 +1196,7 @@ export function registerTools(server, manager) {
           for (const m of [...mods].reverse()) await tab.page.keyboard.up(m);
         }
       });
-    }), { checkRefs: false }));
+    })));
 
   tool('hover', 'Move the mouse over an element (opens hover menus, tooltips).',
     { tab: tabArg, ref: shadowRefArg, snapshot: snapshotArg, timeout_ms: timeoutArg },
@@ -1208,7 +1207,7 @@ export function registerTools(server, manager) {
       }
       const { x, y } = await shadowRefPoint(tab, args.ref);
       await pointed(tab, { x, y }, () => tab.page.mouse.move(x, y), { feedback: false });
-    }), { checkRefs: false }));
+    })));
 
   tool('type',
     'Type text into an editable element. Replaces its content unless append is true. slowly types one key at a time (for fields that react per key, like search suggestions). submit presses Enter after. ' +
@@ -1263,7 +1262,7 @@ export function registerTools(server, manager) {
       const loc = locator(tab, args.ref);
       const chosen = await pointed(tab, refPoint(tab, args.ref), () => selectOnce(tab, args.ref, loc, args.values, args.timeout_ms));
       return `Selected: ${chosen.join(', ')}`;
-    }), { checkRefs: false }));
+    })));
 
   tool('press_key',
     'Press a key or combo, e.g. "Enter", "Escape", "ArrowDown", "ControlOrMeta+a". With ref, focuses that element first; otherwise goes to the focused element.',
