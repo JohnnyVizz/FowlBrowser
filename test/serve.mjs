@@ -43,7 +43,8 @@ async function handle(req, res) {
   res.end(body);
 }
 
-for (const port of [5411, 5412]) {
+const base = Number(process.env.FOWLBROWSER_TEST_PORT) || 5411;
+for (const port of [base, base + 1]) {
   createServer((req, res) => handle(req, res).catch(() => res.writeHead(500).end()))
     .listen(port, '127.0.0.1', () => console.log(`serving test/site on http://127.0.0.1:${port}`));
 }

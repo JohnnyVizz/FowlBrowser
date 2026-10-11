@@ -24,7 +24,7 @@ export default {
     t.eq(r.same.agree, false, 'same-origin checkbox');
     t.eq(r.cross.text, `cross ${t.tag}`, 'cross-origin text');
     t.eq(r.cross.agree, true, 'cross-origin checkbox');
-    t.ok(r.cross.origin.endsWith(':5412'), `cross frame origin ${r.cross.origin}`);
+    t.ok(r.cross.origin.endsWith(`:${new URL(t.cross).port}`), `cross frame origin ${r.cross.origin}`);
 
     t.step('iframe loads a new page: its old refs are refused, the new ones work');
     const oldText = t.ref(await t.snapshot(tab), 'textbox', 'Frame text', 0);

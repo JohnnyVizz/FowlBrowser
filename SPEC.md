@@ -271,7 +271,8 @@ to give a window back the tab that was active before an agent popup took its pla
   `evaluate {tab, function | expression, ref?}` (the source is evaluated as an expression and called, with the element for a ref, if it is a function, so plain expressions work too), `media {tab, action: status|play|pause|toggle|seek|volume|rate|mute|unmute, value?, ref?}`
   (first visible video/audio, or the ref; if play() is refused for lack of a user gesture, click the media element
   and retry; inside YouTube's `#movie_player` it uses the player's own mute/unMute/setVolume/seekTo/playVideo/
-  pauseVideo/setPlaybackRate so YouTube's controls match; mute/unmute never touch the tab's audio, tab_mute does), `console {tab, level?, limit?}`, `network {tab, filter?, limit?}`.
+  pauseVideo/setPlaybackRate so YouTube's controls match; mute/unmute never touch the tab's audio, tab_mute does), `console {tab, level?, limit?}`, `network {tab, filter?, limit?}`, and the
+  performance tools `trace_start`, `trace_stop`, `trace_insight`, `lighthouse` and `memory` (section "Performance tools").
 - Downloads and browsing data (`mcp/src/browserData.mjs`): `download {tab, url? | ref?, wait_ms?=30000 (max 300000)}` (url:
   `downloads.start`; ref: `downloads.expect`, then the click tool's own handler, then waits for a new download of that
   tab, one ref download per tab at a time; an ambiguous download times out with a hint to pass url; then waits until complete, interrupted, held as dangerous, or the deadline; returns path, size, mime, state, url),
@@ -517,3 +518,88 @@ name could send anything.
 - Adoption (`Browser._adopt`) looks the tab's ownership up right before installing (a keep or release that landed
   first means no install), and tab_keep and tab_release wait for an adoption in flight (`browser.adopting`) before
   removing the scripts, and once more after their request (an adoption that looked the tab up before it took effect).
+
+## Performance tools (2026-10-11): traces, Lighthouse, memory
+
+`mcp/src/perf.mjs` (shared helpers, `memory`), `trace.mjs`, `lighthouse.mjs`. All of them talk to the tab's own debugger
+session through `cdp.mjs` (raw CDP through the host, with a session id for a flattened child), beside Playwright's relay
+session: the relay's emulation swallowing does not apply, and overrides set this way end with the session (release and close detach, which
+clears every Emulation and Network override; `clearEmulation` clears them while the tab stays controlled). An extension
+session has no `HeapProfiler`, `Profiler`, `Memory` or `Animation` domain (Chrome 155 answers "wasn't found"): no heap
+snapshots and no JS coverage this way; `Browser.*` stays blocked (the Lighthouse shim answers `Browser.getVersion` from
+the extension's user agent). Dependencies, imported lazily on first use: `@paulirish/trace_engine` (DevTools' trace engine
+and insights, BSD-3-Clause, the version Lighthouse pins) and `lighthouse` (Apache-2.0). Chrome records one trace per
+browser and the trace engine parses one trace at a time per process (its handlers are module state), so recordings and
+Lighthouse runs of one server take turns (`tracingSlot`, process-wide; a holder that never releases is skipped after 10
+  min); a recording of another session or of DevTools makes `Tracing.start` fail and the tool says so. A tab the user owns
+(claimed, `for_user`, kept) is never reloaded for a measurement (`isUsersTab`). File names carry a millisecond stamp and
+the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements never share one.
+
+- `trace_start {tab, reload?=true, auto_stop?=true, seconds?=5 (1..60)}`: records a DevTools performance trace of the tab
+  (DevTools' default timeline categories plus JS sampling and screenshots, `Tracing.start` with `ReturnAsStream` and a
+  1.2 GB trace buffer, as puppeteer records: a busy site's load overflowed Chrome's default buffer and lost its navigation). With
+  `reload` the tab first goes to about:blank, tracing starts, and the page loads again (so the trace holds the navigation);
+  without it tracing starts on the page as it is (for interactions: click, type and the other tools work while recording;
+  pointer actions skip their 1 s quick verdict then, since a slow handler is the point). `reload` is refused on a claimed
+  tab (the user's page), like Lighthouse's navigation mode. Chrome records one trace at a time per browser (a trace, a
+  Lighthouse run or DevTools in any tab): a second `Tracing.start` errors and the tool says so. The tracing slot is taken
+  before the page is blanked; if `Tracing.start` fails, the slot is released and the page loaded again before the error.
+  With `auto_stop` it waits `seconds` after the load (or after the start) and returns what `trace_stop` returns; without it
+  the result says the trace is recording and `trace_stop` ends it. One recording per tab; a second `trace_start` meanwhile
+  errors, a `trace_stop` without a recording errors.
+- `trace_stop {tab}`: `Tracing.end` (a failed one stops the wait for `tracingComplete` at once), reads the stream
+  (`IO.read`, 1 MB chunks; `IO.close` whatever happens), saves it gzipped to
+  `os.tmpdir()/fowlbrowser-traces/trace-<stamp>-<tab>.json.gz` (loads in DevTools' Performance panel), parses it with the
+  trace engine (then resets the engine's module state, which otherwise keeps the raw events; the parsed data kept per tab
+  is untouched) and returns the summary: the URL, the trace length and event count, the file path, CPU and network
+  throttling (always none here), then per insight set (one per navigation, `NAVIGATION_0`, ...; `NO_NAVIGATION` for a
+  trace without one): its URL and bounds, lab metrics (LCP with its TTFB, load delay, load duration and render delay
+  subparts and the LCP element; INP with its interaction, or "n/a (no interactions)"; CLS), long tasks on the main thread
+  (count over 50 ms, the longest), then the insights that fail or inform (name, title, estimated metric savings, wasted
+  bytes), on one line the names that pass, `Not computed (needs source maps, which are not fetched): DuplicatedJavaScript`
+  (no source maps are resolved, so that insight would always pass), and `Could not compute:` for insights whose generator
+  failed (`modelErrors`, with the message). No field (CrUX) data. The parsed trace is kept per tab (the last one only;
+  dropped with the tab) for `trace_insight`, which reports a failed generator's error and the source-map note the same way.
+- `trace_insight {tab, name, set?}`: details of one insight (`name` as listed, e.g. `LCPBreakdown`, `RenderBlocking`,
+  `DocumentLatency`, `ImageDelivery`, `INPBreakdown`, `CLSCulprits`, `ThirdParties`, `DOMSize`, `ForcedReflow`,
+  `NetworkDependencyTree`, `DuplicatedJavaScript`, `LegacyJavaScript`, `FontDisplay`, `Viewport`, `Cache`,
+  `SlowCSSSelector`, `ModernHTTP`, `CharacterSet`, `LCPDiscovery`) of the tab's last trace, `set` defaulting to the first
+  insight set: title, description, state, estimated savings, then the insight's own data (subparts, requests with
+  durations and sizes, checklists, culprits, phases, entities, top functions) in compact lines, cut at 20,000 chars.
+- `lighthouse {tab, device?="mobile"|"desktop", mode?="navigation"|"snapshot", categories?}`: runs Lighthouse (all five
+  categories by default: performance, accessibility, best-practices, seo, agentic-browsing) in the tab, over its own
+  debugger session, through a fake puppeteer page (`url()`, `target().createCDPSession()`; the session routes commands and
+  events, flattened child sessions as `sessionattached`, answers `Browser.getVersion` and `Animation.enable/disable`
+  itself, and holds at most 64 requests in flight: the host refuses a client with over 256). Device emulation as Lighthouse's
+  own presets (mobile: 412x823 at 1.75, Moto G Power user agent; desktop: `desktopConfig`), `throttlingMethod` simulate
+  (Lighthouse's default), `disableStorageReset` (never clears the user's cache or site data; the cache is bypassed with
+  `Network.setCacheDisabled` during the run instead), `skipAudits: bf-cache, unused-javascript, script-treemap-data` (need
+  chrome:// navigation or the Profiler domain). `navigation` reloads the page (about:blank, then the URL again): refused on a
+  claimed or handed-over tab (the user's page; audit a `tab_open` of the URL instead, or use `snapshot`). `snapshot`
+  audits the page as it is (`screenEmulation` disabled, no user agent override, no full-page screenshot, whose gatherer
+  would emulate a device on its own; `device` only sets the audit thresholds) and its first line says so. The session hands events to Lighthouse's listeners one by one, swallowing a listener's
+  synchronous throw and its rejected promise (its async target listeners would otherwise end the process when a child
+  target vanishes mid-answer); once the run ends, queued and new sends fail with "Target closed" (benign to Lighthouse)
+  and the run waits up to 45 s for sends in flight (a host request can take that long to time out). For a navigation run
+  Playwright leaves the tab (its relay session only; the debugger stays attached) and the same Tab gets a fresh page
+  afterwards (`Tab.attachPage`; its id, queue and buffers stay, refs start over with the new document): with both on one
+  session, Lighthouse's network-quiet wait ran to its cap on busy pages (the BBC: about 80 s against 35 s). Calls on the
+  tab meanwhile queue behind the run. If the tab closes or the user cancels debugging during the run, the tab is not
+  taken back (the extension's rules apply: closed is gone, canceled needs a `tab_claim`) and the tool errors saying so;
+  a failed take-back or final load errors too, naming the report paths. `maxWaitForLoad` 30 s, as chrome-devtools-mcp sets it.
+  After the run, whatever happened: `clearEmulation`, cache enabled again, blocked URLs cleared, the scripts Lighthouse
+  added with `Page.addScriptToEvaluateOnNewDocument` removed, `Page` (with lifecycle events), `Runtime`, `Network` and
+  `Log` enabled again for Playwright (a snapshot run shares the session and Lighthouse disables them when it finishes),
+  the trace engine's module state reset (Lighthouse parses its trace with the same engine), and after a navigation run
+  the fresh page loads the URL once more, so the document the agent goes on with has none of Lighthouse's init scripts
+  (one wraps `window.requestIdleCallback` in every frame). Lighthouse records a trace, so a run takes the tracing slot like
+  `trace_start` (this server's runs queue; another session's or DevTools' recording makes it fail, saying so). Result:
+  Lighthouse version, device, mode and wall time; scores as 0-100 (a category holding only weight-0 audits, performance in
+  snapshot mode, prints `n/a (<passed> of <n> audits pass)` instead of Lighthouse's 0); FCP, LCP, TBT, CLS, Speed Index and
+  TTI when the run has them; failed or flagged audits (score under 1; informative, manual and not-applicable ones skipped;
+  one line per audit, the heaviest category wins) by category weight, up to 20, binary ones as `fail`, others as their
+  score, with their display value; run warnings; the report paths `os.tmpdir()/fowlbrowser-lighthouse/<stamp>-<tab>/report.html`
+  and `report.json`.
+- `memory {tab}`: `Performance.getMetrics` and `Runtime.getHeapUsage`: JS heap used and total, engine (embedder) objects,
+  DOM nodes, JS event listeners, documents and frames alive in the renderer, and the change since the last reading of the
+  same document (kept per tab). No heap snapshots (see above).

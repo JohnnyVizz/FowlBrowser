@@ -7,6 +7,7 @@ import { callOnShadowRef, cleanRef, closedShadowSection, focusShadowRef, isShado
 import * as cursor from './cursor/index.mjs';
 import { debug } from './debug.mjs';
 import { EXPORT_DESCRIPTION, exportShape, exportTab } from './exports.mjs';
+import { registerPerf } from './perf.mjs';
 import { uninstallPopups } from './popups.mjs';
 import * as record from './record.mjs';
 import * as takeover from './takeover.mjs';
@@ -538,6 +539,8 @@ async function blockedError(tab, ref, loc, blocked) {
 
 export async function quickly(tab, ref, loc, attempt, timeout) {
   if (timeout !== undefined) return attempt(timeout);
+  // While a trace records, the page runs slower (JS sampling) and a slow handler is the point: no quick verdict.
+  if (tab.trace?.startedAt) return attempt(ACTION_TIMEOUT_MS);
   const started = Date.now();
   try {
     return await attempt(QUICK_MS);
@@ -1437,4 +1440,5 @@ export function registerTools(server, manager) {
     withTab(manager, async (tab, args) => text(`${await header(tab)}\n${await cued(tab, 'observe', () => exportTab(tab, args))}`)));
 
   registerBrowserData(tool, manager, { click: (args) => handlers.click(args), parseTabId });
+  registerPerf(tool, manager, { withTab: (handler) => withTab(manager, handler), header, text, tabArg });
 }

@@ -5,13 +5,13 @@
 <h1>Iframes</h1>
 <p>Same origin:</p>
 <iframe id="same" title="Same-origin frame" src="frame-form.html?frame=same" width="420" height="190"></iframe>
-<p>Cross origin (other site: localhost:5412, so it runs out of process):</p>
+<p>Cross origin (other site: localhost on the next port, so it runs out of process):</p>
 <iframe id="cross" title="Cross-origin frame" width="420" height="190"></iframe>
 <div id="result" role="status" aria-label="Result">{}</div>
 <script>
   // localhost vs 127.0.0.1 is a different site, which forces an out-of-process iframe in Chrome.
   const crossHost = location.hostname === 'localhost' ? '127.0.0.1' : 'localhost';
-  document.getElementById('cross').src = `http://${crossHost}:5412/frame-form.html?frame=cross`;
+  document.getElementById('cross').src = `http://${crossHost}:${Number(location.port) + 1}/frame-form.html?frame=cross`;
   const results = {};
   addEventListener('message', e => {
     if (!e.data || !e.data.frame) return;

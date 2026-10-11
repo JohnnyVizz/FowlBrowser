@@ -1,6 +1,7 @@
-// Raw CDP to a controlled tab's own session, through the host and the extension (never through Playwright's relay).
-export function cdp(tab, method, params = {}) {
-  return tab.browser.host.request('chrome.debugger.sendCommand', [{ tabId: tab.tabId }, method, params]);
+// Raw CDP to a controlled tab's own session, or to one of its flattened child sessions (iframes, workers), through the
+// host and the extension (never through Playwright's relay).
+export function cdp(tab, method, params = {}, sessionId) {
+  return tab.browser.host.request('chrome.debugger.sendCommand', [{ tabId: tab.tabId, sessionId }, method, params]);
 }
 
 // Page-side bindings of FowlBrowser's own scripts (Runtime.addBinding) are named with this prefix. Their

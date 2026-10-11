@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Perf test page</title>
+<link rel="stylesheet" href="style.css?delay=300">
+<h1>Perf test page</h1>
+<p id="status">idle</p>
+<button id="slow">Slow click</button>
+<button id="leak">Leak</button>
+<p id="hero"></p>
+<script>
+  // What the performance tools should find: a render-blocking slow stylesheet (above), a long task on load, a layout
+  // shift, a late large text block (LCP), a slow click handler (INP) and a leak button (memory).
+  const busy = (ms) => { const end = performance.now() + ms; while (performance.now() < end) {} };
+  addEventListener('load', () => busy(150));
+  setTimeout(() => {
+    const banner = document.createElement('div');
+    banner.style.cssText = 'height:100px;background:#fd6';
+    banner.textContent = 'late banner';
+    document.body.prepend(banner);
+  }, 400);
+  setTimeout(() => { document.getElementById('hero').textContent = 'Large text block. '.repeat(400); }, 600);
+  document.getElementById('slow').onclick = () => { busy(200); document.getElementById('status').textContent = 'slow:clicked'; };
+  window.leaked = [];
+  document.getElementById('leak').onclick = () => {
+    const nodes = [];
+    for (let i = 0; i < 300; i++) { const d = document.createElement('div'); d.textContent = 'leak ' + i; document.body.append(d); nodes.push(d); }
+    for (const d of nodes) d.remove();
+    window.leaked.push({ nodes, numbers: Array.from({ length: 200_000 }, (_, i) => i * 1.5) }); // ~1.6 MB in the JS heap
+    document.getElementById('status').textContent = `leaked ${window.leaked.length}`;
+  };
+</script>

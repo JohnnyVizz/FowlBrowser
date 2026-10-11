@@ -30,6 +30,8 @@ in front of you. Open an agent's tab whenever you like, and a cursor shows exact
   you. Tabs it opened for you stay open.
 - **Runs many agents at once.** Every agent session has its own tabs, so agents working in parallel never get in each
   other's way.
+- **Measures pages too.** Performance traces with Core Web Vitals, Lighthouse audits and memory readings, in the agent's
+  own tab, without a debugging port.
 
 ## What you can ask
 
@@ -42,6 +44,8 @@ Ask in plain words. The agent picks the browser you name, or the one where you'r
 > Use my Work browser to download last month's invoices from the billing page. Hand me the tab if it asks me to sign in.
 
 > Open YouTube in Helium, play my Watch Later list and leave the tab for me.
+
+> Why is this page slow? Trace it and tell me what to fix first.
 
 ## Install
 
@@ -150,6 +154,7 @@ by browser and id (`chrome:52`, `helium:1834`). There is no "current tab", so pa
 | Reading | `snapshot`, `screenshot`, `evaluate`, `console`, `network`, `wait_for`, `viewport` |
 | Acting | `navigate`, `click`, `hover`, `type`, `fill_form`, `select_option`, `press_key`, `scroll`, `drag`, `upload_files`, `dialog`, `media` |
 | Files and data | `download`, `downloads`, `export`, `browser_data` |
+| Performance | `trace_start`, `trace_stop`, `trace_insight`, `lighthouse`, `memory` |
 
 - `snapshot` returns an accessibility tree with element refs (`[ref=e12]`). After an action, results list only what
   changed since the last snapshot, and errors say why an action failed ("covered by the cookie banner").
@@ -160,6 +165,12 @@ by browser and id (`chrome:52`, `helium:1834`). There is no "current tab", so pa
 - `viewport` lays a tab out at a phone or window size and is reset before the tab goes back to the user.
 - `export` reads YouTube transcripts and Google Docs, Sheets and Slides directly. `browser_data` reads history,
   bookmarks, recently closed tabs and top sites, read only.
+- `trace_start` and `trace_stop` record a DevTools performance trace and explain it (LCP, INP, CLS, long tasks and the
+  same insights as the Performance panel; `trace_insight` has the details). `lighthouse` runs all five categories, as a
+  phone or a desktop. `memory` reads heap and DOM counts with the change since the last reading. All of it runs in the
+  agent's own tab; emulation is cleared afterwards, raw traces and reports are saved under the system temp folder, and
+  Lighthouse never clears your cache or site data. Heap snapshots need Chrome's debugging port, which FowlBrowser never
+  opens.
 
 ### Configuration
 
@@ -176,7 +187,8 @@ node --test extension/test/ mcp/test/ tools/test/ test/forms/test/ test/demo/tes
 node tools/fake-extension.mjs --test
 ```
 
-- `node test/run.mjs --browser both` runs the end-to-end scenarios against a local test site in real browsers.
+- `node test/run.mjs --browser both` runs the end-to-end scenarios against a local test site in real browsers
+  (`FOWLBROWSER_TEST_PORT=5451` moves the site so two checkouts can test at once).
 - `node tools/rounds.mjs` runs a round of real Claude agents at once (half in Helium, half in Chrome) and grades every
   run: the answer, whether the cursor was on target at each click, focus steals, sound, tabs left behind, time, tool
   calls and tokens. `report.html` shows a frame of the cursor at every click. Bring your own tasks with
