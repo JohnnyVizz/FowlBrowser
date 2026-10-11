@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Checkout</title>
+<link rel="stylesheet" href="style.css">
+<h1>Checkout</h1>
+<form id="pay">
+  <label>Name on card <input name="name" autocomplete="off"></label>
+  <label>Card number <input name="card" inputmode="numeric" autocomplete="off"></label>
+  <label>Expiry <input name="expiry" placeholder="MM/YY" autocomplete="off"></label>
+  <button type="button" id="pay-now">Pay now</button>
+</form>
+<p id="result">not paid</p>
+<script>
+  document.getElementById('pay-now').addEventListener('click', () => { document.getElementById('result').textContent = 'paid'; });
+</script>

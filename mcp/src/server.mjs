@@ -14,7 +14,9 @@ const INSTRUCTIONS = `FowlBrowser drives the user's own Google Chrome and Helium
 - After an action on the same page, the result lists only what changed since the tab's previous snapshot (new lines marked +); refs of unchanged elements stay valid. Call snapshot for the whole page; snapshot mode "text" reads an article or list as plain text.
 - Snapshots are numbered per tab. If a changes-only result is relative to a snapshot you did not receive (another agent used the tab), call snapshot.
 - Interact only through those tools, one action per call, never by scripting clicks, typing or form changes inside evaluate: they send real input (pages react as to a person), wait for what the action starts (navigation, requests), and the user watches an agent cursor do each one in the tab they are looking at. evaluate is for reading state the snapshot doesn't show. Independent actions on different tabs can run in parallel.
-- For a YouTube video's transcript or a Google Docs/Sheets/Slides file's content, use export instead of reading the page.`;
+- For a YouTube video's transcript or a Google Docs/Sheets/Slides file's content, use export instead of reading the page.
+- If a result says the user took over a tab, stop working in it, tell the user where you got to and ask before going on; tab_claim it with resume: true only after they said so in the conversation.
+- For what only the user should do (logins, codes, CAPTCHAs, payment), use tab_handoff and repeat its line to them; tab_claim with resume: true once they say they are done.`;
 
 const manager = new BrowserManager();
 const server = new McpServer({ name: 'fowlbrowser', version: '0.1.0' }, { instructions: INSTRUCTIONS });

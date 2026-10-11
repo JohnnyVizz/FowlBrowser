@@ -9,12 +9,15 @@ import { debug } from './debug.mjs';
 import { EXPORT_DESCRIPTION, exportShape, exportTab } from './exports.mjs';
 import { uninstallPopups } from './popups.mjs';
 import * as record from './record.mjs';
+import * as takeover from './takeover.mjs';
 import { callsByTab } from './turns.mjs';
 import { cap as capText, collapseText, functionSource, newRefState, numberRefs, playwrightRef, REF_PATTERN, shownRef, SNAPSHOT_MAX_CHARS, SNAPSHOT_MAX_CHARS_LIMIT,
   snapshotChanges, urlMatcher } from './snapshots.mjs';
 
 const MAX_CHARS = 80_000; // ~20k tokens, for evaluate, console and network output
 const POPUP_WAIT_MS = 2000; // after an action the page asked for a new tab: how long to wait for the extension to announce it
+// Tools that still work on a parked tab (taken over by the user, or handed to them); every other one gets its notice.
+const ON_PARKED_TABS = new Set(['tab_claim', 'tab_release', 'tab_close', 'tab_focus']);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // --- Schemas shared by many tools ---
@@ -792,6 +795,7 @@ async function typeText(tab, args) {
 
 export function registerTools(server, manager) {
   const handlers = {}; // raw handlers by tool name, so other tools can reuse one (download clicks with click's)
+  const failed = (args, message) => ({ isError: true, content: [{ type: 'text', text: `${args?.tab ? `Tab: ${args.tab}\n` : ''}Error: ${message}` }] });
   const tool = (name, description, shape, handler) => {
     handlers[name] = handler;
     server.registerTool(name, { description, inputSchema: shape }, (args) => record.recordCall(name, args, async () => {
@@ -801,19 +805,23 @@ export function registerTools(server, manager) {
       let tabKey = null;
       try { if (typeof args?.tab === 'string') { const { key, tabId } = parseTabId(args.tab); tabKey = `${key}:${tabId}`; } } catch {}
       if (tabKey) callsByTab.set(tabKey, (callsByTab.get(tabKey) ?? 0) + 1);
+      let result;
       try {
-        const result = await handler(args);
+        // A parked tab (taken over by the user, or handed to them) refuses everything but resuming or letting it go, at once.
+        const parked = tabKey && !ON_PARKED_TABS.has(name) && takeover.notice(tabKey);
+        if (parked) throw new Error(parked);
+        result = await handler(args);
         debug('tool <', name, `${Date.now() - started} ms`);
-        return result;
       } catch (error) {
         debug('tool !', name, `${Date.now() - started} ms`, String(error?.message ?? error));
-        let prefix = '';
-        if (args?.tab) prefix = `Tab: ${args.tab}\n`;
-        return { isError: true, content: [{ type: 'text', text: `${prefix}Error: ${cleanError(error)}` }] };
+        result = failed(args, cleanError(error));
       } finally {
         if (tabKey && callsByTab.get(tabKey) > 1) callsByTab.set(tabKey, callsByTab.get(tabKey) - 1);
         else if (tabKey) callsByTab.delete(tabKey);
       }
+      // The user took the tab over while this call ran on it: that, not the call's own outcome, is what the agent needs.
+      const takenOver = tabKey && takeover.takenOverSince(tabKey, started);
+      return takeover.withNotices(takenOver ? failed(args, takenOver) : result, tabKey);
     }));
   };
 
@@ -848,7 +856,8 @@ export function registerTools(server, manager) {
         const tabs = (await b.host.request('tabs.listAll', {})).filter((t) => scope === 'all' || t.owner === 'you');
         out.push(`Browser: ${b.name} ("${b.key}") · ${tabs.length} tab${tabs.length === 1 ? '' : 's'}${scope === 'mine' ? ' controlled by you' : ''}`);
         for (const t of tabs) {
-          const owner = t.owner === 'you' ? `you (${t.origin === 'user' ? 'claimed from the user' : 'agent tab'})`
+          const parkedAs = { takeover: '; taken over by the user', handoff: '; handed to the user' }[t.parked] ?? '';
+          const owner = t.owner === 'you' ? `you (${t.origin === 'user' ? 'claimed from the user' : 'agent tab'}${parkedAs})`
             : t.owner === 'other' ? 'another agent (do not touch)' : 'user (claimable)';
           const flags = [t.active && 'active', t.pinned && 'pinned', t.audible && 'playing audio', t.muted && 'muted', t.groupTitle && `group "${t.groupTitle}"`].filter(Boolean);
           out.push(`- ${b.key}:${t.id} · ${t.title || '(no title)'} · ${t.url} · owner: ${owner}${flags.length ? ` · ${flags.join(', ')}` : ''}`);
@@ -895,18 +904,28 @@ export function registerTools(server, manager) {
     'Take control of one of the user\'s existing tabs (ids from tab_list scope "all", owner user) to work inside it. It stays where it is and is never focused, ' +
     'but claiming wakes a background tab (a video in it may start playing), so claim only to read or act in the page. ' +
     'To close the user\'s tabs, call tab_close with confirm_close_users_tab: true; no claim needed. ' +
-    'Release it with tab_release when done so the user gets it back untouched; it goes back to them at the end of your turn anyway (claim it again in a later turn).',
-    { tab: tabArg, snapshot: snapshotArg },
-    async ({ tab: value, snapshot }) => {
+    'Release it with tab_release when done so the user gets it back untouched; it goes back to them at the end of your turn anyway (claim it again in a later turn). ' +
+    'resume: true takes back a tab the user took over or you handed to them (tab_handoff), once they said in the conversation that you may carry on.',
+    { tab: tabArg, snapshot: snapshotArg,
+      resume: z.boolean().optional().describe('Resume a tab the user took over or you handed to them. Only after the user said so in the conversation.') },
+    async ({ tab: value, snapshot, resume }) => {
       const { key, tabId } = parseTabId(value);
+      const id = `${key}:${tabId}`;
+      const parked = takeover.parked(id);
+      if (parked && (!resume || parked.gone)) throw new Error(takeover.notice(id));
       const browser = await manager.get(key);
       await browser.playwright();
       const claimed = await browser.host.request('tabs.claim', { tabId });
       // If the debugger isn't attached (an earlier attach failed), announce the tab again so a retry really retries.
       if (!browser.relay.model.isAttached(tabId)) browser.relay.model.onTabCreated(claimed);
       const tab = await browser.waitForTab(tabId, NAVIGATION_TIMEOUT_MS);
-      record.tabEvent('claim', tab.id, tab.page.url());
-      return tab.run(() => report(tab, { lines: [`Claimed ${tab.id}. Release it with tab_release when done.`], snapshot: snapshot !== false }));
+      record.tabEvent(parked ? 'resume' : 'claim', tab.id, tab.page.url());
+      if (parked) takeover.forget(id);
+      const line = parked
+        ? `Resumed ${tab.id}: you control it again. The user may have changed it meanwhile, so go by this snapshot.`
+        : `Claimed ${tab.id}. Release it with tab_release when done.`;
+      // A resumed tab always gets its snapshot: the page is not what the agent last saw.
+      return tab.run(() => report(tab, { lines: [line], snapshot: !!parked || snapshot !== false }));
     });
 
   const byId = (tabId) => ({ tabId });
@@ -922,6 +941,7 @@ export function registerTools(server, manager) {
     const tab = browser.tabs.get(tabId);
     const url = tab?.page.url();
     const call = async () => {
+      if (ends) takeover.markEnding(`${key}:${tabId}`); // its removal is ours, not the user closing it
       if (ends && tab) tab.ending = true; // its page closing now is ours, not "found gone" (record mode)
       if (ends && tab) await cursor.remove(tab, { wait: fadeCursor });
       if (toUser && tab) await uninstallPopups(tab);
@@ -936,7 +956,10 @@ export function registerTools(server, manager) {
       }
       throw error;
     }
-    if (ends) browser.forget(tabId);
+    if (ends) {
+      browser.forget(tabId);
+      takeover.forget(`${key}:${tabId}`);
+    }
     if (event) record.tabEvent(event, `${key}:${tabId}`, url);
     return text(`Browser: ${browser.name} · Tab: ${key}:${tabId}\n${typeof done === 'function' ? done(args) : done}`);
   };
@@ -980,6 +1003,18 @@ export function registerTools(server, manager) {
     { tab: tabArg }, simpleTabCall('tabs.keep', byId, 'Kept: handed to the user now (ungrouped) and stays open after your turn ends. You still control it until then; ' +
       'if it was muted it stays muted till then (tab_mute false if the user asked to hear it now).',
       { event: 'keep', toUser: true }));
+  tool('tab_handoff',
+    'Hand a tab to the user mid-task for something only they should do: logging in, a 2FA code, a CAPTCHA, payment or card details. ' +
+    'Your cursor leaves, the tab leaves your group and is unmuted, and you stop acting in it (it is never brought to the front). ' +
+    'Repeat the returned line to the user, then wait: once they say they are done, tab_claim it with resume: true and carry on; tab_release lets it go for good.',
+    { tab: tabArg, reason: z.string().min(1).describe('What the user should do there, as words for them, e.g. "log in to your bank" or "enter the card details".') },
+    async ({ tab: value, reason }) => {
+      const tab = await resolveTab(manager, value);
+      const title = (await tab.currentTitle()) || tab.page.url();
+      await tab.run(() => takeover.handOff(tab, reason));
+      return text(`Browser: ${tab.browser.name} · Tab: ${tab.id}\nHanded ${tab.id} to the user. Tell them: Your turn in ${tab.browser.name} tab "${title}": ${reason}, then tell me.\n` +
+        'Once they say they are done, call tab_claim on it with resume: true to carry on (you get a fresh snapshot). If you no longer need it, tab_release gives it to them for good.');
+    });
   tool('tab_mute',
     'Mute or unmute a tab\'s audio (the browser\'s tab mute, what the speaker icon in the tab strip shows). Agent tabs open muted unless muted: false (for_user tabs until your turn ends). ' +
     'This is separate from the page\'s own video mute (media mute/unmute).',

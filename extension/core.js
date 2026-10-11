@@ -252,6 +252,43 @@ export function createCore({ chrome, send, timers = globalThis }) {
     delete owner.agentMuted;
   }
 
+  // A parked tab stays the client's (so it can resume) but is the user's meanwhile: debugger detached, out of the
+  // client's group, this extension's mute ended, discardable, and kept and handed over, so a disconnect hands it to
+  // them and never closes it. What it was is remembered for unpark. The client hears a detach with reason "parked".
+  async function park(tabId, owner, kind) {
+    const tab = await chrome.tabs.get(tabId);
+    const grouped = owner.origin === 'agent' && tab.groupId !== -1; // a claimed tab's group is the user's own
+    owner.parked = { kind, at: Date.now(), grouped, muted: ownMute(tab), agentMuted: !!owner.agentMuted, kept: !!owner.kept, handedOver: !!owner.handedOver };
+    owner.detached = true;
+    owner.kept = owner.handedOver = true;
+    delete owner.agentMuted;
+    await persist();
+    try {
+      await chrome.debugger.detach({ tabId }).catch(() => {});
+      childTargets.delete(tabId);
+      if (grouped) await chrome.tabs.ungroup(tabId);
+      await chrome.tabs.update(tabId, { autoDiscardable: true, ...(owner.parked.muted && { muted: false }) });
+    } finally {
+      emitToOwner(owner, 'chrome.debugger.onDetach', [{ tabId }, 'parked']);
+    }
+  }
+
+  // tabs.claim of a parked tab: back into the client's group and its mute as it was; the claim then re-attaches.
+  async function unpark(tabId, owner, tab) {
+    const url = tab.pendingUrl || tab.url || '';
+    if (isRestricted(url)) throw new Error(`Tab ${tabId} shows ${url}, which can't be controlled`);
+    const { parked } = owner;
+    delete owner.parked;
+    owner.kept = parked.kept;
+    owner.handedOver = parked.handedOver;
+    if (parked.agentMuted) owner.agentMuted = true;
+    await persist();
+    if (parked.grouped) await addToGroup(owner.client, owner.group ?? labelFor(owner.client), tabId, tab.windowId);
+    const restore = { ...(parked.muted && { muted: true }), ...(owner.origin === 'agent' && !owner.handedOver && { autoDiscardable: false }) };
+    if (Object.keys(restore).length) await chrome.tabs.update(tabId, restore);
+    return chrome.tabs.get(tabId);
+  }
+
   // The owner record stays (releasing) until cleanup is done, so nobody can claim the tab mid-cleanup. A failed
   // step is retried; the record is dropped only once cleanup worked or the tab is gone, so a surviving agent tab
   // never loses its provenance (a later disconnect or worker restart tries again). Returns whether it finished.
@@ -340,6 +377,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
           origin: owner?.origin ?? null,
           handedOver: !!owner?.handedOver,
           kept: !!owner?.kept,
+          parked: owner?.parked?.kind ?? null,
         };
       });
     },
@@ -371,6 +409,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
         if (owner && owner.client !== client) throw new Error(`Tab ${tabId} is owned by another client`);
         let tab = await chrome.tabs.get(tabId);
         if (owner) {
+          if (owner.parked) tab = await unpark(tabId, owner, tab);
           // The debugger was taken away (DevTools, "Cancel" on the bar): this explicit claim lets the client
           // re-attach. `detached` clears only once chrome.debugger.attach succeeds, so a failed one can be retried.
           if (owner.detached) emitBack('chrome.tabs.onCreated', [tab]);
@@ -432,6 +471,16 @@ export function createCore({ chrome, send, timers = globalThis }) {
       });
     },
 
+    // The user took the tab over, or the client handed it to them mid-task (kind "takeover" or "handoff"): it stays the
+    // client's but goes quiet and becomes theirs for now (see park).
+    async 'tabs.park'({ tabId, kind }, { client }) {
+      return serialize(tabId, async () => {
+        const owner = requireOwner(client, tabId);
+        if (!owner.parked) await park(tabId, owner, kind === 'handoff' ? 'handoff' : 'takeover');
+        return { ok: true };
+      });
+    },
+
     // Closes one of the user's tabs that nobody owns, without attaching the debugger (a claim would wake it: focus
     // emulation and an active lifecycle start its media).
     async 'tabs.closeUnowned'({ tabId }, { client }) {
@@ -462,13 +511,15 @@ export function createCore({ chrome, send, timers = globalThis }) {
     },
 
     // Whether the user can see the tab: active in a normal, non-minimized window (the agent cursor shows only then).
+    // focused: that window has the focus too (only then can input in the page be the user's).
     async 'tabs.isShown'({ tabId }, { client }) {
       requireOwner(client, tabId);
       const tab = await chrome.tabs.get(tabId);
-      if (!tab.active) return { shown: false };
+      if (!tab.active) return { shown: false, focused: false };
       const window = await chrome.windows.get(tab.windowId);
       // App and popup windows (installed web apps, Helium's app windows) are seen too; DevTools windows never.
-      return { shown: ['normal', 'app', 'popup'].includes(window.type) && window.state !== 'minimized' };
+      const shown = ['normal', 'app', 'popup'].includes(window.type) && window.state !== 'minimized';
+      return { shown, focused: shown && !!window.focused };
     },
 
     async 'tabs.setMuted'({ tabId, muted }, { client }) {
@@ -482,7 +533,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
 
     async 'chrome.debugger.attach'([target, version = '1.3'], { client }) {
       const { tabId } = target;
-      requireOwner(client, tabId);
+      if (requireOwner(client, tabId).parked) throw new Error(`Tab ${tabId} is parked (the user has it); claim it to resume`);
       try {
         await chrome.debugger.attach({ tabId }, version);
       } catch (error) {
@@ -808,19 +859,29 @@ export function createCore({ chrome, send, timers = globalThis }) {
     }));
   }
 
-  // Detached for any reason but the tab closing (the user pressed Cancel, opened DevTools): the tab stays owned
-  // but marked detached, and is never re-attached until the owner claims it again.
+  // Detached for any reason but the tab closing (the user pressed Cancel, it went to a page the debugger may not stay
+  // on, its renderer died): the tab stays owned but marked detached, and is never re-attached until the owner claims
+  // it again. target_closed also comes while the tab still exists (a chrome:// page, a crash).
   async function onDebuggerDetach(source, reason) {
     await ready;
     childTargets.delete(source.tabId);
     const owner = owners.get(source.tabId);
     log('debugger detached', { source, reason, owned: !!owner });
     if (!owner) return;
-    if (reason !== 'target_closed') {
+    if (reason !== 'target_closed' || await chrome.tabs.get(source.tabId).then(() => true, () => false)) {
       owner.detached = true;
       await persist();
     }
     emitToOwner(owner, 'chrome.debugger.onDetach', [source, reason]);
+  }
+
+  // A main-frame commit of an owned tab, for the owner to tell the user's navigations (address bar, bookmark, back,
+  // reload) from its own. Not for parked tabs (the user has them) or ones being released.
+  async function onNavigationCommitted({ tabId, frameId, url, transitionType, transitionQualifiers }) {
+    await ready;
+    const owner = owners.get(tabId);
+    if (frameId !== 0 || !owner || owner.parked) return;
+    emitToOwner(owner, 'tabs.committed', { tabId, url, transitionType, transitionQualifiers });
   }
 
   async function onTabRemoved(tabId, removeInfo) {
@@ -848,7 +909,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
     await persist();
     if (owner.releasing) return serialize(addedTabId, () => cleanUp(addedTabId, owner));
     const tab = await chrome.tabs.get(addedTabId);
-    emitToOwner(owner, 'chrome.tabs.onRemoved', [removedTabId, { windowId: tab.windowId, isWindowClosing: false }]);
+    // replacedBy: nobody closed it (the owner must not take it for the user closing the tab).
+    emitToOwner(owner, 'chrome.tabs.onRemoved', [removedTabId, { windowId: tab.windowId, isWindowClosing: false, replacedBy: addedTabId }]);
     emitToOwner(owner, 'chrome.tabs.onCreated', [tab]);
   }
 
@@ -908,7 +970,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
   // webNavigation names the claimed tab as the source.
   function adopter(openerTabId) {
     const opener = owners.get(openerTabId);
-    if (!opener || opener.releasing) return null;
+    // A parked tab is the user's for now: what opens from it is theirs, even inside an expectChild window.
+    if (!opener || opener.releasing || opener.parked) return null;
     // A tab already handed to the user (for_user, tab_keep) is theirs like a claimed one: its children are theirs too.
     if (opener.origin === 'agent' && !opener.handedOver) return opener;
     const expected = expectations.get(openerTabId);
@@ -981,6 +1044,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
     onDebuggerDetach,
     onTabCreated,
     onNavigationTarget,
+    onNavigationCommitted,
     onTabRemoved,
     onTabReplaced,
     onTabUpdated,

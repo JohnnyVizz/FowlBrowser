@@ -3,6 +3,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { spawn } from 'node:child_process';
 import { readdir } from 'node:fs/promises';
+import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
@@ -32,10 +33,12 @@ export const browsersFrom = arg => (arg === 'both' ? BROWSERS : [arg]);
 
 export class ToolError extends Error {}
 
-export async function connect(label) {
+// ownTurns: the server runs under its own sh, which stays its parent (the trailing ':' keeps sh from exec'ing it), so
+// server.endTurn() can end this server's turn alone. Never end the shared e2e server's turn: it closes every job's tabs.
+export async function connect(label, { ownTurns = false } = {}) {
   const command = process.env.FOWLBROWSER_MCP || `${ROOT}mcp/bin/fowlbrowser-mcp`;
   const transport = new StdioClientTransport({
-    command, args: [], stderr: 'pipe',
+    ...(ownTurns ? { command: '/bin/sh', args: ['-c', `'${command}'; :`] } : { command, args: [] }), stderr: 'pipe',
     env: { ...process.env, FOWLBROWSER_LABEL: label },
   });
   let stderr = '';
@@ -54,8 +57,24 @@ export async function connect(label) {
       return { text, images, structured: res.structuredContent, raw: res };
     },
     close: () => client.close(),
+    // The turn-end hook's message to this server (ownTurns only); resolves to its JSON reply.
+    endTurn: () => new Promise((resolve, reject) => {
+      let reply = '';
+      const socket = net.connect(`/tmp/fowlbrowser-turn-${transport.pid}.sock`, () => socket.write('turn_ended\n'));
+      socket.on('data', (chunk) => { reply += chunk; });
+      socket.on('end', () => { try { resolve(JSON.parse(reply)); } catch (e) { reject(e); } });
+      socket.on('error', reject);
+    }),
   };
   return server;
+}
+
+// A raw host connection to a browser (as another client of the extension): tabs.listAll with every field
+// (windowId, kept, handedOver, parked, owner as seen by this client), tabs.focus. Close it when done.
+export async function rawHost(browser, label = 'e2e-raw') {
+  const host = new HostClient(path.join(SOCKET_DIR, `${browser}.sock`));
+  await host.connect(label);
+  return host;
 }
 
 // ---- parsing tool output ----
@@ -76,7 +95,7 @@ export function tabIdsIn(text, browser) {
 }
 
 // Parses tab_list text lines `- chrome:52 · Title · https://url · owner: you (agent tab) · active, muted`
-// into [{tab, title, url, owner: "you"|"other"|null, active, muted, group}].
+// into [{tab, title, url, owner: "you"|"other"|null, active, muted, group, parked: "handoff"|"takeover"|null}].
 export function parseTabs(res) {
   if (!/^Browser: /m.test(res.text) && !/No browsers connected/.test(res.text)) throw new Error(`cannot parse tab_list output: ${res.text.slice(0, 300)}`);
   const tabs = [];
@@ -96,6 +115,7 @@ export function parseTabs(res) {
       muted: /\bmuted\b/.test(flags),
       audible: /playing audio/.test(flags),
       group: /group "([^"]*)"/.exec(flags)?.[1] ?? null,
+      parked: /; handed to the user\)$/.test(ownerText) ? 'handoff' : /; taken over by the user\)$/.test(ownerText) ? 'takeover' : null,
     });
   }
   return tabs;
@@ -142,8 +162,7 @@ export function makeContext({ server, browser, tag }) {
     // not muted), then let go, so nobody owns it. Closed by cleanup with the confirm flag.
     userTabs: new Set(),
     async userTab(url) {
-      const host = new HostClient(path.join(SOCKET_DIR, `${browser}.sock`));
-      await host.connect(`user-${tag}`);
+      const host = await rawHost(browser, `user-${tag}`);
       try {
         const tab = await host.request('tabs.open', { url, forUser: true });
         await host.request('tabs.release', { tabId: tab.id });

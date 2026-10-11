@@ -35,6 +35,7 @@ chrome.debugger.onEvent.addListener(core.onDebuggerEvent);
 chrome.debugger.onDetach.addListener(core.onDebuggerDetach);
 chrome.tabs.onCreated.addListener(core.onTabCreated);
 chrome.webNavigation.onCreatedNavigationTarget.addListener(core.onNavigationTarget);
+chrome.webNavigation.onCommitted.addListener(core.onNavigationCommitted);
 chrome.tabs.onRemoved.addListener(core.onTabRemoved);
 chrome.tabs.onReplaced.addListener(core.onTabReplaced);
 chrome.tabs.onUpdated.addListener(core.onTabUpdated);

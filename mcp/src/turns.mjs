@@ -6,6 +6,7 @@ import net from 'node:net';
 import * as cursor from './cursor/index.mjs';
 import { uninstallPopups } from './popups.mjs';
 import { record, tabEvent } from './record.mjs';
+import { markEnding } from './takeover.mjs';
 
 export const turnSocketPath = (pid = process.ppid) => `/tmp/fowlbrowser-turn-${pid}.sock`;
 
@@ -23,8 +24,8 @@ function countSubagents(delta) {
 }
 
 // Only tabs this session had mapped when the turn ended, taken before any await, so a later turn's tabs are never
-// touched. Skipped: a tab with a call running or queued (a subagent may still use it), and owned tabs not among them
-// (a tab_open or tab_claim in progress, or a later turn's). While background subagents run, nothing is cleaned.
+// touched. Skipped: a tab with a call running or queued (a subagent may still use it), a parked one, and owned tabs not
+// among them (a tab_open or tab_claim in progress, or a later turn's). While background subagents run, nothing is cleaned.
 export async function endTurn(manager) {
   const result = { closed: [], released: [], skipped: [] };
   if (subagents > 0 && Date.now() - subagentsChanged > SUBAGENTS_STALE_MS) countSubagents(-subagents);
@@ -39,7 +40,8 @@ export async function endTurn(manager) {
     await Promise.all(all.filter((t) => t.owner === 'you').map(async (info) => {
       const id = `${browser.key}:${info.id}`;
       const tab = tabs.get(info.id);
-      if (!tab || tab.busy || callsByTab.get(id) > 0) return result.skipped.push(id);
+      // A parked tab (taken over, handed off) stays this session's, so the next turn can resume it once the user says so.
+      if (!tab || info.parked || tab.busy || callsByTab.get(id) > 0) return result.skipped.push(id);
       // Older extensions don't send kept; handedOver was their rule.
       const close = info.origin === 'agent' && !(info.kept ?? info.handedOver);
       // Re-checked when its turn on the tab queue comes: a later turn may have released and reclaimed the same id.
@@ -47,6 +49,7 @@ export async function endTurn(manager) {
       const work = async () => {
         if (!same()) return false;
         tab.ending = true; // its page closing now is ours, not "found gone" (record mode)
+        markEnding(id); // nor the user closing it
         await cursor.remove(tab, { wait: !close });
         if (close) await browser.host.request('chrome.tabs.remove', [info.id]);
         else {
