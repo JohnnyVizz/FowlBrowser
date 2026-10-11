@@ -32,7 +32,8 @@ session's colour with a name label, drawn inside the page. Its curved, Fitts-tim
   the first action on a page finds it ready; the host element itself appears with the first action.
 - Host: `<fowlbrowser-cursor aria-hidden="true">` on `document.documentElement`, closed shadow root, fixed, inset 0,
   `pointer-events:none`, `z-index:2147483647`, `contain:strict`, hidden in print, and in the top layer as a manual popover
-  (above modal dialogs, popovers, fullscreen elements and transformed pages; re-raised when one opens after it).
+  (above modal dialogs, popovers, fullscreen elements and transformed pages; re-raised on the next move when one opened
+  after it).
   Re-attached if the page removes it or replaces its document element. Built with DOM calls and constructed stylesheets
   only: pages with Trusted Types (YouTube, GitHub) refuse HTML strings and a CSP style-src can block `<style>`.
 - Hidden for agent screenshots (`display:none` during the capture).
@@ -57,14 +58,16 @@ session's colour with a name label, drawn inside the page. Its curved, Fitts-tim
   inside the viewport. Max 200 px with ellipsis.
 - Action words: what the agent is doing takes the name's place in the pill ("Claude" becomes "Typing", then "Claude"
   again): Reading, Scrolling, Typing, Dragging and Uploading stay while the action runs (at least 0.6 s); Pressing keys
-  and Loading show for 1.2 s. An action word is drawn at 60% (ink 50%) with a light sweeping over it.
+  and Loading show for 1.2 s. An action word is drawn at 80% (ink 65%) with a light sweeping over it once as it
+  arrives, then every 4 s while the action lasts.
 
 ## Motion
 - Travel (after Cua's `signature_arc`): a cubic Bezier from the current tip to the target, handles 0.3 of the distance at each
   end, bent 0.16 of the distance to the natural side (upward for horizontal moves), bend peak shifted 0.15 toward the
   end; walked by arc length with a minimum-jerk profile plus a follow-through bump peaking at 82% of the move
   (0.018 of the distance, at most 6 px). Duration: Fitts, `(150 + 120 log2(D / W + 1))` ms clamped to 300..1000,
-  times 0.9, at most 850 ms; W is the target's smaller side (24 px for a bare point). Never longer than
+  times 0.9, at most 850 ms; W is the target's smaller side (24 px for a bare point). Short hops are quicker:
+  never longer than `140 + 1.6 D` ms (about 160 ms at 10 px, 220 ms at 50 px; Fitts' alone from about 220 px). Never longer than
   the time left before the action (Agent timing): a quicker travel when less is left, and with under 120 ms left
   the cursor goes straight to the target (appearing there on a fresh page).
 - Arrival (the action may start) when the tip is within 1 px of the target; the follow-through finishes during
@@ -74,21 +77,30 @@ session's colour with a name label, drawn inside the page. Its curved, Fitts-tim
   frames for the travel or the fade) still shows the cursor on the target when the action fires.
 - Lean: the pointer leans into the direction of travel, at most 0.5 rad, weighted by speed ((v - 40) / 260, clamped
   0..1) and smoothed with `1 - exp(-22 dt)`; it settles back after the move. The label stays upright.
-- Click: the pointer presses to 0.86 around its tip and springs back (220 ms), and a ring of the session's colour grows
-  from the tip 5 -> 22 px over 420 ms (ease-out, stroke 2.4 -> 0.6 px, opacity 0.85 -> 0).
-- Word change (name to action word, one word to the next, back to the name): the word going fades out in place to
-  scale 0.96 and blur 4 px over 200 ms; the next comes in from scale 1.04 and blur 4 px over 280 ms, 40 ms later; the
-  pill glides to the new width over 300 ms (against the viewport's right edge the label glides along, so it stays
+- Click: the pointer presses to 0.86 around its tip (`cubic-bezier(0.23, 1, 0.32, 1)`) and springs back
+  (`cubic-bezier(0.34, 1.56, 0.64, 1)`), 220 ms; a press that interrupts the last one starts from its current scale. A
+  ring of the session's colour (a circle drawn at 22 px radius with a 2 px border, scaled down, so it stays sharp)
+  grows from the tip by transform (scale 0.3 -> 1) over 420 ms while it fades (opacity 0.85 -> 0.55 at 80% -> 0),
+  both on `cubic-bezier(0.33, 1, 0.68, 1)`.
+- Word change (name to action word, one word to the next, back to the name), 180 ms in all: the word going fades out
+  in place to scale 0.96 and blur 4 px over 140 ms; the next comes in from scale 1.04 and blur 4 px over 160 ms, 20 ms
+  later; the pill glides to the new width over 180 ms (against the viewport's right edge the label glides along, so it stays
   inside); all `cubic-bezier(0.23, 1, 0.32, 1)`, scale around the text's left edge. A word that goes takes its light's
   animations with it, and so does the cursor.
   An interrupted change goes on from where it is. The light on an action word: a soft-edged band (70% of the word's
-  width, at least 24 px) holding a full-strength copy of the word crosses it every 1.5 s (`cubic-bezier(0.45, 0, 0.55,
-  1)`), starting 250 ms after the word arrives; transforms only, so it stays smooth on a busy page.
+  width, at least 24 px) holding a full-strength copy of the word crosses it in 1.5 s (`cubic-bezier(0.45, 0, 0.55,
+  1)`), starting as the word has arrived (180 ms), then again every 4 s; transforms only, so it stays smooth on a busy
+  page.
 - Appear: at the last point, else where the server last had it, else 58% x / 55% y of the viewport; opacity 0 -> 1 and
   scale 0.85 -> 1 around the tip, 220 ms `cubic-bezier(0.23, 1, 0.32, 1)`. Exit: opacity -> 0, scale -> 0.9, 200 ms.
-- rAF runs only while travelling or turning back to rest; everything else is WAAPI.
-- Reduced motion: no travel (120 ms crossfade to the target), no press or ring; words change by a 120 ms crossfade
-  (no blur, scale or glide) and action words show at full strength without the light.
+- rAF runs only while travelling or turning back to rest; everything else is WAAPI. A frame reads no layout: the
+  viewport's size and page scale are kept until a window or visual viewport resize or scroll, and a word is measured
+  only when it changes.
+- Reduced motion: no travel (120 ms crossfade to the target, the old point fading from the cursor's current opacity),
+  no press or ring; appear and exit by opacity only; words change by a 120 ms crossfade (no blur, scale or glide) and
+  action words show at full strength without the light. The preference turning on while the cursor shows puts a
+  travel under way on its target (crossfade), ends an appear or exit at once and draws the word again without its
+  light; turning off brings the light back.
 
 ## Agent timing
 - Pointer actions wait for arrival, capped at 900 ms for the whole cursor path (visibility, target box, travel), then
