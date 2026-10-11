@@ -236,7 +236,8 @@ to give a window back the tab that was active before an agent popup took its pla
   the session controls, background tabs too, and `<dir>/journal.jsonl` gets a line per tool call, per pointer action
   (target, the overlay's own `state()` right after arrival and landing, `late: true` when the target came after the
   budget and was shown during the action, a frame with the cursor in `<dir>/frames/`, capture capped at
-  500 ms with the state read), per script click shown during evaluate (evaluate waits up to 300 ms for the overlay
+  2.5 s with the state read: a browser kept busy by six agents answers in seconds, and a point without its state would
+  read as a cursor that never showed), per script click shown during evaluate (evaluate waits up to 300 ms for the overlay
   to listen; its source is kept up to 4000 chars), per tab control change, once per download of the session when it
   completes or is interrupted (with `id` and the file's `ino`), and per turn end (`deferred: true` when skipped).
   `tools/rounds.mjs` grades rounds of real agents from it. Unset, none of it runs.

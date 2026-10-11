@@ -739,10 +739,13 @@ async function startMonitor(hosts, file) {
     await host.request('tabs.watchActivity').catch((err) => write({ kind: 'error', message: `${browser}: no tabs.activity stream (${err.message}); flashes are not counted there` }));
   }
   let front; const active = new Map(); const windows = new Map(); const audible = new Map(); const grouped = new Set(); const urls = new Map(); const startTabs = new Set(); const startUrls = new Map();
-  let first = true; let running = true;
-  const tick = async () => {
+  let first = true; let firstFront = true; let running = true;
+  const tickFront = async () => {
     const app = await frontApp();
-    if (app && app !== front) { write({ kind: 'front', app, initial: first || undefined }); front = app; }
+    if (app && app !== front) { write({ kind: 'front', app, initial: firstFront || undefined }); front = app; }
+    firstFront = false;
+  };
+  const tickInventory = async () => {
     const tabs = await inventory(hosts);
     const seenWindows = new Map();
     for (const [k, tab] of Object.entries(tabs)) {
@@ -773,15 +776,20 @@ async function startMonitor(hosts, file) {
     windows.clear(); for (const [win, keys] of seenWindows) windows.set(win, keys);
     first = false;
   };
+  // Two loops. The front app is asked every 250 ms (with the extension's exact activity events, that is the watching
+  // the gaps grade counts). The tab inventory (tabs.listAll through both hosts: 2 to 3 s each when six agents keep a
+  // browser busy) runs once a second on its own, so a busy browser neither reads as "not watched" nor gets more load
+  // from the watching than it needs.
   const ticks = [];
-  const done = (async () => {
+  const loop = async (tick, everyMs, onStart) => {
     while (running) {
       const started = Date.now();
-      ticks.push(started);
+      onStart?.(started);
       await tick().catch((err) => write({ kind: 'error', message: err.message }));
-      await sleep(Math.max(0, 250 - (Date.now() - started)));
+      await sleep(Math.max(0, everyMs - (Date.now() - started)));
     }
-  })();
+  };
+  const done = Promise.all([loop(tickFront, 250, (t) => ticks.push(t)), loop(tickInventory, 1000)]);
   return { log, ticks, stop: async () => { running = false; await done; } };
 }
 

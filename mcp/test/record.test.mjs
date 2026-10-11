@@ -96,24 +96,24 @@ test('no overlay: cursor null; an action error is on the point line', async () =
   assert.deepEqual([line.target, line.cursor, line.error], [null, null, 'covered']);
 });
 
-test('a capture slower than 500 ms is not waited for: frame null, captureMs about 500', async () => {
-  const { tab } = fakeTab({ screenshotMs: 1500 });
+test('a capture slower than 2.5 s is not waited for: frame null, captureMs about 2500', async () => {
+  const { tab } = fakeTab({ screenshotMs: 3200 });
   const started = Date.now();
   const seen = await record.pointSeen(tab, { x: 1, y: 1 }, async () => null);
-  assert.ok(Date.now() - started < 800, `waited ${Date.now() - started} ms`);
+  assert.ok(Date.now() - started < 2900, `waited ${Date.now() - started} ms`);
   assert.equal(seen.frame, null);
-  assert.ok(seen.captureMs >= 490 && seen.captureMs < 800, `captureMs ${seen.captureMs}`);
+  assert.ok(seen.captureMs >= 2490 && seen.captureMs < 2900, `captureMs ${seen.captureMs}`);
 });
 
-test('the whole observation is capped at 500 ms: a late state counts as missing, the frame gets what is left', async () => {
+test('the whole observation is capped at 2.5 s: a late state counts as missing, the frame gets what is left', async () => {
   const { tab } = fakeTab({ screenshotMs: 300 });
   let started = Date.now();
-  let seen = await record.pointSeen(tab, { x: 1, y: 1 }, () => sleep(2000).then(() => ({ visible: true, x: 1, y: 1, opacity: 1 })));
-  assert.ok(Date.now() - started < 700, `waited ${Date.now() - started} ms`);
+  let seen = await record.pointSeen(tab, { x: 1, y: 1 }, () => sleep(3500).then(() => ({ visible: true, x: 1, y: 1, opacity: 1 })));
+  assert.ok(Date.now() - started < 2800, `waited ${Date.now() - started} ms`);
   assert.deepEqual([seen.cursor, seen.frame], [null, null]);
   started = Date.now();
-  seen = await record.pointSeen(tab, { x: 1, y: 1 }, () => sleep(300).then(() => ({ visible: true, x: 1, y: 1, opacity: 1 })));
-  assert.ok(Date.now() - started < 700, `state 300 ms + frame 300 ms took ${Date.now() - started} ms`);
+  seen = await record.pointSeen(tab, { x: 1, y: 1 }, () => sleep(2300).then(() => ({ visible: true, x: 1, y: 1, opacity: 1 })));
+  assert.ok(Date.now() - started < 2800, `state 2300 ms + frame 300 ms took ${Date.now() - started} ms`);
   assert.equal(seen.cursor.visible, true);
   assert.equal(seen.frame, null, 'only 200 ms were left for the 300 ms capture');
 });

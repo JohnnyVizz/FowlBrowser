@@ -7,7 +7,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const MAX_FRAMES = 400;
-const CAPTURE_CAP_MS = 500;
+// Record mode only (rounds): a busy browser answers the overlay's state in seconds, and a point without it would read
+// as a cursor that never showed; the action waits for the capture that long at most.
+const CAPTURE_CAP_MS = 2500;
 const ARG_MAX_CHARS = 200;
 const SOURCE_MAX_CHARS = 4000;
 const ERROR_MAX_CHARS = 300;
