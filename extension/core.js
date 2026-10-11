@@ -484,6 +484,24 @@ export function createCore({ chrome, send, timers = globalThis }) {
       return { ok: true };
     },
 
+    // A popup the page opens without an opener (mcp/src/popups.mjs): opened here, in the background right after its
+    // opener, and adopted like any child of it. A tab the page opens itself, with a user gesture, makes Chrome show the
+    // opener's window, which brings the browser to the front; tabs.create doesn't. No referrer (tabs.create sets none).
+    async 'tabs.openChild'({ tabId, url }, { client }) {
+      requireOwner(client, tabId);
+      if (!adopter(tabId)) throw new Error(`Tab ${tabId} passes no children on`);
+      if (!/^https?:\/\//i.test(String(url))) throw new Error(`Not an http(s) URL: ${url}`);
+      return tracked(async () => {
+        const source = await chrome.tabs.get(tabId);
+        const tab = await chrome.tabs.create({ windowId: source.windowId, index: source.index + 1, url, active: false, openerTabId: tabId });
+        // If the URL turns out to be a download, it is this client's: no referrer to match it by, and the tab closes
+        // before anything can attach to it.
+        downloadSignal(client, tabId, url);
+        await adoptChild(tab.id, tabId);
+        return { tabId: tab.id };
+      });
+    },
+
     // Hands an agent tab to the user now (ungrouped, discardable); the client drives it until it disconnects. Muted by
     // us, it stays muted till then like a forUser tab (focus emulation lets a driven background page autoplay).
     async 'tabs.keep'({ tabId }, { client }) {
@@ -854,10 +872,13 @@ export function createCore({ chrome, send, timers = globalThis }) {
     const pairs = [];
     for (const signal of signals) {
       const matches = strays.filter(([, stray]) => near(signal, stray));
-      if (matches.length === 1 && signals.filter((s) => near(s, matches[0][1])).length === 1) pairs.push([matches[0][0], signal]);
+      if (matches.length !== 1 || pairs.some(([id]) => id === matches[0][0])) continue;
+      // Several signals of one client for one download (tabs.openChild's, then the child's own event) are no rivals.
+      const rivals = signals.filter((s) => near(s, matches[0][1]));
+      if (rivals.every((s) => s.client === signal.client)) pairs.push([matches[0][0], signal, rivals]);
     }
-    for (const [id, signal] of pairs) {
-      signal.claimed = true;
+    for (const [id, signal, rivals] of pairs) {
+      for (const s of rivals) s.claimed = true;
       strayDownloads.delete(id);
       await attributeDownload(id, signal.client, signal.tabId, gen);
     }

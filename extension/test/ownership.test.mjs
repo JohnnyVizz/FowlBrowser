@@ -225,6 +225,28 @@ test('a tab opened by an owned tab is adopted and the user keeps their active ta
   assert.equal(core.owners.has(userChild.id), false);
 });
 
+test('tabs.openChild opens a popup without an opener in the background next to its opener, adopted like one', async () => {
+  const { core, sent, call, chrome } = setup();
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  sent.length = 0;
+  const { result, error } = await call(1, 'tabs.openChild', { tabId: opener.id, url: 'https://example.com/next' });
+  assert.equal(error, undefined);
+  const create = chrome.calls.find((c) => c[0] === 'tabs.create' && c[1].url === 'https://example.com/next');
+  assert.deepEqual(create[1], { windowId: 1, index: chrome.tabsById.get(opener.id).index + 1, url: 'https://example.com/next', active: false, openerTabId: opener.id });
+  assert.deepEqual(core.owners.get(result.tabId), { client: 1, origin: 'agent', group: 'Claude', kept: false });
+  assert.equal(chrome.tabsById.get(result.tabId).mutedInfo.muted, true);
+  assert.equal(chrome.tabsById.get(result.tabId).groupId, chrome.tabsById.get(opener.id).groupId);
+  const created = sent.find((m) => m.method === 'chrome.tabs.onCreated' && m.params[0].id === result.tabId);
+  assert.equal(created?.params[0].openerTabId, opener.id, 'named as the opener\'s child');
+
+  // Only http(s), only from a tab that passes children on, only for its owner.
+  assert.match((await call(1, 'tabs.openChild', { tabId: opener.id, url: 'javascript:alert(1)' })).error.message, /http/);
+  assert.ok((await call(2, 'tabs.openChild', { tabId: opener.id, url: 'https://example.com/x' })).error);
+  await call(1, 'tabs.keep', { tabId: opener.id });
+  assert.match((await call(1, 'tabs.openChild', { tabId: opener.id, url: 'https://example.com/x' })).error.message, /no children/);
+  assert.equal(chrome.calls.filter((c) => c[0] === 'tabs.create' && c[1].url === 'https://example.com/x').length, 0);
+});
+
 test('a popup Chrome activates after Page.windowOpen is switched back inside the onCreated listener, once', async () => {
   const { core, call, chrome } = setup();
   const userTab = chrome.addTab({ url: 'https://mail.example', active: true });

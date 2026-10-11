@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Modifier</title>
+<link rel="stylesheet" href="style.css">
+<h1>Modifier</h1>
+<p>What a page sees of an agent click: the modifiers on its mouse events, and any modifier key events.</p>
+<button id="record">Record modifiers</button>
+<button id="in-place">Go in place</button>
+<button id="cmd-tab">Cmd-click opens new tab</button>
+<div id="result" role="status" aria-label="Result"></div>
+<script>
+  const tag = new URLSearchParams(location.search).get('tag') || '';
+  const target = (via) => `popup-target.html?via=${via}&tag=${encodeURIComponent(tag)}`;
+  // mouse: [type, metaKey, ctrlKey, getModifierState('Meta'), getModifierState('Control')]; keys: [type, key]
+  const seen = { mouse: [], keys: [] };
+  const show = () => { document.getElementById('result').textContent = JSON.stringify(seen); };
+  for (const type of ['pointermove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+    document.addEventListener(type, (e) => {
+      if (type === 'pointermove' && seen.mouse.some(([t]) => t === type)) return;
+      seen.mouse.push([type, e.metaKey, e.ctrlKey, e.getModifierState('Meta'), e.getModifierState('Control')]);
+      show();
+    }, true);
+  }
+  for (const where of [window, document]) {
+    for (const type of ['keydown', 'keyup']) where.addEventListener(type, (e) => { seen.keys.push([type, e.key]); show(); }, true);
+  }
+  document.getElementById('in-place').onclick = () => { location.href = target('in-place'); };
+  // A page that opens a new tab itself on Cmd/Ctrl-click (as some SPAs do) and navigates otherwise.
+  document.getElementById('cmd-tab').onclick = (e) => {
+    if (e.metaKey || e.ctrlKey) window.open(target('cmd-tab-new'));
+    else location.href = target('cmd-tab');
+  };
+</script>

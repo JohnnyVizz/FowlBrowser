@@ -7,7 +7,7 @@ import { callOnShadowRef, cleanRef, closedShadowSection, focusShadowRef, isShado
 import * as cursor from './cursor/index.mjs';
 import { debug } from './debug.mjs';
 import { EXPORT_DESCRIPTION, exportShape, exportTab } from './exports.mjs';
-import { uninstallPopups } from './popups.mjs';
+import { backgroundClick, backgroundClickDone, uninstallPopups } from './popups.mjs';
 import * as record from './record.mjs';
 import * as takeover from './takeover.mjs';
 import { callsByTab } from './turns.mjs';
@@ -1082,6 +1082,15 @@ export function registerTools(server, manager) {
       ? text(`${await header(tab)}\n${await pageText(tab, { ref, maxChars })}`)
       : report(tab, { ref, maxChars })))));
 
+  // A main-frame ref the last snapshot doesn't show as a link, field, toggle or row: worth asking the page whether its
+  // click may carry the hidden new-tab modifier (BACKGROUND_CLICK_FN decides; this only saves its round trip).
+  const mayOpenPopup = (tab, ref) => {
+    const shown = cleanRef(ref);
+    if (/^f\d/.test(shown)) return false;
+    if (tab.snapshotBaseline?.generation !== tab.documentGeneration) return true;
+    const line = tab.snapshotBaseline.text.split('\n').find((l) => l.includes(`[ref=${shown}]`));
+    return !/^\s*- (link|checkbox|radio|switch|textbox|searchbox|combobox|listbox|option|slider|spinbutton|menuitemcheckbox|menuitemradio|row|gridcell|treeitem)\b/.test(line ?? '');
+  };
   const modifiersArg = z.array(z.enum(['Alt', 'Control', 'ControlOrMeta', 'Meta', 'Shift'])).optional();
   tool('click',
     'Click an element by ref, or a point by x,y in CSS pixels (same pixels as the screenshot image). Works in the background tab. ' +
@@ -1097,8 +1106,17 @@ export function registerTools(server, manager) {
       else if (args.ref) {
         const loc = locator(tab, args.ref);
         const plain = !args.double && (args.button ?? 'left') === 'left' && !args.modifiers?.length;
-        return pointed(tab, refPoint(tab, args.ref), () => onRef(tab, args.ref, loc,
-          (timeout) => (args.double ? loc.dblclick({ ...options, timeout }) : loc.click({ ...options, timeout })), args.timeout_ms, plain ? 'toggle' : undefined));
+        return pointed(tab, refPoint(tab, args.ref), async () => {
+          // A popup it opens is a background tab with its opener, never activated (SPEC "Popups (session 5)").
+          const background = plain && mayOpenPopup(tab, args.ref) && await backgroundClick(tab, loc, (args.timeout_ms ?? ACTION_TIMEOUT_MS) + 5000);
+          if (background) options.modifiers = ['ControlOrMeta'];
+          try {
+            return await onRef(tab, args.ref, loc,
+              (timeout) => (args.double ? loc.dblclick({ ...options, timeout }) : loc.click({ ...options, timeout })), args.timeout_ms, plain ? 'toggle' : undefined);
+          } finally {
+            if (background) await backgroundClickDone(tab);
+          }
+        });
       }
       if (x === undefined || y === undefined) throw new Error('Pass ref, or both x and y.');
       await pointed(tab, { x, y }, async () => {

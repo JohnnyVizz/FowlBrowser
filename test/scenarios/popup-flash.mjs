@@ -1,8 +1,9 @@
 // Popups from an agent tab never take the user's eyes (SPEC "Popups (session 5)"). A witness tab, the active tab of
 // the agent tab's window, logs every time it is hidden or loses focus. Opens that need no opener (tier 1) must leave
-// it untouched; opener-dependent window.open calls and forms (tier 2) open as a tab, never a window, and the flash
-// they leave is measured in frames and printed. Every popup is the session's: named in the click result, muted,
-// grouped, in the background. The OAuth pair checks the opener still gets its code and sees the popup close.
+// it untouched, and so must opener-dependent window.open calls from a button (tier 3); opener-dependent links and
+// forms (tier 2) open as a tab, never a window, and the flash they leave is measured in frames and printed. Every
+// popup is the session's: named in the click result, muted, grouped, in the background. The OAuth pair checks the
+// opener still gets its code and sees the popup close.
 // Exclusive: it makes the witness the active tab of its window and gives the window its previous active tab back.
 import { tabIdsIn } from '../lib.mjs';
 
@@ -11,6 +12,9 @@ const TIER1 = [
   ['link', 'Open noopener link', 'rel-noopener'],
   ['button', 'Open noopener window', 'noopener'],
 ];
+// Opener-dependent opens from a button: the agent's click carries the new-tab modifier the page never sees, so they
+// open in the background with their opener (tier 3) and the witness must see nothing. Links and forms keep tier 2.
+const TIER3 = new Set(['window-open', 'features', 'oauth']);
 const TIER2 = [
   ['button', 'Open window', 'window-open'],
   ['button', 'Open popup window', 'features'],
@@ -87,6 +91,7 @@ export default {
         t.step(`tier 2 ${via}`);
         const { popup, events, mark } = await clickOpens(agent, role, name, via);
         if (via !== 'form') t.eq(await t.eval(popup, `() => document.getElementById('opener').textContent`), 'has opener', `${via}: the opener is kept`);
+        if (TIER3.has(via)) t.eq(events, [], `${via}: the witness saw nothing`);
         await measure(via, events, mark);
         await t.close(popup);
       }
@@ -95,6 +100,7 @@ export default {
       const opener = await t.open(`${t.site}/oauth.html?tag=${t.tag}`);
       const signin = await clickOpens(opener, 'button', 'Sign in with IdP', 'oauth', `oauth-popup.html?tag=${t.tag}`);
       const { popup } = signin;
+      t.eq(signin.events, [], 'oauth: the witness saw nothing');
       await measure('oauth', signin.events, signin.mark);
       t.eq(await t.resultOf(popup), 'opener', 'the popup has its opener');
       const mark = Date.now();

@@ -68,6 +68,10 @@ try {
     if (field) await measure('type (ref, with snapshot)', (i) => ({ tab, ref: field, text: `bench ${i}` }));
     const box = refOf(snap, 'checkbox');
     if (box) await measure('click (ref, no snapshot)', () => ({ tab, ref: box, snapshot: false }));
+    // A button that may open a popup: in agent tabs its click goes with the hidden new-tab modifier (SPEC "Popups").
+    const { tab: buttons } = await open(browser, `${SITE}/modifier.html`);
+    const button = refOf((await call('snapshot', { tab: buttons })).body, 'button "Record modifiers"');
+    if (button) await measure('click (button ref, no snapshot)', () => ({ tab: buttons, ref: button, snapshot: false }));
     await measure('click (x,y, no snapshot)', () => ({ tab, x: 5, y: 5, snapshot: false }));
     await measure('press_key (no snapshot)', () => ({ tab, key: 'Shift', snapshot: false }));
     await measure('scroll (no snapshot)', () => ({ tab, direction: 'down', pages: 0.2, snapshot: false }));

@@ -242,6 +242,19 @@ test('two clients downloading the same URL never get each other\'s download, in 
   }
 });
 
+test('a popup the extension opened (tabs.openChild) that turns out to be a download is the opener\'s, even with the child\'s own event', async () => {
+  for (const childEvent of [false, true]) {
+    const { chrome, core, call, timers } = setup();
+    const { result: opener } = await call(1, 'tabs.open', {});
+    const { result: child } = await call(1, 'tabs.openChild', { tabId: opener.id, url: FILE });
+    if (childEvent) await core.onDebuggerEvent({ tabId: child.tabId }, 'Page.downloadWillBegin', { url: FILE });
+    const item = chrome.addDownload({ url: FILE }); // no referrer: tabs.create sets none
+    await core.onDownloadCreated(item);
+    await timers.fire(800);
+    assert.deepEqual((await call(1, 'downloads.list', {})).result.map((d) => [d.id, d.tabId]), [[item.id, opener.id]], `child event: ${childEvent}`);
+  }
+});
+
 test("a downloads.start in flight neither hides another client's download nor lets its signal take a later one", async () => {
   const { chrome, core, call, timers } = setup();
   const { result: tabA } = await call(1, 'tabs.open', {});
