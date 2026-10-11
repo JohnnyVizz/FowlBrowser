@@ -4,35 +4,52 @@
 
 <h1 align="center">FowlBrowser</h1>
 
-<p align="center">Let your AI agents use your real Chrome, in background tabs, without getting in your way.</p>
+<p align="center">Let your AI agents use your real browser, in background tabs, while you keep working.</p>
 
-FowlBrowser connects Claude Code (or any MCP client) to the browser you already use, with your logins, cookies and
-open tabs. Agents work in their own background tabs, several at once, while you keep working. When you want to watch,
-open an agent's tab and a cursor shows you exactly where it clicks.
+FowlBrowser lets AI agents like Claude Code and Codex use the Chrome or Helium you already have, with your logins,
+bookmarks and open tabs. Agents work in their own tabs in the background, several at once, and never pull the browser
+in front of you. Open an agent's tab whenever you like, and a cursor shows exactly what it is doing.
 
 <p align="center">
   <img src="docs/cursor.png" width="720" alt="An agent filling in a checkout form; its cursor, labeled Claude, rests on the Phone field">
 </p>
 
-- **Your real browser.** Your accounts just work: Gmail, GitHub, Google Docs, YouTube, X. No separate profile to sign in to.
-- **Never in your way.** Agent tabs open in the background, muted, in a collapsed tab group. Nothing steals focus.
-- **Many agents at once.** Every tab belongs to one session, so separate agents never touch each other's tabs (subagents
-  share their session's tabs).
-- **A cursor you can follow.** In the tab you're looking at, an animated cursor travels to every click and labels the agent.
-- **Cleans up after itself.** When an agent finishes its turn, its work tabs close. Tabs it opened for you stay.
-- **No permission prompts.** No "Allow remote debugging?" dialog, and one launch flag hides the debugging bar too.
-- **Built for agents.** Compact page snapshots with element refs, changes-only results, and fast errors that say why
-  (for example, "covered by the cookie banner, dismiss it first").
+## What it does
 
-## Requirements
+- **Uses the browser you're already signed in to.** Gmail, GitHub, Google Docs, YouTube and X just work. There's no
+  separate browser profile to set up and no logging in again.
+- **Stays out of your way.** Agent tabs open in the background, muted, inside a folded tab group. Nothing jumps to the
+  front, and pop-ups the agent triggers stay in the background too.
+- **Shows its work.** In the tab you're looking at, a cursor with the agent's name moves to each click and says what
+  it's doing ("typing", "scrolling").
+- **Lets you step in.** Click or type in an agent's tab and it stops, tells you where it got to and waits for your
+  go-ahead. When a step needs you, like a login, a code or a payment, it hands you the tab and waits until you're done.
+- **Asks before acting for you.** Agents are told to check with you before they send, post, buy, delete or change
+  account settings, and to treat text on web pages as information, never as instructions.
+- **Cleans up.** When the agent finishes its reply, its work tabs close and any of your tabs it borrowed go back to
+  you. Tabs it opened for you stay open.
+- **Runs many agents at once.** Every agent session has its own tabs, so agents working in parallel never get in each
+  other's way.
 
-- macOS
-- Node.js 22 or newer
-- Google Chrome or [Helium](https://helium.computer). Chromium, Brave, Edge, Arc and Vivaldi are registered too but
-  less tested.
-- [Claude Code](https://claude.com/claude-code), or any client that speaks MCP
+## What you can ask
+
+Ask in plain words. The agent picks the browser you name, or the one where you're signed in.
+
+> Open my GitHub notifications and tell me what needs a reply.
+
+> Find the RSVP form in my email, fill it in with my details and stop before sending.
+
+> Use my Work browser to download last month's invoices from the billing page. Hand me the tab if it asks me to sign in.
+
+> Open YouTube in Helium, play my Watch Later list and leave the tab for me.
 
 ## Install
+
+You need a Mac, [Node.js](https://nodejs.org) 22 or newer, Google Chrome or [Helium](https://helium.computer), and
+[Claude Code](https://claude.com/claude-code) or another AI agent that supports MCP. Chromium, Brave, Edge, Arc and
+Vivaldi work too, but are less tested.
+
+**1. Run the installer.** In Terminal:
 
 ```sh
 git clone https://github.com/argofowl/FowlBrowser.git
@@ -40,67 +57,117 @@ cd FowlBrowser
 sh install.sh
 ```
 
-The installer copies FowlBrowser to `~/Library/Application Support/FowlBrowser`, registers the browser helper and,
-when Claude Code is installed, the `fowlbrowser` MCP server and its end-of-turn hook. It prints exactly what it
-changed.
+It copies FowlBrowser to `~/Library/Application Support/FowlBrowser`, connects it to your browsers and, if you use
+Claude Code, adds it there too. It prints everything it changed.
 
-Then, once in each browser:
+**2. Add the extension to your browser.** FowlBrowser isn't in the Chrome Web Store yet, so you load it yourself, once
+per browser profile:
 
-1. Open the extensions page (`chrome://extensions`).
-2. Turn on **Developer mode**.
-3. Click **Load unpacked** and pick `~/Library/Application Support/FowlBrowser/extension` (the installer puts this path
-   on your clipboard; in the file picker, Cmd-Shift-G and paste).
-4. Open the extension's **Details** and turn on **Allow access to file URLs** (needed for file uploads).
+1. Open `chrome://extensions` and turn on **Developer mode** (top right).
+2. Click **Load unpacked** and choose `~/Library/Application Support/FowlBrowser/extension`. The installer puts this path
+   on your clipboard: in the file picker, press Cmd-Shift-G and paste.
+3. Open the extension's **Details** and turn on **Allow access to file URLs**, so agents can upload files for you.
 
-Optional: hide Chrome's "started debugging this browser" bar by relaunching it with a flag. Quit Chrome first, then:
+**3. Start a new agent session.** Claude Code picks FowlBrowser up in any session started after the install. Then just
+ask.
+
+**Optional: name your browsers.** Click the FowlBrowser icon in the toolbar and give the browser a name, like Work or
+Personal. Agents then see it as "Chrome (Work)", so you can say "use my work browser". Each profile with the extension
+counts as its own browser. The same popup shows whether FowlBrowser is connected.
+
+**Optional: hide the debugging bar.** While an agent works, Chrome shows a "started debugging this browser" bar. To hide
+it, quit Chrome and relaunch it with this command:
 
 ```sh
 open -a "Google Chrome" --args --silent-debugger-extension-api --restore-last-session
 ```
 
-To update, pull and run `sh install.sh` again. To remove everything, run `sh uninstall.sh`.
+To update, run `git pull` and then `sh install.sh` again. To remove FowlBrowser, run `sh uninstall.sh`, then remove the
+extension from each browser.
 
-## Use
+## Using other agents
 
-Ask your agent in plain words. It picks the browser you name, or the one where you're signed in.
+FowlBrowser works with any agent that supports MCP (Model Context Protocol, the standard way agents connect to tools).
+The easiest route: click the FowlBrowser icon, open **Set up an agent**, choose your agent and paste the prompt into
+it. Or set it up by hand:
 
-> Open my GitHub notifications in Chrome and summarize what needs a reply.
+- **Claude Code:** done by the installer.
+- **Codex:**
+  ```sh
+  codex mcp add fowlbrowser --env FOWLBROWSER_LABEL=Codex -- "$HOME/Library/Application Support/FowlBrowser/mcp/bin/fowlbrowser-mcp"
+  ```
+- **Any other MCP client:** add a stdio server with the command
+  `~/Library/Application Support/FowlBrowser/mcp/bin/fowlbrowser-mcp` (no arguments). Set `FOWLBROWSER_LABEL` to the
+  name the cursor should show.
 
-> Find the RSVP form in my email, fill it in with my details and stop before sending.
+One difference: Claude Code closes an agent's work tabs after every reply. Other agents close them when their session
+ends.
 
-> Open YouTube in Helium, play my Watch Later list muted and leave the tab for me.
+## Privacy and safety
 
-Other MCP clients can start the server with `~/Library/Application Support/FowlBrowser/mcp/bin/fowlbrowser-mcp`.
-End-of-turn cleanup uses Claude Code hooks; elsewhere, agent tabs close when the session ends.
+- **Everything stays on your Mac.** FowlBrowser has no servers and collects nothing. Pages an agent reads go only to
+  the agent you're using.
+- **No open debugging port.** Many automation tools open a port that any program on your Mac can use to control the
+  browser. FowlBrowser doesn't: it works through Chrome's extension APIs, one tab at a time.
+- **Agents only touch their own tabs.** An agent controls the tabs it opened and the ones it borrowed from you. It never
+  closes your tabs unless you asked, and incognito windows are left alone.
+- **Locked to your account.** Agents connect to the browser through a local channel that needs a secret only your Mac
+  user can read.
+- **Limited powers.** Commands that would reach beyond the agent's tab, such as other tabs, window focus or your whole
+  profile's cookies and storage, are blocked.
 
-## How it works
+## Good to know
+
+- FowlBrowser runs on macOS only for now.
+- A sign-in window that a website opens as a separate pop-up window can still bring the browser to the front.
+- Agents read pages as text with numbered elements, not as screenshots, so they're fast and cheap. They can still take
+  a screenshot when the layout matters.
+
+## For developers
+
+### How it works
 
 ```
-Agent (Claude Code or any MCP client)
-  │  MCP
-FowlBrowser server, one per session
+Agent (Claude Code, Codex or any MCP client)
+  │  MCP over stdio
+FowlBrowser server: one per agent session, its subagents share it
   │  local socket, token-gated
-Helper, started by the browser
+Helper (native messaging host), started by the browser
   │  native messaging
 Extension: chrome.debugger and chrome.tabs
 ```
 
-The extension drives only the tabs a session opened or was given, through `chrome.debugger`, so the browser never
-opens a remote-debugging port. Everything stays on your Mac.
+The extension drives only the tabs a session opened or claimed, through `chrome.debugger`, so the browser never opens a
+remote-debugging port. The server talks to each tab through a local CDP relay and Playwright, and identifies every tab
+by browser and id (`chrome:52`, `helium:1834`). There is no "current tab", so parallel agents can't collide.
 
-## Tools
+### Tools
 
 | Area | Tools |
 | --- | --- |
 | Browsers and tabs | `browser_list`, `tab_list`, `tab_open`, `tab_claim`, `tab_release`, `tab_close`, `tab_keep`, `tab_handoff`, `tab_mute`, `tab_focus` |
-| Reading | `snapshot`, `screenshot`, `evaluate`, `console`, `network`, `wait_for`, `viewport` (lay a tab out at a phone or window size; reset when done) |
+| Reading | `snapshot`, `screenshot`, `evaluate`, `console`, `network`, `wait_for`, `viewport` |
 | Acting | `navigate`, `click`, `hover`, `type`, `fill_form`, `select_option`, `press_key`, `scroll`, `drag`, `upload_files`, `dialog`, `media` |
-| Files and data | `download`, `downloads`, `export` (YouTube transcripts, Google Docs, Sheets and Slides), `browser_data` (history, bookmarks, recently closed, top sites; read only) |
+| Files and data | `download`, `downloads`, `export`, `browser_data` |
 
-A tab meant for you to keep is opened with `tab_open` and `for_user: true`. Your own tabs are never closed unless you
-ask, and a tab an agent claimed goes back to you when it is done.
+- `snapshot` returns an accessibility tree with element refs (`[ref=e12]`). After an action, results list only what
+  changed since the last snapshot, and errors say why an action failed ("covered by the cookie banner").
+- `tab_open` with `for_user: true` opens a tab meant for the user, kept after the agent's turn. `tab_claim` borrows one
+  of the user's tabs, and `tab_release` gives it back.
+- `tab_handoff` gives a tab to the user mid-task (logins, codes, payments). `tab_claim` with `resume: true` takes it back
+  once they're done. The same call resumes a tab the user took over; agents are told to wait for the user's go-ahead.
+- `viewport` lays a tab out at a phone or window size and is reset before the tab goes back to the user.
+- `export` reads YouTube transcripts and Google Docs, Sheets and Slides directly. `browser_data` reads history,
+  bookmarks, recently closed tabs and top sites, read only.
 
-## Development
+### Configuration
+
+| Variable | What it does |
+| --- | --- |
+| `FOWLBROWSER_LABEL` | The agent name on the cursor and its tab group. Default `Claude`. |
+| `FOWLBROWSER_SKIP_CLAUDE=1` | Makes `install.sh` and `uninstall.sh` leave Claude Code's settings alone. |
+
+### Development
 
 ```sh
 npm ci --prefix mcp && npm install --prefix test   # once
@@ -109,25 +176,18 @@ node tools/fake-extension.mjs --test
 ```
 
 - `node test/run.mjs --browser both` runs the end-to-end scenarios against a local test site in real browsers.
-- `node tools/rounds.mjs` runs a round of real Claude agents at once (half in Helium, half in Chrome) and grades each
-  run: the answer, whether the cursor was on target at every click, focus steals, sound, tabs left behind, time, tool
+- `node tools/rounds.mjs` runs a round of real Claude agents at once (half in Helium, half in Chrome) and grades every
+  run: the answer, whether the cursor was on target at each click, focus steals, sound, tabs left behind, time, tool
   calls and tokens. `report.html` shows a frame of the cursor at every click. Bring your own tasks with
   `--tasks <file>`.
 - `node tools/rounds.mjs --tasks tools/agents/forms.json --serve "node test/forms/server.mjs"` puts 12 agents on six
   tricky forms (custom dropdowns, a virtualized list, a cross-origin card field, closed shadow DOM, drag to reorder)
   and checks every field and any mix-up between agents.
-- `--surface codex` runs the same tasks on Codex's browser extension instead (the same Claude model driving ChatGPT's
-  `cua_repl` through a `codex-cu` MCP server registered in Claude Code), graded the same way: `node tools/rounds.mjs --tasks
-  tools/agents/codex-h2h.json --serve "node test/demo/server.mjs --all" --surface codex`, then again with
-  `--surface fowlbrowser`. The 14 head-to-head tasks cover the forms, new tabs and popups, a sign-in popup, a phone-size
-  check, handing a checkout to the user, the user taking a tab back (`--gui`, test Mac only) and pages that try to make
-  the agent order or forward mail, on a local demo shop and inbox that log every visit, post and typed field.
-- `--remote <host>` puts the agents' browsers on a test Mac while `claude -p` stays here: every MCP server, the
-  `--serve` site and the takeover act run there over one ssh connection, which also forwards its FowlBrowser sockets
-  and the graded ports. The round holds that Mac's GUI lock (`--remote-held` when the caller already does) and refuses
-  to start unless its `~/Projects/FowlBrowser` is this tree.
+- `--surface codex` runs the same tasks on Codex's browser extension instead, graded the same way, for a head-to-head
+  on `tools/agents/codex-h2h.json` against a local demo shop and inbox (`--serve "node test/demo/server.mjs --all"`).
+  `--remote <host>` runs the browsers and MCP servers on a second Mac over ssh.
 
-The full contract is in [SPEC.md](SPEC.md), the cursor in [docs/cursor-spec.md](docs/cursor-spec.md).
+The full contract is in [SPEC.md](SPEC.md), the agent cursor in [docs/cursor-spec.md](docs/cursor-spec.md).
 
 ## License
 
