@@ -210,14 +210,17 @@ export function createCore({ chrome, send, timers = globalThis }) {
     const owner = { client, origin: 'agent', group: label, kept: !!forUser, handedOver: !!forUser, agentMuted: !!forUser };
     owners.set(tab.id, owner);
     try {
-      await persist();
-      if (forUser) {
-        await chrome.tabs.update(tab.id, { muted: true });
+      // In the tab's queue, like a child's adoption: a disconnect's cleanup comes after it and finds the group to leave.
+      return await serialize(tab.id, async () => {
+        await persist();
+        if (forUser) {
+          await chrome.tabs.update(tab.id, { muted: true });
+          return await chrome.tabs.get(tab.id);
+        }
+        await chrome.tabs.update(tab.id, { muted, autoDiscardable: false });
+        await addToGroup(client, label, tab.id, tab.windowId);
         return await chrome.tabs.get(tab.id);
-      }
-      await chrome.tabs.update(tab.id, { muted, autoDiscardable: false });
-      await addToGroup(client, label, tab.id, tab.windowId);
-      return await chrome.tabs.get(tab.id);
+      });
     } catch (error) {
       owner.releasing = true;
       await serialize(tab.id, () => cleanUp(tab.id, owner));
@@ -667,6 +670,12 @@ export function createCore({ chrome, send, timers = globalThis }) {
       if (owner.parked && !owner.parked.resuming) { // called off meanwhile (tabs.park)
         await chrome.debugger.detach({ tabId }).catch(() => {});
         throw refused();
+      }
+      // Released, or its client left, meanwhile: cleanUp's detach may have come first. Detached after the cleanup, unless
+      // the tab has a new owner by then.
+      if (owners.get(tabId) !== owner || owner.releasing) {
+        await serialize(tabId, async () => { if ((owners.get(tabId) ?? owner) === owner) await chrome.debugger.detach({ tabId }).catch(() => {}); });
+        throw new Error(`Tab ${tabId} is no longer controlled by this client`);
       }
       if (owner.parked) resumed(owner);
       delete owner.detached;

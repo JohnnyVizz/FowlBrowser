@@ -75,6 +75,7 @@ const records = new Map(); // "chrome:52" -> { kind: 'takeover'|'handoff', at, t
 const unseen = new Set(); // takeovers no result has told the agent about yet
 const ending = new Map(); // "chrome:52" -> when this session started closing or releasing it
 const crashed = new Map(); // "chrome:52" -> when its renderer died
+const downloaded = new Map(); // "chrome:52" -> when its page last started a download (a new tab then closes for it)
 const lastTabs = new Map(); // "chrome:52" -> the Tab it was when its debugger went (its page may close first)
 const parking = new Map(); // "chrome:52" -> its takeover's park, or its handoff's cleanup and park, until done
 const judging = new WeakMap(); // Tab -> reports of input in it still being judged (onReport), for userSettled
@@ -189,7 +190,7 @@ export function markEnding(key) {
 // fades on its own idle timer, the popup scripts switch themselves off).
 export async function takeOver(browser, tabId, how, { tab = browser.tabs.get(tabId), gone = false } = {}) {
   const key = keyOf(browser, tabId);
-  if (records.has(key)) return;
+  if (records.has(key) || browser.host.closed) return;
   records.set(key, { kind: 'takeover', at: Date.now(), tabId, how, gone });
   unseen.add(key);
   debug('takeover', key, how);
@@ -273,11 +274,20 @@ export function watchTakeovers(browser) {
     return done;
   };
   browser.host.on('event', (method, params) => {
+    if (browser.host.closed) return; // drained after the connection ended: its tabs are no longer this session's
     if (method === 'chrome.debugger.onDetach') onDetach(browser, params?.[0]?.tabId, params?.[1]).catch((e) => debug('takeover: detach', e.message));
     else if (method === 'chrome.tabs.onRemoved') onRemoved(browser, params?.[0], params?.[1]).catch((e) => debug('takeover: removed', e.message));
     else if (method === 'chrome.debugger.onEvent') {
       const [source, cdpMethod] = params ?? [];
       if (!source?.sessionId && cdpMethod === 'Inspector.targetCrashed') crashed.set(keyOf(browser, source?.tabId), Date.now());
+      else if (!source?.sessionId && cdpMethod === 'Page.downloadWillBegin') downloaded.set(keyOf(browser, source?.tabId), Date.now());
+    }
+  });
+  // The connection ended (the browser quit, the extension reloaded): none of its tabs is this session's any more, and a
+  // browser restart numbers tabs from the start again, so its records must not hold a new tab of the same id.
+  browser.host.on('close', () => {
+    for (const map of [records, unseen, parking, ending, inputs, crashed, downloaded, lastTabs, givenBack]) {
+      for (const key of map.keys()) if (key.startsWith(`${browser.key}:`)) map.delete(key);
     }
   });
 }
@@ -304,9 +314,14 @@ async function onDetach(browser, tabId, reason) {
 async function onRemoved(browser, tabId, removeInfo) {
   const key = keyOf(browser, tabId);
   const tab = browser.tabs.get(tabId) ?? lastTabs.get(key);
-  const known = !!tab || browser.relay.model.hasTab(tabId);
+  // Only a tab this session controlled: a popup announced but closed before it was attached and mapped (Chrome closes a
+  // new tab whose first navigation became a download) was never the agent's to take back.
+  const known = !!tab;
   const ours = recently(ending, key, ENDING_MS);
-  for (const map of [inputs, ending, crashed]) map.delete(key);
+  // Chrome closes a new tab whose first navigation became a download (it never showed a page), and the extension a
+  // tabs.openChild child likewise.
+  const download = recently(downloaded, key, CLOSED_BY_PAGE_MS) && ['', 'about:blank'].includes(tab?.page.url());
+  for (const map of [inputs, ending, crashed, downloaded]) map.delete(key);
   if (removeInfo?.usersPopup) { // still open: a popup the extension gave back to the user who opened it
     givenBack.add(key);
     setTimeout(() => givenBack.delete(key), KEEP_MS).unref();
@@ -314,7 +329,7 @@ async function onRemoved(browser, tabId, removeInfo) {
   }
   if (removeInfo?.replacedBy !== undefined) return moveRecord(key, keyOf(browser, removeInfo.replacedBy), removeInfo.replacedBy);
   if (records.get(key)?.kind === 'handoff') return forget(key); // the user closed what they were handed
-  if (!known || records.has(key) || ours) return;
+  if (!known || records.has(key) || ours || download) return;
   if (Date.now() - (tab?.closedByPageAt ?? -Infinity) <= CLOSED_BY_PAGE_MS) return; // the page closed itself
   await takeOver(browser, tabId, 'closed the tab', { tab, gone: true });
 }

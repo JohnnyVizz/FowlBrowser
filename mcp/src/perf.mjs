@@ -8,7 +8,7 @@ import path from 'node:path';
 import { cdp } from './cdp.mjs';
 import { registerLighthouse } from './lighthouse.mjs';
 import { registerTrace } from './trace.mjs';
-import { sleep, tabInfo } from './util.mjs';
+import { sleep, tabInfo, within } from './util.mjs';
 
 export { cdp } from './cdp.mjs';
 
@@ -47,16 +47,16 @@ export async function clearEmulation(tab) {
 
 // Chrome records one trace per browser, and the trace engine (shared by traces and Lighthouse) parses one trace at a
 // time per process, so this server's recordings and Lighthouse runs take turns: resolves with the release function
-// once the previous holder released (a holder that never did, a recording nobody stops, is skipped after 10 min).
+// once the previous holder released (a holder that never did, a recording nobody stops, is skipped 10 min after it got
+// the slot; the callers queued behind it still take turns with each other).
 const SLOT_WAIT_MS = 600_000;
 let tracing = Promise.resolve();
 export async function tracingSlot() {
   const previous = tracing;
   let release;
   const held = new Promise((resolve) => { release = resolve; });
-  tracing = previous.then(() => held);
-  let timer;
-  await Promise.race([previous, new Promise((resolve) => { timer = setTimeout(resolve, SLOT_WAIT_MS); })]).finally(() => clearTimeout(timer));
+  tracing = previous.then(() => within(held, SLOT_WAIT_MS));
+  await previous;
   return release;
 }
 
@@ -113,11 +113,11 @@ export async function readStream(send, stream) {
   return Buffer.concat(chunks);
 }
 
-// A claimed or handed-over tab (for_user, tab_keep) is the user's own page: reloading it for a measurement would throw
-// their state away.
+// A claimed or handed-over tab (for_user, tab_keep), or one kept for the user (a child of such a tab, which may be their
+// own Cmd-click), is the user's own page: reloading it for a measurement would throw their state away.
 export async function isUsersTab(tab) {
   const info = await tabInfo(tab.browser, tab.tabId);
-  return info?.origin === 'user' || !!info?.handedOver;
+  return info?.origin === 'user' || !!info?.handedOver || !!info?.kept;
 }
 
 // Where big results go: os.tmpdir()/fowlbrowser-<kind>/, created for this user only. stamp(): 20261011-131500-123 (ms);

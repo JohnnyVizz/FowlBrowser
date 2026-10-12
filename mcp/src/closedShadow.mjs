@@ -8,7 +8,8 @@
 //   parsers) and counts closed roots per document; each snapshot reads the count in every frame (one
 //   evaluate per frame, in parallel). Declarative `<template shadowrootmode="closed">` from the HTML parser
 //   calls no JS, so each frame's document response is checked for it (fetched in the background as it loads).
-//   A document the hook missed the start of (`late`) gets one full scan.
+//   A document the hook missed the start of (`late`: one loaded before control, every cross-origin frame) gets a full
+//   scan, and one on every snapshot while the page has closed roots.
 // - the user's claimed tabs (nothing is patched in their pages): a full scan per document, then again on each
 //   snapshot if it found roots, or, if it found none, at most every RESCAN_MS. Nothing cheap seen from outside the
 //   page reliably signals a closed root attached later to an element already there (the light DOM is unchanged).
@@ -129,10 +130,11 @@ export async function closedShadowSection(tab) {
   if (tab.documentGeneration !== generation) return ''; // navigated meanwhile: these nodes belong to the old document
   if (!agent) claimedState.set(tab, { generation, hosts: hosts.length, at: Date.now() });
   else {
-    // Documents the hook joined late are now known; keep scanning them only if roots exist.
+    // Documents the hook joined late stay late (scanned on every snapshot) only while the page has roots. Not counted as
+    // roots of their own: those are what the hook saw, which a late cross-origin frame's are not.
     await Promise.all(need.late.map((frame) => frame.evaluate(([key, found]) => {
       const state = document[key];
-      if (state) Object.assign(state, { late: false, closed: Math.max(state.closed, found ? 1 : 0) });
+      if (state) state.late = found;
     }, [KEY, hosts.length > 0]).catch(() => {})));
   }
   const unreachable = agent && need.expected > roots

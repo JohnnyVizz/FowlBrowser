@@ -47,7 +47,7 @@ export class Tab extends EventEmitter {
     this.console = [];
     this.network = [];
     this.documentGeneration = 0; // bumped when the main frame commits a new document (refs from older ones are void)
-    this.frameGeneration = 0; // bumped when any iframe navigates (its refs from before are void; snapshots.mjs numberRefs)
+    this.frameGeneration = 0; // bumped when any iframe loads a new document (its refs from before are void; snapshots.mjs numberRefs)
     this._queue = Promise.resolve();
     this._calls = 0; // run() calls not yet settled
     this._busy = null;
@@ -66,7 +66,6 @@ export class Tab extends EventEmitter {
       this.dialog = dialog;
       this.emit('dialog', dialog);
     });
-    page.on('framenavigated', (frame) => { if (frame !== page.mainFrame()) this.frameGeneration++; });
     // Answered by the user in the browser, or by the dialog tool: actions are no longer blocked.
     page.on('dialogclosed', (dialog) => { if (this.dialog === dialog) this.dialog = null; });
     page.on('console', (message) => push(this.console, {
@@ -178,13 +177,16 @@ export class Browser {
     this.relay.setUserAgent(extension.userAgent);
   }
 
-  // Raw CDP events of the tab's own session (not workers or frames): new documents, 'windowopen' (url) when the
-  // page asks for a new tab or window, and 'binding' (name, payload) when one of FowlBrowser's page scripts reports.
+  // Raw CDP events of the tab: new documents in its iframes (in the page's process, or out of it on their own session;
+  // never same-document navigations, which Playwright's framenavigated reports too), and of the tab's own session the
+  // main frame's new documents, 'windowopen' (url) when the page asks for a new tab or window, and 'binding' (name,
+  // payload) when one of FowlBrowser's page scripts reports.
   _onDebuggerEvent([source, method, params] = []) {
-    if (source?.sessionId) return;
     const tab = this.tabs.get(source?.tabId);
     if (!tab) return;
-    if (method === 'Page.frameNavigated' && !params?.frame?.parentId) {
+    if (method === 'Page.frameNavigated' && (source.sessionId || params?.frame?.parentId)) tab.frameGeneration++;
+    else if (source.sessionId) return;
+    else if (method === 'Page.frameNavigated') {
       tab._newDocument();
       prepareCursor(tab);
     } else if (method === 'Page.windowOpen') tab.emit('windowopen', params?.url ?? '');

@@ -223,11 +223,13 @@ const FOCUSED_FIELD_FN = () => {
   return r.width >= 4 && r.height >= 4 && getComputedStyle(el).opacity !== '0' ? el : null;
 };
 
-// Waits up to 5 s for the page's load event, unless the document is complete already: a page restored from the
-// back/forward cache never fires it again.
-async function loaded(page) {
-  if (await page.evaluate(() => document.readyState === 'complete').catch(() => false)) return;
-  await page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
+// Waits for the page's load event (up to 5 s by default), unless the document is complete already: a page restored
+// from the back/forward cache never fires it again. The check and the wait share the timeout (a busy page's script
+// holds the check up).
+async function loaded(page, timeout = 5000) {
+  const end = Date.now() + timeout;
+  if (await within(page.evaluate(() => document.readyState === 'complete'), timeout, false)) return;
+  await page.waitForLoadState('load', { timeout: Math.max(1, end - Date.now()) }).catch(() => {});
 }
 
 async function header(tab) {
@@ -253,6 +255,9 @@ async function snapshotText(tab, { ref, changes = false, maxChars = SNAPSHOT_MAX
     url = tab.page.url();
     const target = ref ? locator(tab, ref) : tab.page;
     yaml = await target.ariaSnapshot({ mode: 'ai', timeout: ACTION_TIMEOUT_MS });
+    // Playwright resolves refs through its last snapshot's table, a section's only of the section: the whole page is read
+    // again (text unused), so the refs shown before outside it keep working.
+    if (ref) await tab.page.ariaSnapshot({ mode: 'ai', timeout: ACTION_TIMEOUT_MS }).catch((error) => debug('ref table restore failed', error.message));
     shadow = ref ? '' : await closedShadowSection(tab).catch((error) => { debug('closed shadow scan failed', error.message); return ''; });
     if (tab.documentGeneration === generation && tab.page.url() === url) break;
     if (attempt) return `Snapshot unavailable: the page kept navigating while it was read (now ${tab.page.url()}). Call snapshot again.`;
@@ -340,9 +345,9 @@ function watchRequests(page) {
 }
 
 async function settle(tab, { requests, first }, { watchMs = WATCH_MS.snapshot, generation, waited = false, trailing = true, timeout = NAVIGATION_TIMEOUT_MS } = {}) {
-  const load = () => tab.page.waitForLoadState('load', { timeout: ACTION_TIMEOUT_MS }).catch(() => {});
+  const load = () => loaded(tab.page, ACTION_TIMEOUT_MS);
+  if (waited) return; // navigate also waited for its load already, at most 5 s
   if (tab.documentGeneration !== generation) return load();
-  if (waited) return;
   await within(first, watchMs);
   const main = tab.page.mainFrame();
   // Requests that start while earlier ones finish (a fetch answered, then another, then a redirect) are followed too,
@@ -482,15 +487,26 @@ async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenT
 function withTab(manager, handler) {
   return async (args) => {
     const tab = await resolveTab(manager, args.tab);
+    const started = Date.now();
     return tab.run(async () => {
       await checkRefs(tab, args);
       return handler(tab, args);
     }).catch((error) => {
+      const closed = closedItself(tab, started);
+      if (closed) return closed;
       // Playwright names the ref it was given; the agent knows it by the number it was shown.
       if (typeof error?.message === 'string') error.message = error.message.replace(/aria-ref=(\w+)/g, (_, r) => `aria-ref=${shownRef(tab.refs, r)}`);
       throw error;
     });
   };
+}
+
+// A call that failed because the page closed its own tab since `started` (popups.mjs heard its window.close()) reports
+// that instead: it is what happened, not a failure. Null otherwise.
+function closedItself(tab, started) {
+  if (!(tab.closedByPageAt >= started) || !tab.page.isClosed()) return null;
+  return text(`Browser: ${tab.browser.name} · Tab: ${tab.id}\nThe page closed this tab itself (window.close(), as sign-in and payment popups do ` +
+    'once they are done) during this call; the tab is gone.');
 }
 
 export function cleanError(error) {
@@ -963,12 +979,21 @@ export function registerTools(server, manager) {
         // Like a navigation, it may take a while when the browser is busy (its debugger attach alone can take seconds).
         const tab = await browser.waitForTab(created.id, timeout_ms ?? NAVIGATION_TIMEOUT_MS);
         return await tab.run(async () => {
-          if (url) await tab.page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeout_ms ?? NAVIGATION_TIMEOUT_MS });
-          await loaded(tab.page);
-          if (focus) await browser.host.request('tabs.focus', { tabId: tab.tabId });
-          const lines = [`Opened ${tab.id} in ${browser.name}${focus ? ' and brought it to the front' : ''}.`];
+          // A dialog the page opens while it loads holds the load up: it is reported at once, as act() does for navigate,
+          // and the load goes on once it is resolved (later calls on the tab wait for that).
+          let onDialog;
+          const dialogOpened = new Promise((resolve) => { onDialog = resolve; tab.once('dialog', onDialog); });
+          const opening = (async () => {
+            if (url) await tab.page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeout_ms ?? NAVIGATION_TIMEOUT_MS });
+            await loaded(tab.page);
+            if (focus) await browser.host.request('tabs.focus', { tabId: tab.tabId });
+          })();
+          opening.catch(() => {}); // a dialog may win the race
+          await Promise.race([opening, dialogOpened]).finally(() => tab.off('dialog', onDialog));
+          if (tab.dialog) tab.keepBusy(opening.catch(() => {}));
+          const lines = [`Opened ${tab.id} in ${browser.name}${focus && !tab.dialog ? ' and brought it to the front' : ''}.`];
           if (for_user) lines.push('It is the user\'s tab (not grouped) and stays open after your turn; you control it until then, and it stays muted till then so nothing plays aloud before they look (tab_mute false if they asked to hear it now).');
-          return report(tab, { lines, snapshot: snapshot !== false });
+          return report(tab, { lines, snapshot: snapshot !== false && !tab.dialog });
         });
       } catch (error) {
         // The tab exists and is ours either way: name it so it can be used or closed instead of piling up.
@@ -1341,22 +1366,31 @@ export function registerTools(server, manager) {
     // Not queued: the action that opened the dialog may still hold this tab's queue until the dialog is resolved.
     async (args) => {
       const tab = await resolveTab(manager, args.tab);
+      const started = Date.now();
       const dialog = tab.dialog;
       if (!dialog) throw new Error('No dialog is open on this tab.');
       tab.dialog = null;
       const summary = `${args.accept ? 'Accepted' : 'Dismissed'} ${dialog.type()} "${dialog.message()}".`;
       const snapshot = args.snapshot !== false;
-      // What the page does once it goes on (a navigation a confirm allowed, a request) is waited for like after an action.
-      const watch = watchRequests(tab.page);
-      try {
-        const generation = tab.documentGeneration;
-        if (args.accept) await dialog.accept(args.text);
-        else await dialog.dismiss();
-        await settle(tab, watch, { watchMs: snapshot ? WATCH_MS.snapshot : WATCH_MS.action, generation, trailing: snapshot }).catch(() => {});
-      } finally {
-        watch.stop();
-      }
-      return report(tab, { lines: [summary], snapshot: snapshot && !tab.dialog, changes: true });
+      const answer = async () => {
+        // What the page does once it goes on (a navigation a confirm allowed, a request) is waited for like after an action.
+        const watch = watchRequests(tab.page);
+        try {
+          const generation = tab.documentGeneration;
+          if (args.accept) await dialog.accept(args.text);
+          else await dialog.dismiss();
+          await settle(tab, watch, { watchMs: snapshot ? WATCH_MS.snapshot : WATCH_MS.action, generation, trailing: snapshot }).catch(() => {});
+        } finally {
+          watch.stop();
+        }
+        return report(tab, { lines: [summary], snapshot: snapshot && !tab.dialog, changes: true });
+      };
+      // A popup that closes itself once its alert is answered, maybe before the answer's own reply comes back.
+      return answer().catch((error) => {
+        const closed = closedItself(tab, started);
+        if (closed) return closed;
+        throw error;
+      });
     });
 
   tool('wait_for',

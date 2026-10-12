@@ -573,3 +573,63 @@ test('a popup the user\'s own click opens while an agent call runs is theirs: ne
   assert.ok(methods.indexOf('tabs.userInput') >= 0 && methods.indexOf('tabs.userInput') < methods.indexOf('tabs.openChild'), methods.join());
   assert.ok(!browser.requests.some(([m, p]) => m === 'chrome.debugger.sendCommand' && p[0].tabId === 9));
 });
+
+test('a new tab that turned into a download and was closed for it (by the extension or Chrome) is no takeover', async () => {
+  const browser = await fakeBrowser({ ids: [1, 2] });
+  browser.tabs.set(2, new Tab(browser, 2, fakePage('about:blank')));
+  // The agent's click on a target=_blank download link: the child's first navigation became a download, so it closes.
+  browser.host.emit('event', 'chrome.debugger.onEvent', [{ tabId: 2 }, 'Page.downloadWillBegin', { url: 'https://shop.example/invoice.pdf', guid: 'g' }]);
+  browser.host.emit('event', 'chrome.tabs.onRemoved', [2, { windowId: 1, isWindowClosing: false }]);
+  await sleep(10);
+  const result = await toolsFor(browser)('console', { tab: `${browser.key}:1` });
+  assert.equal(result.error, false, result.text);
+  assert.doesNotMatch(result.text, /took over/);
+});
+
+test('the user closing a page right after a download started in it is still a takeover', async () => {
+  const browser = await fakeBrowser({ ids: [1] }); // a claimed checkout page
+  browser.host.emit('event', 'chrome.debugger.onEvent', [{ tabId: 1 }, 'Page.downloadWillBegin', { url: 'https://shop.example/invoice.pdf', guid: 'g' }]);
+  browser.host.emit('event', 'chrome.tabs.onRemoved', [1, { windowId: 1, isWindowClosing: false }]);
+  await sleep(10);
+  const result = await toolsFor(browser)('console', { tab: `${browser.key}:1` });
+  assert.match(result.text, /took over .*\(closed the tab\)/);
+  browser.host.emit('close'); // its notice is for this test only
+});
+
+test('events of a connection that ended, drained after its close, take nothing over', async () => {
+  const first = await fakeBrowser({ ids: [52] });
+  first.host.closed = true; // HostClient: set before 'close'; messages already received still drain one per tick
+  first.host.emit('close');
+  first.host.emit('event', 'chrome.tabs.onRemoved', [52, { windowId: 1, isWindowClosing: false }]);
+  first.host.emit('event', 'chrome.debugger.onDetach', [{ tabId: 52 }, 'canceled_by_user']);
+  await sleep(10);
+  const second = await fakeBrowser({ ids: [] });
+  second.key = first.key;
+  second.tabs.set(52, new Tab(second, 52, fakePage()));
+  const result = await toolsFor(second)('console', { tab: `${first.key}:52` });
+  assert.equal(result.error, false, result.text);
+  assert.doesNotMatch(result.text, /took over/);
+});
+
+test('a takeover of the browser\'s last connection is forgotten when it closes: after a browser restart a new tab may get the same id', async () => {
+  const first = await fakeBrowser({ ids: [52] });
+  first.host.emit('event', 'chrome.tabs.onRemoved', [52, { windowId: 1, isWindowClosing: false }]); // the user closed it
+  await sleep(10);
+  first.host.emit('close'); // Chrome restarts; the server reconnects to the same socket name
+  const second = await fakeBrowser({ ids: [] });
+  second.key = first.key;
+  second.tabs.set(52, new Tab(second, 52, fakePage())); // tab_open got id 52 again
+  const result = await toolsFor(second)('console', { tab: `${first.key}:52` });
+  assert.equal(result.error, false, result.text);
+  assert.doesNotMatch(result.text, /took over/);
+});
+
+test('a popup announced but not yet controlled that closes (Chrome closing it for its download) is no takeover', async () => {
+  const browser = await fakeBrowser({ ids: [1, 2] });
+  browser.tabs.delete(2); // the extension adopted and announced it (the relay knows it); no page for it yet
+  browser.host.emit('event', 'chrome.tabs.onRemoved', [2, { windowId: 1, isWindowClosing: false }]);
+  await sleep(10);
+  const result = await toolsFor(browser)('console', { tab: `${browser.key}:1` });
+  assert.equal(result.error, false, result.text);
+  assert.doesNotMatch(result.text, /took over/);
+});

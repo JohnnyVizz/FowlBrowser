@@ -321,7 +321,7 @@ export function registerLighthouse(tool, manager, { withTab, header, text, tabAr
     },
     withTab(async (tab, { device = 'mobile', mode = 'navigation', categories }) => {
       if (mode === 'navigation' && await isUsersTab(tab)) {
-        throw new Error(`Tab ${tab.id} is the user's own tab (you claimed it): mode "navigation" reloads the page, so it was not run. ` +
+        throw new Error(`Tab ${tab.id} is the user's own tab (you claimed it, or it is kept or handed over to them): mode "navigation" reloads the page, so it was not run. ` +
           'Audit a tab_open of the URL instead, or use mode "snapshot" to audit the page as it is.');
       }
       const lh = await load();

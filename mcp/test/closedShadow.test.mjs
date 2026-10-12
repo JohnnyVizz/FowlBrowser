@@ -99,3 +99,36 @@ test('closed shadow click: hit test in document coordinates, the control\'s own 
   await closedShadowSection(covered);
   await assert.rejects(shadowRefPoint(covered, 's1'), /covered at its centre \(100, 50\) by <div#banner>/);
 });
+
+// An agent tab: each frame's document is a vm context the hook really runs in. The main frame got the init script and
+// made one closed root; the cross-origin iframe (its own session, so no init script) is joined late by the snapshot.
+test('agent tab: a late cross-origin iframe is not counted as holding the main frame\'s closed roots', async () => {
+  const { EventEmitter } = await import('node:events');
+  const vm = await import('node:vm');
+  const { watchClosedShadow } = await import('../src/closedShadow.mjs');
+  const documentContext = () => vm.createContext({ document: {}, Element: class { attachShadow({ mode }) { return { mode }; } }, ShadowRoot: class {}, Document: class {} });
+  const frameOf = (context) => ({
+    evaluate: async (fn, arg) => (typeof fn === 'string' ? vm.runInContext(fn, context) : vm.runInContext(`(${fn})`, context)(arg)),
+  });
+  const main = documentContext();
+  const iframe = documentContext();
+  const tab = fakeTab();
+  tab.controls = [101];
+  tab.page = Object.assign(new EventEmitter(), { url: () => 'https://example.test/', frames: () => [frameOf(main), frameOf(iframe)] });
+  const request = tab.browser.host.request;
+  let initScript;
+  tab.browser.host.request = async (name, [target, method, params]) => {
+    if (method === 'Page.addScriptToEvaluateOnNewDocument') { initScript = params.source; return {}; }
+    return request(name, [target, method, params]);
+  };
+  await watchClosedShadow(tab, true);
+  vm.runInContext(initScript, main);
+  vm.runInContext('new Element().attachShadow({ mode: "closed" })', main);
+
+  const first = await closedShadowSection(tab);
+  assert.deepEqual(refsOf(first), ['s1=101']);
+  assert.ok(!/cannot reach/.test(first));
+  const second = await closedShadowSection(tab);
+  assert.deepEqual(refsOf(second), ['s1=101']);
+  assert.ok(!/cannot reach/.test(second), `a note about roots that do not exist:\n${second}`);
+});

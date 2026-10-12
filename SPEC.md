@@ -185,7 +185,9 @@ and Chrome would have shown it.
   earlier page, or any ref before the current page has a snapshot, is refused ("Ref eN is from an earlier page of this
   tab ..."). Iframe refs (`f<seq>eN`) keep their frame prefix and are numbered the same way per frame: after an iframe
   (or the page) loads a new document, its refs are refused until the next snapshot, which numbers the new ones above
-  the old. The main frame's prefix is that of the first ref outside an iframe subtree. A page restored from the
+  the old. Playwright resolves refs through its last snapshot's table, which a section read (`snapshot {ref}`) narrows
+  to the section, so a section read reads the whole page once more (text unused) and the refs outside it keep working.
+  The main frame's prefix is that of the first ref outside an iframe subtree. A page restored from the
   back/forward cache keeps refs Playwright gave it on the earlier visit, whose prefix names a frame number Playwright has
   retired: refs outside iframes are looked up in the main frame directly, whatever their prefix.
   A string that is not a snapshot ref (`e12`, `f3e12`, `s4`) is refused at once; a ref whose element is gone fails
@@ -361,10 +363,14 @@ A tab this session controls (agent or claimed) is **taken over** only when contr
 - DevTools opening on the tab: measured on mac2 (Chrome 154.0.8037.99, Helium 0.18.3.1, 2026-10-11) with the real
   Cmd-Opt-I on a focused agent tab: DevTools opens docked, our debugger session stays (no `onDetach`), calls on the tab
   keep working, so it is no takeover.
-- Closing the tab: `chrome.tabs.onRemoved` for a tab this session did not close (no tab_close, turn end or release in
-  the last 30 s), that Chrome did not just swap for another (`removeInfo.replacedBy`), and that did not close itself
-  (`window.close()` reported by the popup script of agent tabs within 3 s, `tab.closedByPageAt`, see Popups). Its notice
-  has no resume line. A swapped parked tab stays parked under its new id: the extension moves its parked owner record and
+- Closing the tab: `chrome.tabs.onRemoved` for a tab this session controlled (it had a mapped page: an adopted popup
+  that closes before that, e.g. Chrome closing it for its download, is not), did not close (no tab_close, turn end or
+  release in the last 30 s), that Chrome did not just swap for another (`removeInfo.replacedBy`), that did not close
+  itself (`window.close()` reported by the popup script of agent tabs within 3 s, `tab.closedByPageAt`, see Popups), and
+  that did not close for its download (a `Page.downloadWillBegin` on its main session within 3 s: Chrome closes a new
+  tab whose first navigation became a download, the extension a `tabs.openChild` child likewise). Its notice
+  has no resume line. When a browser's connection ends, its takeover and handoff records, unseen notices and parks go
+  with it (a restarted browser numbers tabs from the start again, so an old record must not hold a new tab). A swapped parked tab stays parked under its new id: the extension moves its parked owner record and
   does not announce it for attaching, the server moves the record and any unseen notice, so a plain `tab_claim` of the
   new id is refused like the old one. A tab swapped while its takeover or handoff is still parking it: the extension's
   announcement of the new id is not passed to the relay meanwhile, so nothing attaches it; a handoff's park goes to the
@@ -622,7 +628,8 @@ name could send anything.
 - `window.close()` is wrapped to report `{"type":"close"}` once the native close ran (top frame only), and the
   isolated world passes it on only if `window.closed` is true (set at once when the browser accepts the close), so a
   page can't fake one; the server sets `tab.closedByPageAt = Date.now()` (takeover detection reads it: a tab that
-  closed itself is no takeover).
+  closed itself is no takeover). A call on the tab that fails because its page closed it during the call (a sign-in
+  popup's Continue, an alert answered with `dialog`) returns "The page closed this tab itself ..." as its result.
 - After a detach nothing reaches the page over CDP (the user's Cancel on the debugging bar parks the tab with no
   cleanup), so the scripts notice it themselves: before every intercept the isolated world appends a blank iframe to
   its closed shadow root for a moment and looks for the binding in that frame's new context of its world. V8 puts
@@ -651,8 +658,8 @@ the extension's user agent). Dependencies, imported lazily on first use: `@pauli
 and insights, BSD-3-Clause, the version Lighthouse pins) and `lighthouse` (Apache-2.0; an optional dependency, left out
 by `install.sh --lite`: the `lighthouse` tool then errors saying how to add it, the other tools are unaffected). Chrome records one trace per
 browser and the trace engine parses one trace at a time per process (its handlers are module state), so recordings and
-Lighthouse runs of one server take turns (`tracingSlot`, process-wide; a holder that never releases is skipped after 10
-  min); a recording of another session or of DevTools makes `Tracing.start` fail with "already been started": the tools
+Lighthouse runs of one server take turns (`tracingSlot`, process-wide; a holder that never releases is skipped 10
+  min after it got the slot, once; the callers behind it still take turns); a recording of another session or of DevTools makes `Tracing.start` fail with "already been started": the tools
   wait for it to end (`startTracing`: retried every 2 s, up to 90 s, `TRACE_WAIT`; `waitForTracing` first starts and
   ends an empty trace on the page as it is, so a reload is not left blank meanwhile) and say for how long they waited
   (from 1 s: the retries, not the start that went through; Lighthouse's own start retries count too); still busy after
@@ -699,7 +706,9 @@ the tab id (`trace-20261011-131500-123-chrome-52.json.gz`), so two measurements 
   (count over 50 ms, the longest), then the insights that fail or inform (name, title, estimated metric savings, wasted
   bytes), on one line the names that pass, `Not computed (needs source maps, which are not fetched): DuplicatedJavaScript`
   (no source maps are resolved, so that insight would always pass), and `Could not compute:` for insights whose generator
-  failed (`modelErrors`, with the message). No field (CrUX) data. When the recording waited for another session's
+  failed (`modelErrors`, with the message). The engine gives no insight set at all for a trace under 5 s without a page
+  load, an interaction or a layout shift: the summary then says so and lists the long tasks of the whole trace, and
+  `trace_insight` on it says there are no details. No field (CrUX) data. When the recording waited for another session's
   trace (1 s or more), a `Waited N s ...` line comes first. The parsed trace is kept per tab (the last one only;
   dropped with the tab) for `trace_insight`, which reports a failed generator's error and the source-map note the same way.
 - `trace_insight {tab, name, set?}`: details of one insight (`name` as listed, e.g. `LCPBreakdown`, `RenderBlocking`,

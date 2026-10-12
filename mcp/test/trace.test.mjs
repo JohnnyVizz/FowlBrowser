@@ -281,3 +281,26 @@ test('trace_stop: a failing IO.read still closes the stream', async () => {
   assert.deepEqual(tab.sent, ['Tracing.start', 'Tracing.end', 'IO.read', 'IO.close']);
   assert.notEqual(await slotIsFree(), null, 'slot released');
 });
+
+test('a short trace with no page load, interaction or layout shift has no insight sets: the summary says so and still lists long tasks', async () => {
+  const json = JSON.parse(clickTrace);
+  const idle = await parseTrace((json.traceEvents ?? json).filter((e) => e.name !== 'EventTiming')); // the click taken out
+  assert.equal(idle.insights.size, 0);
+  const s = summaryText(idle, { file: 'f' });
+  assert.match(s, /^No metrics or insights: the trace engine reports none for a trace under 5 s without a page load, an interaction or a layout shift\.$/m);
+  assert.match(s, /^Long tasks: 2 over 50 ms, longest 204 ms$/m);
+  assert.ok(!/trace_insight/.test(s), 'no pointer to insight details that do not exist');
+  assert.throws(() => insightText(idle, 'INPBreakdown'), /^Error: No metrics or insights: .*, so the last trace has no insight details\.$/);
+});
+
+test('trace_start never reloads the user\'s page: a claimed tab, one handed to them, or one kept for them (a child of their tab)', async () => {
+  for (const info of [{ origin: 'user' }, { origin: 'agent', kept: true, handedOver: true }, { origin: 'agent', kept: true }]) {
+    const tab = fakeTab();
+    const request = tab.browser.host.request;
+    tab.browser.host.request = async (method, args) => (method === 'tabs.info' ? { owner: 'you', kept: false, handedOver: false, ...info } : request(method, args));
+    const result = await tools.trace_start(tab, { reload: true, auto_stop: false }).then(() => 'reloaded', (e) => e.message);
+    if (result === 'reloaded') await tools.trace_stop(tab);
+    assert.match(result, /user's own tab, so it was not reloaded/, JSON.stringify(info));
+    assert.deepEqual(tab.page.gotos, []);
+  }
+});

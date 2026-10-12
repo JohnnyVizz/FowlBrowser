@@ -88,3 +88,26 @@ test('readStream: chunks are joined (base64 decoded) and the stream closed, also
   await assert.rejects(readStream(async (method) => { sent.push(method); if (method === 'IO.read') throw new Error('gone'); return {}; }, 'h'), /gone/);
   assert.deepEqual(sent, ['IO.read', 'IO.close']);
 });
+
+test('tracingSlot: a holder that never releases is skipped once, 10 min after it got the slot; the callers behind it still take turns', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const settle = async () => { for (let i = 0; i < 10; i++) await tick(); };
+  const order = [];
+  const take = (name) => tracingSlot().then((release) => { order.push(name); return release; });
+  const stuck = await tracingSlot(); // a recording nobody stops
+  const second = take('second');
+  const third = take('third');
+  t.mock.timers.tick(600_000);
+  await settle();
+  assert.deepEqual(order, ['second'], 'the third waits for the second, not just for its own 10 min');
+  (await second)();
+  await settle();
+  assert.deepEqual(order, ['second', 'third']);
+  const fourth = take('fourth');
+  await settle();
+  (await third)();
+  await settle();
+  assert.deepEqual(order, ['second', 'third', 'fourth'], 'the fourth gets the slot when the third releases, not 10 min later');
+  (await fourth)();
+  stuck();
+});

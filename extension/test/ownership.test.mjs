@@ -1671,3 +1671,93 @@ test('a tab adopted for the user\'s input and swapped by Chrome before the repor
   for (let i = 0; i < 5; i++) await tick();
   assert.equal(core.owners.has(replacement.id), false, 'the replacement is the user\'s');
 });
+
+test('an attach that finishes after the tab was released or its client left leaves it detached', async () => {
+  const { chrome, core, call, start } = setup();
+  const claimed = chrome.addTab({ url: 'https://user.example' });
+  const released = chrome.addTab({ url: 'https://user.example/2' });
+  await call(1, 'tabs.claim', { tabId: claimed.id });
+  await call(1, 'tabs.claim', { tabId: released.id });
+  const pending = [];
+  chrome.debugger.attach = async ({ tabId }) => { // a busy browser's attach can take seconds
+    await new Promise((resolve) => pending.push(resolve));
+    chrome.calls.push(['debugger.attach', tabId]);
+  };
+  const attaching = [claimed.id, released.id].map((tabId) => start(1, 'chrome.debugger.attach', [{ tabId }, '1.3']));
+  await tick();
+  await call(1, 'tabs.release', { tabId: released.id });
+  await core.handleMessage({ method: 'host.clientDisconnected', params: { client: 1 } }); // the session ended meanwhile
+  for (const resolve of pending) resolve();
+  await Promise.all(attaching.map((a) => a.done));
+  for (const [tabId, request] of [[claimed.id, attaching[0]], [released.id, attaching[1]]]) {
+    const last = chrome.calls.filter((c) => c[1] === tabId && /^debugger\.(attach|detach)$/.test(c[0])).at(-1);
+    assert.deepEqual(last, ['debugger.detach', tabId], `tab ${tabId} left attached with no owner`);
+    assert.ok(request.reply().error, 'the attach fails');
+    assert.equal(core.owners.has(tabId), false);
+  }
+});
+
+// Chrome handles each API call when the extension makes it and answers later, in call order (the fake above reads tab
+// state when it answers instead). `answer()` delivers the oldest pending answer.
+function orderedChrome() {
+  const tabs = new Map();
+  const groups = new Set();
+  const calls = [];
+  const closedInGroup = []; // tabs Chrome closed while they were in a group: it keeps such a group as a saved group
+  const pending = [];
+  let nextTab = 100, nextGroup = 1;
+  const handle = (fn) => {
+    let result, error;
+    try { result = structuredClone(fn()); } catch (e) { error = e; }
+    return new Promise((resolve, reject) => pending.push(() => (error ? reject(error) : resolve(result))));
+  };
+  const tab = (id) => { if (!tabs.has(id)) throw new Error(`No tab with id: ${id}`); return tabs.get(id); };
+  const store = { async get() { return {}; }, async set() {} };
+  return {
+    calls, closedInGroup,
+    answer: async () => { // the extension's own work runs first: an answer never comes back at once
+      const settle = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
+      await settle();
+      pending.shift()?.();
+      await settle();
+    },
+    get waiting() { return pending.length; },
+    runtime: { id: 'fowlbrowser-ext', getManifest: () => ({ version: '0.1.0' }) },
+    storage: { session: store, local: store },
+    windows: { getLastFocused: () => handle(() => ({ id: 1, type: 'normal', incognito: false })) },
+    tabGroups: { update: (id) => handle(() => { if (!groups.has(id)) throw new Error(`No group with id: ${id}`); return {}; }) },
+    debugger: { detach: () => handle(() => ({})) },
+    tabs: {
+      query: () => handle(() => []),
+      create: (props) => handle(() => {
+        const t = { id: nextTab++, windowId: props.windowId, index: 0, url: props.url, groupId: -1, mutedInfo: { muted: false } };
+        tabs.set(t.id, t);
+        return t;
+      }),
+      get: (id) => handle(() => tab(id)),
+      update: (id, props) => handle(() => { calls.push(['tabs.update', id]); return Object.assign(tab(id), { mutedInfo: { muted: !!props.muted } }); }),
+      group: ({ groupId, tabIds }) => handle(() => {
+        const g = groupId ?? nextGroup++;
+        groups.add(g);
+        for (const id of tabIds) tab(id).groupId = g;
+        return g;
+      }),
+      ungroup: (id) => handle(() => { tab(id).groupId = -1; }),
+      remove: (id) => handle(() => { if (tab(id).groupId !== -1) closedInGroup.push(id); tabs.delete(id); }),
+    },
+  };
+}
+
+test('a client that leaves while tabs.open still sets up its tab: the tab leaves its group before it closes (no saved group)', async () => {
+  const chrome = orderedChrome();
+  const core = createCore({ chrome, send: () => {} });
+  do await chrome.answer(); while (chrome.waiting); // restore()
+  await core.handleMessage({ method: 'host.clientConnected', params: { client: 1 } });
+  const opening = core.handleMessage({ id: 1, method: 'tabs.open', params: {}, client: 1 });
+  for (let i = 0; i < 20 && !chrome.calls.some(([c]) => c === 'tabs.update'); i++) await chrome.answer();
+  const leaving = core.handleMessage({ method: 'host.clientDisconnected', params: { client: 1 } }); // the session ends
+  while (chrome.waiting) await chrome.answer();
+  await Promise.all([opening, leaving]);
+  assert.deepEqual(chrome.closedInGroup, []);
+  assert.equal(core.owners.size, 0);
+});

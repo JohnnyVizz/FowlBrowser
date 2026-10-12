@@ -133,6 +133,9 @@ function longTasks(parsed, bounds) {
 // DuplicatedJavaScript reads the scripts' source maps, which are not fetched, so it always "passes": not shown as passed.
 const NEEDS_SOURCE_MAPS = 'DuplicatedJavaScript';
 const short = (error) => String(error?.message ?? error).split('\n')[0].slice(0, 120);
+// The engine leaves out the set of a trace without a page load that is under 5 s, has no interaction or layout shift
+// and passes every insight: then there is no set at all.
+const NO_SETS = 'No metrics or insights: the trace engine reports none for a trace under 5 s without a page load, an interaction or a layout shift';
 
 export function summaryText(parsed, { file, dataLoss }) {
   const { traceBounds, mainFrameURL } = parsed.data.Meta;
@@ -142,6 +145,10 @@ export function summaryText(parsed, { file, dataLoss }) {
     `File: ${file} (loads in DevTools' Performance panel)`,
     'Throttling: CPU none · network none',
   ];
+  if (!parsed.insights.size) {
+    lines.push('', `${NO_SETS}.`, longTasks(parsed, traceBounds));
+    return lines.join('\n');
+  }
   for (const [id, set] of parsed.insights) {
     const start = set.bounds.min - traceBounds.min;
     lines.push('', `${id}: ${set.url?.href ?? set.url ?? ''} · ${ms(start)} to ${ms(start + set.bounds.range)} of the trace`);
@@ -306,6 +313,7 @@ const DETAILS = {
 
 export function insightText(parsed, name, setId) {
   const sets = [...parsed.insights.keys()];
+  if (!sets.length) throw new Error(`${NO_SETS}, so the last trace has no insight details.`);
   const set = parsed.insights.get(setId ?? sets[0]);
   if (!set) throw new Error(`No insight set "${setId}". Sets of the last trace: ${sets.join(', ')}`);
   const error = set.modelErrors?.[name];
