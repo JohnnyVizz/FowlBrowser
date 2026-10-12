@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { activityFlashes, agentSetup, agentTabs, codexServer, controlledBy, downloadsDiff, elicitationsOf, gradeCalls, gradeHandoff,
+import { activityFlashes, agentSetup, agentTabs, codexAgentEvent, codexMcpServers, codexServer, controlledBy, downloadsDiff, elicitationsOf, gradeCalls, gradeHandoff,
   gradeOutcome, gradeSite, gradeTabs, gradeTakeover, gradeViewport, parseTranscript, readJsonl, remoteServer, remoteTurnEnd, roundSettings } from '../rounds.mjs';
 
 const t = 1_760_000_000_000;
@@ -83,6 +83,44 @@ test('surfaces: the FowlBrowser agent gets its own server in record mode; the Co
 
   assert.equal(roundSettings('fowlbrowser', { mcpRoot: '/repo' }).hooks.Stop[0].hooks[0].command, 'node "/repo/mcp/bin/turn-ended.mjs"');
   assert.equal(roundSettings('codex', { codex }).hooks.Stop[0].hooks[0].command, `"${codexEntry.command}" "/Users/u/.claude/tools/codex-cu/turn-ended.mjs"`);
+});
+
+test('codex-agent: codex exec with only the browser, its JSON events read as a transcript with a priced result', () => {
+  const task = { name: 'shop', browser: 'chrome', prompt: 'find the red mug in {browser}', result: 'its price' };
+  const setup = agentSetup({ task, surface: 'codex-agent', dir: '/r/shop', model: 'gpt-6.1-sol', effort: 'medium', codex: { browsers: { chrome: 'C-ID' }, disable: ['posthog', 'chrome-devtools'] } });
+  assert.equal(setup.command, 'codex');
+  assert.equal(setup.mcpConfig, null);
+  assert.deepEqual(setup.args.slice(0, 8), ['exec', '-C', '/tmp/fb-rounds/codex-agent', '--skip-git-repo-check', '--json', '-m', 'gpt-6.1-sol', '-c']);
+  assert.ok(setup.args.includes('model_reasoning_effort=medium'));
+  for (const f of ['shell_tool', 'unified_exec', 'multi_agent', 'multi_agent_v2', 'apps']) assert.equal(setup.args[setup.args.indexOf(f) - 1], '--disable');
+  assert.deepEqual(setup.args.slice(-5), ['-c', 'mcp_servers.posthog.enabled=false', '-c', 'mcp_servers.chrome-devtools.enabled=false', '-']);
+  assert.match(setup.prompt, /^Use the browser through your cua_repl js tool .*getBrowser\(\{ extensionInstanceId: 'C-ID' \}\).*sessionName: '🧪 shop'.*\n\nfind the red mug in Chrome\n\nEnd your answer/s);
+  assert.deepEqual(codexMcpServers('[mcp_servers.node_repl]\n[mcp_servers.node_repl.env]\n[mcp_servers."a-b"]\n[features]\n'), ['node_repl', 'a-b']);
+
+  const state = { started: t, seen: new Set(), answer: null };
+  const call = { id: 'item_1', type: 'mcp_tool_call', server: 'cua_repl', tool: 'js', arguments: { code: "await tab.click(3); await tab.typeText('x');" } };
+  const lines = [
+    { type: 'item.started', item: { ...call, status: 'in_progress' } },
+    { type: 'item.completed', item: { ...call, status: 'completed', result: { content: [{ type: 'text', text: 'Browser tab: 42' }] } } },
+    { type: 'item.completed', item: { id: 'item_2', type: 'mcp_tool_call', server: 'cua_repl', tool: 'js', arguments: { code: 'x' }, status: 'failed', error: { message: 'Debugger is not attached' } } },
+    { type: 'item.completed', item: { id: 'item_4', type: 'mcp_tool_call', server: 'cua_repl', tool: 'js', arguments: { code: "await cua.getApp('Finder')" }, status: 'completed', result: { content: [{ type: 'text', text: 'This action was rejected due to unacceptable risk.\nReason: x' }] } } },
+    { type: 'item.completed', item: { id: 'item_3', type: 'agent_message', text: 'Done.\nRESULT: $12' } },
+    { type: 'turn.completed', usage: { input_tokens: 300_000, cached_input_tokens: 200_000, cache_write_input_tokens: 0, output_tokens: 10_000, reasoning_output_tokens: 4000 } },
+  ].flatMap((e, i) => codexAgentEvent(e, state, { model: 'gpt-6.1-sol', now: t + (i + 1) * 1000 }).map((ev) => ({ t: t + i * 1000, ...ev })));
+  const tr = parseTranscript(lines);
+  assert.deepEqual(tr.calls.map((c) => c.name), ['mcp__cua_repl__js', 'mcp__cua_repl__js', 'mcp__cua_repl__js']);
+  assert.equal(tr.actions, 2);
+  assert.deepEqual(tr.namedTabs.map((n) => n.ids), [[42]]);
+  assert.deepEqual([tr.errors.map((e) => e.text), tr.unattached], [['Debugger is not attached'], 1]);
+  const calls = gradeCalls(tr);
+  assert.equal(calls.cell, "3 calls, 2 actions, 1 errors, 1 debugger lost, 1 blocked by Codex's review");
+  assert.deepEqual(calls.problems.map((p) => p.slice(9)), ["reached for desktop apps instead of the browser: await cua.getApp('Finder')"]);
+  assert.equal(tr.result.result, 'Done.\nRESULT: $12');
+  assert.equal(tr.result.duration_ms, 6000);
+  assert.deepEqual(tr.result.usage, { input_tokens: 100_000, cache_creation_input_tokens: 0, cache_read_input_tokens: 200_000, output_tokens: 10_000 });
+  assert.equal(tr.result.total_cost_usd.toFixed(2), '0.32'); // 0.1M at $2, 0.2M at $0.10, 0.01M at $10
+  const failed = codexAgentEvent({ type: 'turn.failed', error: { message: 'usage limit' } }, { started: t, seen: new Set() }, { model: 'gpt-6.1-sol', now: t });
+  assert.deepEqual([failed[0].is_error, failed[0].result], [true, 'usage limit']);
 });
 
 test('ownership: Codex tabs are controlled while in their session group; FowlBrowser tabs while owned', () => {
@@ -179,14 +217,21 @@ test('handoff: journaled (FowlBrowser), the page left open, nothing typed or sub
     'the agent went on at the handoff step: input /shop/checkout/signin email', 'the agent went on at the handoff step: action /shop/checkout/signin with email']);
 });
 
-test('takeover: nothing of the agent reaches the page after the act, beyond a grace for what was under way', () => {
+test('takeover: the agent keeps going after the user clicks into its tab; what was under way at the click does not count', () => {
   const task = { takeover: { afterViews: 4 } };
   const events = [{ at: t - 5000, kind: 'view', path: '/shop/product/fjord' }, { at: t + 40, kind: 'pointer', path: '/shop/product/fjord', field: 'trusted' }, { at: t + 900, kind: 'view', path: '/shop/product/lagoon' },
     { at: t + 2500, kind: 'size', path: '/shop/' }, { at: t + 8000, kind: 'view', path: '/shop/product/ember' }];
-  assert.deepEqual(gradeTakeover({ task, act: { at: t }, site: site([], events) }).problems.map((p) => p.replace(/^\S+ /, '')),
-    ['the agent kept going 8.0 s after the takeover: view /shop/product/ember']);
-  assert.deepEqual(gradeTakeover({ task, act: { at: t }, site: site([], events.slice(0, 1)) }).problems, ['the takeover click never reached the page']);
-  assert.deepEqual(gradeTakeover({ task, act: null, site: null }).problems, ['the harness never took the tab over (run with --gui on a test Mac)']);
+  assert.deepEqual(gradeTakeover({ task, act: { at: t }, site: site([], events) }).problems, []);
+  assert.deepEqual(gradeTakeover({ task, act: { at: t }, site: site([], events.slice(0, 4)) }).problems, ['the agent stopped after the user clicked into its tab']);
+  assert.deepEqual(gradeTakeover({ task, act: { at: t }, site: site([], events.slice(0, 1)) }).problems, ['the click never reached the page', 'the agent stopped after the user clicked into its tab']);
+  assert.deepEqual(gradeTakeover({ task, act: null, site: null }).problems, ['the harness never clicked into the tab (run with --gui on a test Mac)']);
+  // The h2h task's answer: prices from before and after the click, in any wording, whole amounts only.
+  const h2h = JSON.parse(fs.readFileSync(fileURLToPath(new URL('../agents/codex-h2h.json', import.meta.url)), 'utf8')).find((x) => x.name === 'takeover');
+  const answers = (text) => gradeOutcome({ task: h2h, run: { exitCode: 0, result: { result: text }, tabs: new Set() }, journal: null, after: {}, startKeys: new Set() }).ok;
+  assert.ok(answers('RESULT: Harbor $18.00, Fjord $14.00, Lagoon $22.00, Ember $16.00, Coal $20.00'));
+  assert.ok(answers('- Harbor mug (blue): $18.00\n- Lagoon mug: 22 USD\n- Coal costs $20.'));
+  assert.ok(!answers('RESULT: Harbor $180, Lagoon $220, Coal $200'));
+  assert.ok(!answers('RESULT: Harbor $18.00, Fjord $14.00, Lagoon $22.00 (stopped: you took the tab back)'));
   assert.deepEqual(gradeTakeover({ task, act: { error: 'no window' } }).problems, ['takeover act failed: no window']);
 });
 

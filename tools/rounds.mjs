@@ -1,11 +1,12 @@
 // One round of real Claude agents doing the user's everyday browser tasks, graded the way the user would grade them.
 //   node tools/rounds.mjs [--tasks tools/agents/example.json] [--swap] [--only a,b] [--model opus] [--effort medium]
-//                         [--surface fowlbrowser|codex|devtools] [--codex-browsers chrome=<id>,helium=<id>|auto]
+//                         [--surface fowlbrowser|codex|codex-agent|devtools] [--codex-browsers chrome=<id>,helium=<id>|auto]
 //                         [--mcp repo|installed] [--out <dir>] [--keep-tabs] [--serve "<command>"] [--gui]
 //                         [--remote mac2 [--remote-owner fb-rounds | --remote-held]]
 // All agents start at once, each its own `claude -p` session. --surface picks its browser tools: FowlBrowser (its own
 // MCP server, record mode on), Codex's browser extension (ChatGPT.app's cua_repl through ~/.claude/tools/codex-cu) or
 // Chrome DevTools MCP through the user's cdp-relay (devtools); a task's own `surface` overrides it, so one round can mix.
+// codex-agent: Codex itself is the agent (`codex exec`, gpt-6.1-sol unless --model) with its own browser extension.
 // Both run through the same spawner, monitor and grading. While they run, a monitor logs the frontmost app, active
 // tabs, windows, audible tabs and the extension's exact activation events. Then every run is graded (outcome, cursor,
 // focus, flashes, sound, tabs, checks, time, calls, tokens), the round's leftovers are cleaned up and checked, and
@@ -58,11 +59,14 @@ export function agentTabs(name, journal, monitor, tabMatch = null) {
   return tabs;
 }
 
+// Codex's browser extension, driven by a Claude agent (codex) or by Codex itself (codex-agent): graded alike.
+export const isCodex = (surface) => surface === 'codex' || surface === 'codex-agent';
+
 // Whether a tab is still under an agent's control in an inventory. FowlBrowser says so (`owner`); Codex's tabs are
 // never FowlBrowser's, but an agent's tab stays in its session's tab group (sessionName) while Codex holds it.
 export function controlledBy(surface, name) {
   if (surface === 'devtools') return () => false; // DevTools MCP never owns a tab: whatever it leaves open is left for the user
-  return surface === 'codex' ? (k, inv) => inv[k]?.groupTitle === labelOf(name) : (k, inv) => !!inv[k]?.owner;
+  return isCodex(surface) ? (k, inv) => inv[k]?.groupTitle === labelOf(name) : (k, inv) => !!inv[k]?.owner;
 }
 
 // journal: FowlBrowser's journal, or for Codex synthesized download lines (downloadsDiff). controlled: controlledBy().
@@ -275,7 +279,7 @@ const onRemote = (command) => sh('ssh', [...remote.ssh, command]);
 // What runs from the remote test bed for a surface (the extension and host the monitor reads, the sites, and the MCP
 // server or the tee): every file under these paths but tests, notes and node_modules (its lockfile stands for those).
 const BED_PATHS = { common: ['extension', 'host/host.mjs', 'host/install.sh', 'test/demo', 'test/forms', 'test/site', 'test/serve.mjs', 'test/package-lock.json'],
-  fowlbrowser: ['mcp/bin', 'mcp/src', 'mcp/package.json', 'mcp/package-lock.json'], codex: ['tools/mcp-tee.mjs'] };
+  fowlbrowser: ['mcp/bin', 'mcp/src', 'mcp/package.json', 'mcp/package-lock.json'], codex: ['tools/mcp-tee.mjs'], 'codex-agent': [] };
 
 // The bed manifest of a surface: relative path -> md5 of the file in <root>.
 export function bedManifest(surface, root = ROOT) {
@@ -411,16 +415,19 @@ const codexAction = /\.(goto|click|dblclick|double_click|fill|type|typeText|pres
 const codexCreate = /createBrowserTab\(|\.newTab\(|tabs\.new\(/g;
 const codexLookup = /getTab\(|claimTab\(|listTabs\(|tabs\.(get|list|query)\(|popup|waitForEvent\(/i;
 const codexFocus = /visible:\s*true|['"]visibility['"]\)[\s\S]{0,80}\.set\(\s*true|windows\.update\([^)]*focused|bringToFront/;
+// Code reaching for desktop apps (Computer Use) instead of the browser.
+const codexDesktop = /\bcua\.(getApp|listApps|listWindows)\(/;
 const resultText = (content) => (typeof content === 'string' ? content : (content || []).map((c) => c.text ?? '').join('\n'));
 
 // lines: parsed events.jsonl. Returns the agent's browser calls ({t, id, name, input}), failed ones ({t, id, name,
-// text}), action count, Codex kernel resets and lost debugger sessions, elicitation lines seen in the stream, calls whose
-// code asks for focus (as journal-like call lines for focusEvents), the tabs results named (namedTabs: `created` is the id
-// a call provably opened), every tab id its code or results referred to (tabRefs) and the result event.
+// text}), action count, Codex kernel resets and lost debugger sessions, actions Codex's own approval review blocked,
+// calls reaching for desktop apps, elicitation lines seen in the stream, calls whose code asks for focus (as
+// journal-like call lines for focusEvents), the tabs results named (namedTabs: `created` is the id a call provably
+// opened), every tab id its code or results referred to (tabRefs) and the result event.
 export function parseTranscript(lines) {
-  const calls = []; const errors = []; const elicitations = []; const focusCalls = []; const namedTabs = []; const tabRefs = new Set();
+  const calls = []; const errors = []; const elicitations = []; const focusCalls = []; const namedTabs = []; const tabRefs = new Set(); const desktop = [];
   const byId = new Map();
-  let servers = null; let result = null; let kernelResets = 0; let unattached = 0;
+  let servers = null; let result = null; let kernelResets = 0; let unattached = 0; let reviewBlocks = 0;
   for (const e of lines) {
     if (e.type === 'system' && e.subtype === 'init') servers = e.mcp_servers ?? null;
     if (/elicit/i.test(`${e.type} ${e.subtype ?? ''}`)) elicitations.push({ t: e.t, text: JSON.stringify(e).slice(0, 400) });
@@ -432,6 +439,7 @@ export function parseTranscript(lines) {
         // Codex takes tab ids as strings: getTab('898969305').
         for (const m of (c.input?.code ?? '').matchAll(/(['"`])(\d+)\1/g)) tabRefs.add(Number(m[2]));
         if (codexFocus.test(c.input?.code ?? '')) focusCalls.push({ t: e.t, tool: 'focus', args: { code: c.input.code.slice(0, 200) } });
+        if (codexDesktop.test(c.input?.code ?? '')) desktop.push({ t: e.t, code: c.input.code.slice(0, 160) });
       }
       if (e.type === 'user' && c.type === 'tool_result' && byId.has(c.tool_use_id)) {
         const text = resultText(c.content);
@@ -444,13 +452,14 @@ export function parseTranscript(lines) {
         const creates = (code.match(codexCreate) || []).length;
         if (ids.length) namedTabs.push({ t: e.t, ids, created: creates === 1 && !codexLookup.test(code) && ids.length === 1 ? ids[0] : null });
         if (/kernel reset/i.test(text)) kernelResets++;
+        if (/^This action was rejected due to unacceptable risk/.test(text)) reviewBlocks++;
         if (/Debugger (is )?(un|not )attached/i.test(text)) unattached++;
         if (c.is_error) errors.push({ t: e.t, id: c.tool_use_id, name: byId.get(c.tool_use_id).name, text: text.slice(0, 300) });
       }
     }
   }
   const actions = calls.reduce((n, c) => n + (c.input?.code ? (c.input.code.match(codexAction) || []).length : 1), 0);
-  return { servers, calls, errors, actions, kernelResets, unattached, elicitations, focusCalls, namedTabs, tabRefs: [...tabRefs], result };
+  return { servers, calls, errors, actions, kernelResets, unattached, reviewBlocks, desktop, elicitations, focusCalls, namedTabs, tabRefs: [...tabRefs], result };
 }
 
 // The tabs a Codex agent provably created (Codex keeps no journal, and its group or a demo tag says nothing about who
@@ -474,11 +483,13 @@ export function elicitationsOf(tee, calls) {
 }
 
 export function gradeCalls(transcript, elicitations = []) {
-  const { calls, actions, errors, kernelResets, unattached } = transcript;
+  const { calls, actions, errors, kernelResets, unattached, reviewBlocks = 0, desktop = [] } = transcript;
   const cell = [`${calls.length} calls`, actions !== calls.length && `${actions} actions`, errors.length && `${errors.length} errors`,
-    kernelResets && `${kernelResets} kernel resets`, unattached && `${unattached} debugger lost`, elicitations.length && `${elicitations.length} elicitations`].filter(Boolean).join(', ');
-  const problems = elicitations.filter((e) => e.action !== 'accept')
-    .map((e) => `${time(e.t)} elicitation "${e.text}" answered ${e.action}${e.code ? `, the action was: ${e.code}` : ''}`);
+    kernelResets && `${kernelResets} kernel resets`, unattached && `${unattached} debugger lost`, elicitations.length && `${elicitations.length} elicitations`,
+    reviewBlocks && `${reviewBlocks} blocked by Codex's review`].filter(Boolean).join(', ');
+  const problems = [...elicitations.filter((e) => e.action !== 'accept')
+    .map((e) => `${time(e.t)} elicitation "${e.text}" answered ${e.action}${e.code ? `, the action was: ${e.code}` : ''}`),
+  ...desktop.map((d) => `${time(d.t)} reached for desktop apps instead of the browser: ${d.code}`)];
   return { cell, problems };
 }
 
@@ -540,22 +551,23 @@ export function gradeHandoff({ task, surface, journal, site, afterExit }) {
   if (!task.handoff) return { problems: [] };
   const page = new RegExp(task.handoff.url, 'i');
   const problems = [];
-  if (surface !== 'codex' && !(journal || []).some((e) => e.type === 'tab' && e.event === 'handoff')) problems.push('no tab_handoff in the journal');
+  if (!isCodex(surface) && !(journal || []).some((e) => e.type === 'tab' && e.event === 'handoff')) problems.push('no tab_handoff in the journal');
   if (!Object.values(afterExit || {}).some((tab) => page.test(tab.url))) problems.push(`no tab on /${task.handoff.url}/ left open for the user`);
   for (const l of (site?.lines || []).filter((l) => /^(input|action) /.test(l) && page.test(l.split(' ')[1]))) problems.push(`the agent went on at the handoff step: ${l}`);
   return { problems };
 }
 
-// After the harness acted as the user (act.at, its click logged by the page), the agent must stop: no page view or
-// form post of its tag later than TAKEOVER_GRACE_MS (a navigation already under way may still land).
+// After the harness clicked into the agent's tab like the user watching it (act.at, its click logged by the page), the
+// agent must keep going: two page views or form posts of its tag after the click (one may have been under way already;
+// a tab loads one page at a time).
 const TAKEOVER_GRACE_MS = 1000;
 export function gradeTakeover({ task, act, site }) {
   if (!task.takeover) return { problems: [] };
-  if (!act) return { problems: ['the harness never took the tab over (run with --gui on a test Mac)'] };
+  if (!act) return { problems: ['the harness never clicked into the tab (run with --gui on a test Mac)'] };
   if (act.error) return { problems: [`takeover act failed: ${act.error}`] };
-  const after = (site?.events || []).filter((e) => (e.kind === 'view' || e.kind === 'action') && e.at > act.at + TAKEOVER_GRACE_MS);
+  const after = (site?.events || []).filter((e) => (e.kind === 'view' || e.kind === 'action') && e.at > act.at).length >= 2;
   const landed = (site?.events || []).some((e) => e.kind === 'pointer' && e.at >= act.at && e.at <= act.at + TAKEOVER_GRACE_MS);
-  return { problems: [...(landed ? [] : ['the takeover click never reached the page']), ...after.map((e) => `${time(e.at)} the agent kept going ${((e.at - act.at) / 1000).toFixed(1)} s after the takeover: ${e.kind} ${e.path}${e.detail ? ` ${e.detail}` : ''}`)] };
+  return { problems: [...(landed ? [] : ['the click never reached the page']), ...(after ? [] : ['the agent stopped after the user clicked into its tab'])] };
 }
 
 // The view must be back to the user's size by turn end: FowlBrowser's journal (viewport set/clear lines, any surface
@@ -593,22 +605,83 @@ export function codexServer(entry, { tee, log }) {
     env: { ...entry.env, CUA_REPL_ENABLED_SURFACES: 'browser' } };
 }
 
-// One agent's MCP config, claude arguments and prompt for a surface.
+// --- Codex as the agent (codex-agent) ---
+
+// $ per 1M tokens, short context (input up to 272K), from developers.openai.com/api/docs/pricing on 2026-10-12.
+export const CODEX_PRICES = { 'gpt-6.1-sol': { input: 2, cached: 0.1, cacheWrite: 2.5, output: 10 } };
+// Codex trusts every new working folder in the user's config: all its agents share this one.
+const CODEX_AGENT_CWD = '/tmp/fb-rounds/codex-agent';
+
+// The user's own MCP servers in a Codex config.toml. A Codex agent gets them all turned off (its browser tool, cua_repl,
+// comes from ChatGPT's plugin), as a Claude agent gets only its browser server.
+export function codexMcpServers(toml) {
+  return [...new Set([...toml.matchAll(/^\s*\[mcp_servers\.("?)([^".\]]+)\1\]/gm)].map((m) => m[2]))];
+}
+
+// `codex exec` for one agent: model and effort pinned, JSON events on stdout, the prompt on stdin, and nothing but the
+// browser (no shell, web search, subagents, connectors or the user's MCP servers), like a Claude agent's tools.
+export function codexAgentArgs({ model, effort, disable }) {
+  return ['exec', '-C', CODEX_AGENT_CWD, '--skip-git-repo-check', '--json', '-m', model, '-c', `model_reasoning_effort=${effort}`,
+    '-c', 'approvals_reviewer=auto_review', '-c', 'web_search=disabled',
+    ...['shell_tool', 'unified_exec', 'multi_agent', 'multi_agent_v2', 'apps', 'image_generation'].flatMap((f) => ['--disable', f]),
+    ...disable.flatMap((name) => ['-c', `mcp_servers.${name}.enabled=false`]), '-'];
+}
+
+// One `codex exec --json` event as the Claude stream-json lines parseTranscript and the grading read: an MCP tool call
+// becomes a tool_use and its tool_result, the turn's end a result with the answer (the last agent message), the time
+// since `state.started`, the tokens and their API price. state ({started, seen: Set, answer}) lives across a run's events.
+export function codexAgentEvent(e, state, { model, now }) {
+  const out = [];
+  const item = e.item;
+  if (e.type === 'item.completed' && item?.type === 'agent_message') state.answer = item.text;
+  if (item?.type === 'mcp_tool_call') {
+    if (!state.seen.has(item.id)) {
+      state.seen.add(item.id);
+      out.push({ type: 'assistant', message: { content: [{ type: 'tool_use', id: item.id, name: `mcp__${item.server}__${item.tool}`, input: item.arguments ?? {} }] } });
+    }
+    if (e.type === 'item.completed') {
+      const failed = !!item.error || item.status === 'failed' || !!item.result?.isError;
+      const content = item.result?.content ?? [{ type: 'text', text: item.error?.message ?? JSON.stringify(item.error ?? null) }];
+      out.push({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: item.id, content, is_error: failed }] } });
+    }
+  }
+  if (e.type === 'turn.completed' || e.type === 'turn.failed') {
+    const u = e.usage ?? {};
+    const cached = u.cached_input_tokens ?? 0; const write = u.cache_write_input_tokens ?? 0;
+    const usage = { input_tokens: (u.input_tokens ?? 0) - cached - write, cache_creation_input_tokens: write, cache_read_input_tokens: cached, output_tokens: u.output_tokens ?? 0 };
+    const p = CODEX_PRICES[model];
+    const cost = p ? (usage.input_tokens * p.input + cached * p.cached + write * p.cacheWrite + usage.output_tokens * p.output) / 1e6 : 0;
+    const failed = e.type === 'turn.failed';
+    out.push({ type: 'result', subtype: failed ? 'error' : 'success', is_error: failed, result: failed ? e.error?.message ?? 'turn failed' : state.answer ?? '',
+      duration_ms: now - state.started, usage, total_cost_usd: cost });
+  }
+  return out;
+}
+
+// One agent's MCP config, command, arguments and prompt for a surface.
 export function agentSetup({ task, surface, dir, mcpRoot, settings, model, effort, codex, remote = null }) {
   const remoteDir = remote && `${remote.runDir}/${task.name}`;
   const browserName = task.browser === 'helium' ? 'Helium' : 'Chrome';
   let prompt = `${task.prompt.replaceAll('{browser}', browserName).replaceAll('{repo}', path.resolve(ROOT))}\n\nEnd your answer with one line starting with RESULT: that states ${task.result}.`;
   let mcpServers; let allowed; const disallowed = ['Bash', 'WebFetch', 'WebSearch', 'Read', 'Write', 'Edit'];
+  const id = codex?.browsers[task.browser];
+  const find = id ? `${browserName} is the browser with extensionInstanceId ${id}: get it with \`const b = await cua.getBrowser({ extensionInstanceId: '${id}' })\``
+    : `Find ${browserName} by its name with \`await cua.listBrowsers()\`, get it with \`const b = await cua.getBrowser({ extensionInstanceId })\``;
+  const open = `open your tabs with \`cua.createBrowserTab(b.browserId, url, { sessionName: '${labelOf(task.name)}' })\``;
+  if (surface === 'codex-agent') {
+    // Codex runs where the browsers are; on another Mac over the round's ssh connection.
+    prompt = `Use the browser through your cua_repl js tool (the browser extension, not Computer Use on desktop apps). ${find} and ${open}.\n\n${prompt}`;
+    const args = codexAgentArgs({ model, effort, disable: codex.disable });
+    if (!remote) return { command: 'codex', args, prompt, mcpConfig: null };
+    return { command: 'ssh', args: [...remote.ssh, `${REMOTE_PATH}; exec codex ${args.map(shq).join(' ')}`], prompt, mcpConfig: null };
+  }
   if (surface === 'codex') {
-    const id = codex.browsers[task.browser];
-    const find = id ? `${browserName} is the browser with extensionInstanceId ${id}: get it with \`const b = await cua.getBrowser({ extensionInstanceId: '${id}' })\``
-      : `Find ${browserName} by its name with \`await cua.listBrowsers()\`, get it with \`const b = await cua.getBrowser({ extensionInstanceId })\``;
     const server = remote ? codexServer(codex.entry, { tee: `${remote.bed}/tools/mcp-tee.mjs`, log: `${remoteDir}/elicitations.jsonl` })
       : codexServer(codex.entry, { tee: path.join(ROOT, 'tools/mcp-tee.mjs'), log: path.join(dir, 'elicitations.jsonl') });
     mcpServers = { 'codex-cu': remote ? remoteServer(server, { ssh: remote.ssh, dir: remoteDir }) : server };
     allowed = 'mcp__codex-cu__js,mcp__codex-cu__js_reset';
     disallowed.push('mcp__codex-cu__js_add_node_module_dir');
-    prompt = `Use the browser through the mcp__codex-cu__js tool. ${find} and open your tabs with \`cua.createBrowserTab(b.browserId, url, { sessionName: '${labelOf(task.name)}' })\`.\n\n${prompt}`;
+    prompt = `Use the browser through the mcp__codex-cu__js tool. ${find} and ${open}.\n\n${prompt}`;
   } else if (surface === 'devtools') {
     // Chrome DevTools MCP through the user's cdp-relay (~/.claude/tools/cdp-relay): one relay per browser, on this Mac.
     if (remote) throw new Error('--surface devtools has no --remote');
@@ -623,7 +696,7 @@ export function agentSetup({ task, surface, dir, mcpRoot, settings, model, effor
   const args = ['-p', '--model', model, '--effort', effort, '--input-format', 'stream-json', '--output-format', 'stream-json',
     '--verbose', '--strict-mcp-config', '--mcp-config', path.join(dir, 'mcp.json'), '--settings', settings,
     '--allowedTools', allowed, '--disallowedTools', disallowed.join(',')];
-  return { mcpConfig: { mcpServers }, args, prompt };
+  return { command: 'claude', mcpConfig: { mcpServers }, args, prompt };
 }
 
 // The Stop hook that ends a turn on each surface (also in the user's settings; explicit so a change there can't
@@ -813,17 +886,24 @@ function runAgent(task, out, { model, effort, mcpRoot, hosts, surface, codex }) 
   const dir = path.join(out, task.name);
   fs.mkdirSync(dir, { recursive: true });
   const setup = agentSetup({ task, surface, dir, mcpRoot, settings: path.join(out, 'settings.json'), model, effort, codex, remote });
-  fs.writeFileSync(path.join(dir, 'mcp.json'), JSON.stringify(setup.mcpConfig, null, 2));
+  if (setup.mcpConfig) fs.writeFileSync(path.join(dir, 'mcp.json'), JSON.stringify(setup.mcpConfig, null, 2));
   const run = { name: task.name, started: Date.now(), firstToolAt: null, tools: [], result: null, resultAt: null, exitCode: null, killed: false };
   // A call that never returns (an unanswered prompt, a hung browser) must not stall the round: stopped after
   // AGENT_CAP times its budget (10 min without one).
-  const child = spawn('claude', setup.args, { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'] });
-  process.on('exit', () => child.kill());
-  // Each stream-json line as it arrived, stamped with `t` (parseTranscript times calls and errors by it).
+  // `codex` is a node launcher whose native child keeps stdout open: a Codex agent gets its own process group, killed whole.
+  const codexAgent = surface === 'codex-agent';
+  const child = spawn(setup.command, setup.args, { cwd: dir, stdio: ['pipe', 'pipe', 'pipe'], detached: codexAgent });
+  const kill = (signal) => { try { codexAgent ? process.kill(-child.pid, signal) : child.kill(signal); } catch {} };
+  process.on('exit', () => kill('SIGTERM'));
+  // Each stream-json line as it arrived, stamped with `t` (parseTranscript times calls and errors by it). A Codex
+  // agent's own events go to codex-events.jsonl, translated into events.jsonl.
   const events = fs.createWriteStream(path.join(dir, 'events.jsonl'));
+  const raw = codexAgent && fs.createWriteStream(path.join(dir, 'codex-events.jsonl'));
+  const state = { started: run.started, seen: new Set(), answer: null };
   let stderr = '';
   child.stderr.on('data', (d) => { stderr += d; });
-  child.stdin.write(JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: setup.prompt }] } }) + '\n');
+  if (codexAgent) child.stdin.end(setup.prompt);
+  else child.stdin.write(JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: setup.prompt }] } }) + '\n');
   const exited = new Promise((resolve) => child.on('close', (code) => { run.exitCode = code; resolve(); }));
   let pending = '';
   const gotResult = new Promise((resolve) => {
@@ -831,33 +911,37 @@ function runAgent(task, out, { model, effort, mcpRoot, hosts, surface, codex }) 
       pending += chunk;
       const lines = pending.split('\n'); pending = lines.pop();
       for (const line of lines) {
-        let e; try { e = JSON.parse(line); } catch { events.write(line + '\n'); continue; }
-        events.write(JSON.stringify({ t: Date.now(), ...e }) + '\n');
-        if (e.type === 'assistant') for (const c of e.message?.content || []) if (c.type === 'tool_use') {
-          run.firstToolAt ??= Date.now();
-          run.tools.push({ t: Date.now(), name: c.name });
+        let e; try { e = JSON.parse(line); } catch { (raw || events).write(line + '\n'); continue; }
+        if (raw) raw.write(JSON.stringify({ t: Date.now(), ...e }) + '\n');
+        for (const ev of codexAgent ? codexAgentEvent(e, state, { model, now: Date.now() }) : [e]) {
+          events.write(JSON.stringify({ t: Date.now(), ...ev }) + '\n');
+          if (ev.type === 'assistant') for (const c of ev.message?.content || []) if (c.type === 'tool_use') {
+            run.firstToolAt ??= Date.now();
+            run.tools.push({ t: Date.now(), name: c.name });
+          }
+          if (ev.type === 'result') { run.result = ev; run.resultAt = Date.now(); resolve(); }
         }
-        if (e.type === 'result') { run.result = e; run.resultAt = Date.now(); resolve(); }
       }
     });
     exited.then(resolve);
   });
-  const cap = setTimeout(() => { run.timedOut = true; child.kill('SIGKILL'); }, (task.budgetSeconds ? task.budgetSeconds * AGENT_CAP : 600) * 1000);
+  const cap = setTimeout(() => { run.timedOut = true; kill('SIGKILL'); }, (task.budgetSeconds ? task.budgetSeconds * AGENT_CAP : 600) * 1000);
   return (async () => {
     await gotResult;
     clearTimeout(cap);
-    // The Stop hook can't reach a remote server: end its turn from here.
-    if (remote && run.result) await onRemote(remoteTurnEnd(surface, `${remote.runDir}/${task.name}`)).catch((err) => { run.turnEndError = err.message; });
+    // The Stop hook can't reach a remote server: end its turn from here (a Codex agent ends its own).
+    if (remote && run.result && !codexAgent) await onRemote(remoteTurnEnd(surface, `${remote.runDir}/${task.name}`)).catch((err) => { run.turnEndError = err.message; });
     await sleep(1000);
     run.atTurnEnd = await inventory(hosts);
     child.stdin.end();
-    const timer = setTimeout(() => { run.killed = true; child.kill('SIGKILL'); }, 20000);
+    const timer = setTimeout(() => { run.killed = true; kill('SIGKILL'); }, 20000);
     await exited; clearTimeout(timer);
     await sleep(2000);
     run.afterExit = await inventory(hosts);
     // A remote server's record dir (journal, frames, elicitations) comes back next to the transcript.
-    if (remote) await sh('rsync', ['-a', '-e', `ssh ${remote.ssh.slice(0, -1).join(' ')}`, `${remote.host}:${remote.runDir}/${task.name}/`, `${dir}/`]).catch((err) => { run.pullError = err.message; });
+    if (remote && !codexAgent) await sh('rsync', ['-a', '-e', `ssh ${remote.ssh.slice(0, -1).join(' ')}`, `${remote.host}:${remote.runDir}/${task.name}/`, `${dir}/`]).catch((err) => { run.pullError = err.message; });
     events.end();
+    if (raw) raw.end();
     if (stderr) fs.writeFileSync(path.join(dir, 'stderr.txt'), stderr);
     return run;
   })();
@@ -909,6 +993,23 @@ function loadCodex(args) {
   const browsers = args['codex-browsers'] === 'auto' ? {}
     : { ...CODEX_BROWSERS, ...Object.fromEntries((args['codex-browsers'] || '').split(',').filter(Boolean).map((p) => p.split('='))) };
   return { entry, browsers };
+}
+
+// codex-agent: the Codex CLI and a live Codex browser socket where the browsers are, the MCP servers its config adds
+// (turned off per agent) and the browser ids (as for codex, but none by default on another Mac).
+async function loadCodexAgent(args) {
+  const run = (command) => (remote ? onRemote(`${REMOTE_PATH}; ${command}`) : sh('sh', ['-c', command]));
+  const version = await run('codex --version').catch(() => null);
+  const socket = await run('ls /tmp/codex-browser-use/*.sock').then(() => true, () => false);
+  if (!version || !socket) {
+    console.error(`--surface codex-agent: ${!version ? 'no codex CLI' : 'no /tmp/codex-browser-use/*.sock (is ChatGPT running with its browser extension?)'}${remote ? ` on ${remote.host}` : ''}`);
+    process.exit(2);
+  }
+  await run(`mkdir -p ${CODEX_AGENT_CWD}`);
+  const disable = codexMcpServers(await run('cat ~/.codex/config.toml').catch(() => ''));
+  const given = Object.fromEntries((args['codex-browsers'] || '').split(',').filter((p) => p && p !== 'auto').map((p) => p.split('=')));
+  const browsers = args['codex-browsers'] === 'auto' ? {} : remote ? given : { ...CODEX_BROWSERS, ...given };
+  return { version: version.trim(), disable, browsers };
 }
 
 const readJson = (file) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } };
@@ -982,16 +1083,19 @@ async function main() {
     tasks = tasks.filter((t) => !t.takeover);
   }
   const surface = args.surface || 'fowlbrowser';
-  const surfaces = ['fowlbrowser', 'codex', 'devtools'];
-  if (!surfaces.includes(surface)) { console.error(`--surface ${surface}: use fowlbrowser, codex or devtools`); process.exit(2); }
-  for (const t of tasks) if (t.surface && !surfaces.includes(t.surface)) { console.error(`${t.name}: surface ${t.surface}: use fowlbrowser, codex or devtools`); process.exit(2); }
+  const surfaces = ['fowlbrowser', 'codex', 'codex-agent', 'devtools'];
+  if (!surfaces.includes(surface)) { console.error(`--surface ${surface}: use ${surfaces.join(', ')}`); process.exit(2); }
+  for (const t of tasks) if (t.surface && !surfaces.includes(t.surface)) { console.error(`${t.name}: surface ${t.surface}: use ${surfaces.join(', ')}`); process.exit(2); }
   const surfaceOf = (t) => t.surface ?? surface;
   const anySurface = (name) => tasks.some((t) => surfaceOf(t) === name);
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
   const graded = tasks.flatMap((t) => [t.grade, t.site?.log].filter(Boolean)).map((u) => new URL(u));
   if (args.remote) await openRemote(args.remote, { owner: args['remote-owner'] || 'fb-rounds', ports: [...new Set(graded.map((u) => u.port))], stamp, held: args['remote-held'], surface });
   const codex = anySurface('codex') ? (remote ? await loadRemoteCodex(args) : loadCodex(args)) : null;
-  const model = args.model || 'opus';
+  const codexAgent = anySurface('codex-agent') ? await loadCodexAgent(args) : null;
+  // A Codex agent runs a Codex model, the others Claude.
+  const modelOf = (t) => args.model || (surfaceOf(t) === 'codex-agent' ? 'gpt-6.1-sol' : 'opus');
+  const model = modelOf({});
   const effort = args.effort || 'medium';
   const mcpRoot = args.mcp === 'installed' ? path.join(os.homedir(), 'Library/Application Support/FowlBrowser') : ROOT;
   const out = path.resolve(args.out || `/tmp/fb-rounds/${stamp}`);
@@ -1029,12 +1133,12 @@ async function main() {
   const start = await inventory(hosts);
   const startKeys = new Set(Object.keys(start));
   const monitor = await startMonitor(hosts, path.join(out, 'monitor.jsonl'));
-  console.log(`round of ${tasks.length} agents (${surface}, ${model}, ${effort}${surface === 'fowlbrowser' ? `, mcp ${args.mcp || 'repo'}` : ''}); output in ${out}`);
+  console.log(`round of ${tasks.length} agents (${surface}, ${model}, ${effort}${surface === 'fowlbrowser' ? `, mcp ${args.mcp || 'repo'}` : ''}${codexAgent ? `, ${codexAgent.version}` : ''}); output in ${out}`);
   const acts = new Array(tasks.length).fill(null);
   const runs = await Promise.all(tasks.map(async (task, i) => {
     let done = false;
     const act = task.takeover && takeoverAct(task, hosts, () => done).then((a) => { acts[i] = a; console.log(`${task.name}: ${a.error ? `takeover act failed: ${a.error}` : `took ${a.tab} over at ${time(a.at)}`}`); });
-    const run = await runAgent(task, out, { model, effort, mcpRoot, hosts, surface: surfaceOf(task), codex });
+    const run = await runAgent(task, out, { model: modelOf(task), effort, mcpRoot, hosts, surface: surfaceOf(task), codex: surfaceOf(task) === 'codex-agent' ? codexAgent : codex });
     done = true; await act;
     console.log(`${task.name} finished in ${((Date.now() - run.started) / 1000).toFixed(0)} s`);
     return run;
@@ -1052,17 +1156,17 @@ async function main() {
   const transcripts = tasks.map((t) => parseTranscript(readJsonl(path.join(out, t.name, 'events.jsonl')) || []));
   const elicitations = tasks.map((t, i) => elicitationsOf(readJsonl(path.join(out, t.name, 'elicitations.jsonl')) || [], transcripts[i].calls));
   // Codex keeps no journal: its downloads are the new files in ~/Downloads whose names its transcript mentions.
-  if (anySurface('codex') && !remote) {
+  if (tasks.some((t) => isCodex(surfaceOf(t))) && !remote) {
     const fresh = downloadsDiff(downloadsBefore, listDownloads(downloadsDir), downloadsDir);
     tasks.forEach((t, i) => {
-      if (surfaceOf(t) !== 'codex') return;
+      if (!isCodex(surfaceOf(t))) return;
       const text = fs.readFileSync(path.join(out, t.name, 'events.jsonl'), 'utf8');
       journals[i] = fresh.filter((d) => text.includes(path.basename(d.path)));
     });
   }
   runs.forEach((run, i) => { run.tabs = agentTabs(tasks[i].name, journals[i], monitor.log, surfaceOf(tasks[i]) === 'devtools' ? tasks[i].tabMatch : null); });
   const owners = new Map(runs.flatMap((run) => [...run.tabs].map((k) => [k, run.name])));
-  const calls = tasks.flatMap((t, i) => (surfaceOf(t) === 'codex' ? transcripts[i].focusCalls.map((c) => ({ ...c, agent: t.name }))
+  const calls = tasks.flatMap((t, i) => (isCodex(surfaceOf(t)) ? transcripts[i].focusCalls.map((c) => ({ ...c, agent: t.name }))
     : (journals[i] || []).filter((e) => e.type === 'call').map((e) => ({ ...e, agent: t.name }))));
   const closedAt = new Map([...monitor.log.filter((e) => e.kind === 'tab' && e.event === 'gone' && owners.has(e.tab)).map((e) => [e.tab, e.t]),
     ...journals.flatMap((journal) => (journal || []).filter((e) => e.type === 'tab' && e.event === 'close').map((e) => [e.tab, e.t]))]);
@@ -1107,7 +1211,7 @@ async function main() {
     return { task, surface: mySurface, journal, outcome, checks, cursor, focus: myFocus, flashes: myFlashes, sound: mySound, tabs, timing, tokens, calls: callCell };
   });
   const touched = new Set([...journals.flatMap((journal) => (journal || []).map((e) => e.tab).filter(Boolean)),
-    ...tasks.flatMap((t, i) => (surfaceOf(t) === 'codex' ? transcripts[i].tabRefs.map((id) => `${t.browser}:${id}`) : surfaceOf(t) === 'devtools' ? [...runs[i].tabs] : []))]);
+    ...tasks.flatMap((t, i) => (isCodex(surfaceOf(t)) ? transcripts[i].tabRefs.map((id) => `${t.browser}:${id}`) : surfaceOf(t) === 'devtools' ? [...runs[i].tabs] : []))]);
   const userTabs = userTabChanges(start, end, touched, monitor.log);
   for (const c of userTabs.changes) problems.push(`round · the user's tabs · ${c}`);
   for (const e of focus.filter((e) => e.owner === 'round')) problems.push(`round · focus · ${e.text}`);
@@ -1118,12 +1222,12 @@ async function main() {
   // for Codex, the tabs its transcript proves it created (codexCreatedTabs). Other new tabs seen in an agent's group or on
   // its demo pages may be the user's: left open and reported.
   // DevTools agents' tabs (tagged pages, or tabMatch) are nobody's: closed like the rest.
-  const created = new Set(tasks.flatMap((t, i) => (surfaceOf(t) === 'codex' ? [...codexCreatedTabs({ browser: t.browser, transcript: transcripts[i], startKeys })]
+  const created = new Set(tasks.flatMap((t, i) => (isCodex(surfaceOf(t)) ? [...codexCreatedTabs({ browser: t.browser, transcript: transcripts[i], startKeys })]
     : surfaceOf(t) === 'devtools' ? [...runs[i].tabs].filter((k) => !startKeys.has(k)) : [...createdTabs([journals[i]], startKeys)])));
   if (!args['keep-tabs']) {
     const now = await inventory(hosts);
     for (const [i, run] of runs.entries()) {
-      if (surfaceOf(tasks[i]) !== 'codex') continue;
+      if (!isCodex(surfaceOf(tasks[i]))) continue;
       for (const k of run.tabs) if (now[k] && !startKeys.has(k) && !created.has(k)) problems.push(`round · teardown · left open, not proven ${tasks[i].name}'s: ${k} ${now[k].url}`);
     }
     for (const k of created) {
