@@ -1245,21 +1245,159 @@ test('a parked tab can be released or closed by its owner, and resuming a tab no
   assert.equal(core.owners.get(c.id).parked.kind, 'takeover');
 });
 
-test('tabs.committed goes to the owner for main-frame commits of its tabs only, never for parked ones', async () => {
+// The user's turn of a tab (usersTurn): their latest input in it, as the server saw it (tabs.userInput), is later than
+// the agent's latest Input.* and at most 5 s old.
+const input = (call, tabId, sessionId) => call(1, 'chrome.debugger.sendCommand', [{ tabId, ...(sessionId && { sessionId }) }, 'Input.dispatchMouseEvent', { type: 'mousePressed' }]);
+const openFrom = async (core, chrome, opener, props = {}) => {
+  const child = chrome.addTab({ openerTabId: opener, ...props });
+  await core.onTabCreated(structuredClone(child));
+  await core.onNavigationTarget({ sourceTabId: opener, tabId: child.id });
+  await tick();
+  return child.id;
+};
+
+test('the user\'s turn: a tab their own input opens from an agent tab is theirs, until the agent\'s next input', async () => {
   const { core, chrome, call, sent } = setup();
-  const { result: tab } = await call(1, 'tabs.open', {});
-  const stranger = chrome.addTab({ url: 'https://user.example' });
+  const userTab = chrome.addTab({ url: 'https://mail.example', active: true });
+  await core.onTabActivated({ tabId: userTab.id, windowId: 1 });
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://shop.example' });
+  assert.deepEqual((await call(1, 'tabs.userInput', { tabId: opener.id, at: Date.now() })).result, { ok: true });
+  assert.match((await call(2, 'tabs.userInput', { tabId: opener.id, at: Date.now() })).error.message, /not owned/);
   sent.length = 0;
-  const commit = (tabId, frameId, transitionType = 'typed', transitionQualifiers = ['from_address_bar']) =>
-    core.onNavigationCommitted({ tabId, frameId, url: 'https://next.example/', transitionType, transitionQualifiers, timeStamp: 1 });
-  await commit(tab.id, 0);
-  await commit(tab.id, 7, 'auto_subframe', []);
-  await commit(stranger.id, 0);
-  assert.deepEqual(sent, [{ method: 'tabs.committed', params: { tabId: tab.id, url: 'https://next.example/', transitionType: 'typed', transitionQualifiers: ['from_address_bar'] }, client: 1 }]);
-  await call(1, 'tabs.park', { tabId: tab.id, kind: 'takeover' });
+
+  // Chrome opened it in front, for the user's click: it stays in front and nobody owns it.
+  chrome.tabsById.get(userTab.id).active = false;
+  const theirs = await openFrom(core, chrome, opener.id, { active: true, url: 'https://shop.example/terms' });
+  assert.equal(core.owners.has(theirs), false);
+  assert.ok(!chrome.calls.some((c) => c[0] === 'tabs.update' && (c[1] === theirs || c[2].active)), 'not muted, grouped or switched away from');
+  assert.equal(chrome.tabsById.get(theirs).groupId, -1);
+  assert.ok(!sent.some((m) => m.method === 'chrome.tabs.onCreated'));
+  // Chrome put one into the agent's group (a tab opened from a grouped tab joins it): out it goes, and stays nobody's.
+  const grouped = await openFrom(core, chrome, opener.id, { groupId: chrome.tabsById.get(opener.id).groupId });
+  assert.equal(core.owners.has(grouped), false);
+  assert.equal(chrome.tabsById.get(grouped).groupId, -1, 'out of the agent\'s group');
+
+  // Other commands are no input; any Input.* command of the tab, also on a child session, is the agent's.
+  await call(1, 'chrome.debugger.sendCommand', [{ tabId: opener.id }, 'Runtime.evaluate', { expression: '1' }]);
+  assert.equal(core.owners.has(await openFrom(core, chrome, opener.id)), false);
+  await input(call, opener.id, 'CHILD-SESSION');
+  const agents = await openFrom(core, chrome, opener.id);
+  assert.equal(core.owners.get(agents)?.client, 1);
+
+  // The user's input again, then the agent's: the agent's turn.
+  await call(1, 'tabs.userInput', { tabId: opener.id, at: Date.now() });
+  assert.equal(core.owners.has(await openFrom(core, chrome, opener.id)), false);
+  await input(call, opener.id);
+  assert.equal(core.owners.get(await openFrom(core, chrome, opener.id))?.client, 1);
+  // An older report of the user's input does not take the turn back.
+  await call(1, 'tabs.userInput', { tabId: opener.id, at: Date.now() - 1000 });
+  assert.equal(core.owners.get(await openFrom(core, chrome, opener.id))?.client, 1);
+});
+
+test('the user\'s turn lasts 5 s, a page\'s transient activation', async () => {
+  const { core, chrome, call } = setup();
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://shop.example' });
+  await call(1, 'tabs.userInput', { tabId: opener.id, at: Date.now() - 5100 });
+  assert.equal(core.owners.get(await openFrom(core, chrome, opener.id))?.client, 1, 'over 5 s ago');
+  await call(1, 'tabs.userInput', { tabId: opener.id, at: Date.now() + 60_000 }); // never later than now
+  const now = Date.now;
+  Date.now = () => now() + 5001;
+  try {
+    assert.equal(core.owners.get(await openFrom(core, chrome, opener.id))?.client, 1, 'expired');
+  } finally {
+    Date.now = now;
+  }
+});
+
+test('Page.windowOpen during the user\'s turn arms nothing: the popup Chrome opens in front for them stays there', async () => {
+  const { core, call, chrome, sent } = setup();
+  const userTab = chrome.addTab({ url: 'https://mail.example', active: true });
+  await core.onTabActivated({ tabId: userTab.id, windowId: 1 });
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://shop.example' });
+  await call(1, 'tabs.expectChild', { tabId: opener.id, ms: 3000 });
+  await call(1, 'tabs.userInput', { tabId: opener.id, at: Date.now() });
   sent.length = 0;
-  await commit(tab.id, 0);
-  assert.deepEqual(sent, []);
+  await core.onDebuggerEvent({ tabId: opener.id }, 'Page.windowOpen', { url: 'https://idp.example/auth' });
+  assert.ok(sent.some((m) => m.method === 'chrome.debugger.onEvent' && m.params[1] === 'Page.windowOpen'), 'the owner still hears it');
+  core.onTabCreated(structuredClone(chrome.addTab({ active: true, url: '' })));
+  assert.ok(!chrome.calls.some((c) => c[0] === 'tabs.update' && c[2].active === true));
+
+  // The agent's input: armed again.
+  await input(call, opener.id);
+  await core.onDebuggerEvent({ tabId: opener.id }, 'Page.windowOpen', { url: 'https://idp.example/auth' });
+  core.onTabCreated(structuredClone(chrome.addTab({ active: true, url: '' })));
+  assert.ok(chrome.calls.some((c) => c[0] === 'tabs.update' && c[2].active === true));
+});
+
+test('tabs.openChild during the user\'s turn opens the tab for them: in front, right after its opener, nobody\'s', async () => {
+  const { core, call, chrome, sent } = setup();
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://shop.example' });
+  const group = chrome.tabsById.get(opener.id).groupId;
+  await call(1, 'tabs.userInput', { tabId: opener.id, at: Date.now() });
+  assert.match((await call(1, 'tabs.openChild', { tabId: opener.id, url: 'javascript:alert(1)' })).error.message, /http/);
+  assert.match((await call(2, 'tabs.openChild', { tabId: opener.id, url: 'https://shop.example/terms' })).error.message, /not owned/);
+  sent.length = 0;
+  chrome.hooks.created = (tab) => { tab.groupId = group; }; // Chrome put it inside the agent's group
+  const { result, error } = await call(1, 'tabs.openChild', { tabId: opener.id, url: 'https://shop.example/terms' });
+  chrome.hooks.created = undefined;
+  assert.equal(error, undefined);
+  assert.equal(result.user, true);
+  assert.deepEqual(chrome.calls.filter((c) => c[0] === 'tabs.create').at(-1)[1],
+    { windowId: 1, index: chrome.tabsById.get(opener.id).index + 1, url: 'https://shop.example/terms', active: true, openerTabId: opener.id });
+  assert.equal(core.owners.has(result.tabId), false);
+  assert.equal(chrome.tabsById.get(result.tabId).groupId, -1, 'out of the agent\'s group');
+  assert.equal(chrome.tabsById.get(result.tabId).mutedInfo.muted, false);
+  assert.ok(!sent.some((m) => m.method === 'chrome.tabs.onCreated'));
+
+  // After the agent's input: the agent's own, as before (blank, background, adopted).
+  await input(call, opener.id);
+  const agents = await call(1, 'tabs.openChild', { tabId: opener.id, url: 'https://shop.example/next' });
+  assert.equal(agents.result.user, undefined);
+  assert.deepEqual(chrome.calls.filter((c) => c[0] === 'tabs.create').at(-1)[1],
+    { windowId: 1, index: chrome.tabsById.get(opener.id).index + 1, url: 'about:blank', active: false, openerTabId: opener.id });
+  assert.equal(core.owners.get(agents.result.tabId)?.client, 1);
+});
+
+test('a tab opened from a claimed tab inside its expectChild window is the user\'s during their turn', async () => {
+  const { core, chrome, call } = setup();
+  const gmail = chrome.addTab({ url: 'https://mail.example', active: true, groupId: 77 }); // in a group of the user's
+  await call(1, 'tabs.claim', { tabId: gmail.id });
+  await call(1, 'tabs.expectChild', { tabId: gmail.id, ms: 3000 });
+  await call(1, 'tabs.userInput', { tabId: gmail.id, at: Date.now() });
+  const theirs = await openFrom(core, chrome, gmail.id, { groupId: 77 });
+  assert.equal(core.owners.has(theirs), false);
+  assert.equal(chrome.tabsById.get(theirs).groupId, 77, 'the user\'s own group stays');
+  await input(call, gmail.id);
+  assert.equal(core.owners.get(await openFrom(core, chrome, gmail.id))?.client, 1, 'the agent\'s click');
+});
+
+test('the user\'s turn ends with control: release, disconnect, the tab closing or being replaced', async () => {
+  const { core, chrome, call } = setup();
+  const gmail = chrome.addTab({ url: 'https://mail.example' });
+  await call(1, 'tabs.claim', { tabId: gmail.id });
+  await call(1, 'tabs.userInput', { tabId: gmail.id, at: Date.now() });
+  await call(1, 'tabs.release', { tabId: gmail.id });
+  await call(1, 'tabs.claim', { tabId: gmail.id });
+  await call(1, 'tabs.expectChild', { tabId: gmail.id, ms: 3000 });
+  assert.equal(core.owners.get(await openFrom(core, chrome, gmail.id))?.client, 1, 'released: the turn went with it');
+
+  await call(1, 'tabs.userInput', { tabId: gmail.id, at: Date.now() });
+  await core.handleMessage({ method: 'host.clientDisconnected', params: { client: 1 } });
+  await tick();
+  await call(2, 'tabs.claim', { tabId: gmail.id });
+  await call(2, 'tabs.expectChild', { tabId: gmail.id, ms: 3000 });
+  assert.equal(core.owners.get(await openFrom(core, chrome, gmail.id))?.client, 2, 'disconnected: the turn went with it');
+
+  const { result: a } = await call(3, 'tabs.open', {});
+  const { result: b } = await call(3, 'tabs.open', {});
+  for (const tab of [a, b]) {
+    await call(3, 'chrome.debugger.sendCommand', [{ tabId: tab.id }, 'Input.insertText', { text: 'x' }]);
+    await call(3, 'tabs.userInput', { tabId: tab.id, at: Date.now() });
+  }
+  for (const map of [core.userInputAt, core.agentInputAt]) assert.ok(map.has(a.id) && map.has(b.id));
+  await chrome.tabs.remove(a.id);
+  await core.onTabReplaced(chrome.addTab({}).id, b.id);
+  for (const map of [core.userInputAt, core.agentInputAt]) assert.ok(!map.has(a.id) && !map.has(b.id), 'closed and replaced tabs leave nothing behind');
 });
 
 test('tabs opened from a parked tab are the user\'s, even inside an expectChild window', async () => {
@@ -1419,4 +1557,117 @@ test('a group the user unfolded is left alone: a resume into it, and children op
   await core.onNavigationTarget({ sourceTabId: b.id, tabId: child.id });
   assert.equal(core.owners.get(child.id).client, 1);
   assert.equal(chrome.groupsById.get(groupId).collapsed, false, 'a background child never folds it');
+});
+
+test('a tab adopted before the user\'s input that opened it was heard of is theirs after all, back in front', async () => {
+  const { core, chrome, call, sent } = setup();
+  const userTab = chrome.addTab({ url: 'https://mail.example', active: true });
+  await core.onTabActivated({ tabId: userTab.id, windowId: 1 });
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://shop.example' });
+  const agents = await openFrom(core, chrome, opener.id); // the agent's, before the user pressed anything
+  // The user is on the agent's tab (its input can only be theirs there).
+  chrome.tabsById.get(userTab.id).active = false;
+  chrome.tabsById.get(opener.id).active = true;
+  await core.onTabActivated({ tabId: opener.id, windowId: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const pressed = Date.now();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  // A key press opened it at once, in front, before its report came: adopted and switched back meanwhile.
+  chrome.tabsById.get(opener.id).active = false;
+  const early = await openFrom(core, chrome, opener.id, { active: true, url: 'https://shop.example/terms' });
+  assert.equal(core.owners.get(early)?.client, 1);
+  sent.length = 0;
+  await call(1, 'tabs.userInput', { tabId: opener.id, at: pressed });
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(core.owners.has(early), false, 'the user\'s after all');
+  const tab = chrome.tabsById.get(early);
+  assert.deepEqual([tab.groupId, tab.mutedInfo.muted], [-1, false], 'out of the group, unmuted');
+  assert.ok(sent.some((m) => m.method === 'chrome.tabs.onRemoved' && m.params[0] === early && m.params[1].usersPopup), 'the client hears it is gone, no takeover');
+  assert.ok(chrome.calls.some((c) => c[0] === 'tabs.update' && c[1] === early && c[2].active === true), 'back in front');
+  assert.equal(core.owners.get(agents)?.client, 1, 'what opened before the input stays the agent\'s');
+
+  // Once the user picked another tab, a late hand-back brings nothing to the front behind their back.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const pressedAgain = Date.now();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const second = await openFrom(core, chrome, opener.id, { active: true, url: 'https://shop.example/faq' });
+  await core.onTabActivated({ tabId: userTab.id, windowId: 1 });
+  await call(1, 'tabs.userInput', { tabId: opener.id, at: pressedAgain });
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(core.owners.has(second), false);
+  assert.ok(!chrome.calls.some((c) => c[0] === 'tabs.update' && c[1] === second && c[2].active === true), 'the user moved on: left in the background');
+
+  // Reports out of order: the agent acted and its click opened a tab, then a newer report of the user's input came
+  // before an older one. The older one gives back nothing the agent opened before the newer.
+  await input(call, opener.id);
+  const agentsChild = await openFrom(core, chrome, opener.id);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await call(1, 'tabs.userInput', { tabId: opener.id, at: Date.now() });
+  await call(1, 'tabs.userInput', { tabId: opener.id, at: pressedAgain + 1 });
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(core.owners.get(agentsChild)?.client, 1, 'still the agent\'s');
+});
+
+test('a popup armed before the user\'s input was heard of is not switched away from once it is their turn', async () => {
+  const { core, call, chrome } = setup();
+  const userTab = chrome.addTab({ url: 'https://mail.example', active: true });
+  await core.onTabActivated({ tabId: userTab.id, windowId: 1 });
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://shop.example' });
+  await call(1, 'tabs.expectChild', { tabId: opener.id, ms: 3000 });
+  await core.onDebuggerEvent({ tabId: opener.id }, 'Page.windowOpen', { url: 'https://idp.example/auth' }); // still the agent's turn
+  await call(1, 'tabs.userInput', { tabId: opener.id, at: Date.now() });
+  core.onTabCreated(structuredClone(chrome.addTab({ active: true, url: '' })));
+  assert.ok(!chrome.calls.some((c) => c[0] === 'tabs.update' && c[2].active === true));
+});
+
+test('a popup the user\'s click asked for is theirs even when its opener closed itself meanwhile', async () => {
+  const { core, call, chrome } = setup();
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://example.com' });
+  chrome.tabsById.get(opener.id).windowId = 3;
+  await call(1, 'tabs.userInput', { tabId: opener.id, at: Date.now() });
+  await chrome.tabs.remove(opener.id); // window.open(url, '_blank', 'noopener'); window.close()
+  const { result, error } = await call(1, 'tabs.openChild', { tabId: opener.id, url: 'https://example.com/next' });
+  assert.equal(error, undefined);
+  assert.equal(result.user, true);
+  assert.deepEqual(chrome.calls.filter((c) => c[0] === 'tabs.create').at(-1)[1], { windowId: 3, url: 'https://example.com/next', active: true });
+  assert.equal(core.owners.has(result.tabId), false);
+});
+
+test('a tab given back to the user while the agent was closing it stays open, theirs', async () => {
+  const { core, chrome, call, start } = setup();
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://shop.example' });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const pressed = Date.now();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const child = await openFrom(core, chrome, opener.id);
+  let open;
+  const held = new Promise((resolve) => { open = resolve; });
+  const ungroup = chrome.tabs.ungroup;
+  chrome.tabs.ungroup = async (ids) => { await held; return ungroup(ids); };
+  const closing = start(1, 'chrome.tabs.remove', [child]);
+  await tick();
+  await call(1, 'tabs.userInput', { tabId: opener.id, at: pressed }); // the late report, mid-close
+  chrome.tabs.ungroup = ungroup;
+  open();
+  await closing.done;
+  for (let i = 0; i < 5; i++) await tick();
+  assert.ok(chrome.tabsById.has(child), 'not closed');
+  assert.equal(core.owners.has(child), false);
+  assert.equal(chrome.tabsById.get(child).mutedInfo.muted, false, 'handed over: unmuted');
+});
+
+test('a tab adopted for the user\'s input and swapped by Chrome before the report came is still given back', async () => {
+  const { core, chrome, call } = setup();
+  const { result: opener } = await call(1, 'tabs.open', { url: 'https://shop.example' });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const pressed = Date.now();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const child = await openFrom(core, chrome, opener.id);
+  const replacement = chrome.addTab({ url: 'https://shop.example/terms' });
+  chrome.tabsById.delete(child);
+  await core.onTabReplaced(replacement.id, child);
+  assert.equal(core.owners.get(replacement.id)?.client, 1);
+  await call(1, 'tabs.userInput', { tabId: opener.id, at: pressed });
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(core.owners.has(replacement.id), false, 'the replacement is the user\'s');
 });

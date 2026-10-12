@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { cdp, clearEmulation, fileTab, isUsersTab, onCdpEvent, outputDir, readStream, stamp, startTracing, traceBusy, tracingSlot, waitForTracing } from './perf.mjs';
 import { debug } from './debug.mjs';
 import { POPUP_BINDING, POPUP_WORLD, popupsInstalled } from './popups.mjs';
-import { navigating, notice, USER_BINDING, USER_WORLD } from './takeover.mjs';
+import { notice, USER_BINDING, USER_WORLD } from './takeover.mjs';
 import { resetEngine } from './trace.mjs';
 import { clearViewport, setViewport } from './viewport.mjs';
 
@@ -164,7 +164,7 @@ export async function restore(tab, scripts) {
   for (const [method, params] of [['Page.enable'], ['Page.setLifecycleEventsEnabled', { enabled: true }], ['Runtime.enable'], ['Network.enable'], ['Log.enable']]) {
     await cdp(tab, method, params).catch(() => {});
   }
-  // Runtime.disable dropped the bindings FowlBrowser's own page scripts report through (takeover detection, popup
+  // Runtime.disable dropped the bindings FowlBrowser's own page scripts report through (the user's input, popup
   // interception): without them new documents would go unheard.
   await cdp(tab, 'Runtime.addBinding', { name: USER_BINDING, executionContextName: USER_WORLD }).catch(() => {});
   if (popupsInstalled(tab)) await cdp(tab, 'Runtime.addBinding', { name: POPUP_BINDING, executionContextName: POPUP_WORLD }).catch(() => {});
@@ -251,7 +251,7 @@ async function run(tab, lh, { device, mode, categories }) {
     // Lighthouse's init scripts ran in the audited document and its frames (one wraps requestIdleCallback): after a
     // navigation run, whatever its outcome, the page loads once more, so the agent goes on with a clean document
     // (Playwright's reload: refs start over).
-    if (mode === 'navigation' && !notice(tab.id)) await navigating(tab, () => tab.page.reload({ waitUntil: 'load' })).catch((error) => warnings.push(`The page could not be loaded again after the audit (${error.message.split('\n')[0]}): navigate to it before going on.`));
+    if (mode === 'navigation' && !notice(tab.id)) await tab.page.reload({ waitUntil: 'load' }).catch((error) => warnings.push(`The page could not be loaded again after the audit (${error.message.split('\n')[0]}): navigate to it before going on.`));
     // A run abandoned at the browser connection's close may still be parsing its trace with the shared engine: it
     // ends (its sends fail now, its load waits time out) before the engine is reset and the slot released.
     if (running) await within(running, LH_SETTLE_MS);

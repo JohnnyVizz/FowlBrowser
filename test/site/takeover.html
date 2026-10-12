@@ -11,6 +11,7 @@
 </style>
 <h1>Takeover test</h1>
 <button id="add" type="button">Add to cart</button>
+<p><a id="user-link" href="popup-target.html?via=takeover-link" target="_blank">Open link in new tab</a> <button id="user-open" type="button">Open window</button> <a id="user-download" href="download.txt" target="_blank">Download in a new tab</a></p>
 <label>Search <input id="search" type="text"></label>
 <label>Notes <textarea id="notes" rows="2"></textarea></label>
 <label>Size
@@ -27,6 +28,12 @@
 <script>
   let clicks = 0;
   document.getElementById('add').addEventListener('click', () => { document.getElementById('result').textContent = `added ${++clicks}`; });
+  // Popups: a link with no opener (the extension opens it) and window.open (the browser does, with its opener). ?tag= is
+  // passed on so a run can find (and clean up) exactly its own tabs.
+  const tag = encodeURIComponent(new URLSearchParams(location.search).get('tag') || '');
+  document.getElementById('user-link').href += `&tag=${tag}`;
+  document.getElementById('user-download').href = `download.txt?attachment=fowlbrowser-user-download-${tag}.txt`;
+  document.getElementById('user-open').addEventListener('click', () => { window.open(`popup-target.html?via=takeover-open&tag=${tag}`); });
   const drop = document.getElementById('drop');
   drop.addEventListener('dragover', (e) => e.preventDefault());
   drop.addEventListener('drop', (e) => { e.preventDefault(); drop.textContent = 'Dropped'; });

@@ -20,7 +20,7 @@ const BLOCKED_CDP = [
 ];
 const CHILD_ONLY_CDP = /^Target\.attachToTarget$/;
 const isBlockedCommand = (method) => BLOCKED_CDP.some((rule) => rule.test(String(method)));
-const EXPECT_CHILD_MAX_MS = 5000;
+const EXPECT_CHILD_MAX_MS = 5000;     // also how long the user's turn of a tab lasts (a page's transient activation)
 const LAST_OWNED_MS = 5000; // how long a closed owned tab can still open the popup it asked for (tabs.openChild)
 const CLEANUP_RETRY_MS = [200, 1000];
 const DOWNLOAD_MATCH_MS = 10_000;      // how long downloads and Page.downloadWillBegin signals are kept for matching
@@ -68,6 +68,9 @@ export function createCore({ chrome, send, timers = globalThis }) {
   const armedWindows = new Map();   // windowId -> { source, url, at, until }: a popup is on its way into that window
   const openedFor = new Map();      // tabs.openChild child tabId -> opener tabId, until the child's first page commits
   const lastOwned = new Map();      // owned tabId that closed -> { owner, windowId, at }, for 5 s (tabs.openChild)
+  const userInputAt = new Map();    // owned tabId -> time of the user's latest input in it (tabs.userInput)
+  const agentInputAt = new Map();   // owned tabId -> when its client last sent it an Input.* command
+  const adoptedFrom = new Map();    // adopted child tabId -> { from, at, wasActive }, for EXPECT_CHILD_MAX_MS (giveBack)
   // Downloads: each belongs to the client whose tab started it (see attributeDownload), and only that client
   // ever sees it. Nothing here survives a disconnect; the files stay.
   const downloads = new Map();      // download id -> { client, tabId }
@@ -238,8 +241,9 @@ export function createCore({ chrome, send, timers = globalThis }) {
     if ((await chrome.tabs.get(tabId)).groupId !== -1) await chrome.tabs.ungroup(tabId);
   }
 
-  async function closeAgentTab(tabId) {
+  async function closeAgentTab(tabId, owner) {
     await ungroup(tabId);
+    if (owner?.givenBack) return; // the user's own popup after all (giveBack): theirs, never closed
     await chrome.tabs.remove(tabId);
   }
 
@@ -339,8 +343,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
     for (let attempt = 0; owners.get(tabId) === owner; attempt++) {
       try {
         await rollBack(tabId, owner); // the client left mid-resume: still the user's
-        if (owner.origin === 'agent' && !owner.kept) await closeAgentTab(tabId);
-        else {
+        if (owner.origin === 'agent' && !owner.kept) await closeAgentTab(tabId, owner);
+        if (owner.origin !== 'agent' || owner.kept) { // kept: also given back to the user while it was closing (giveBack)
           // Handed over already (tab_keep, forUser): the user may have muted it since; never undo their changes.
           // Unmuted before the detach: Helium can lose an unmute sent right after one.
           if (owner.origin === 'agent' && !owner.handedOver) await handOver(tabId);
@@ -375,7 +379,10 @@ export function createCore({ chrome, send, timers = globalThis }) {
     for (let i = downloadSignals.length - 1; i >= 0; i--) if (downloadSignals[i].client === client) downloadSignals.splice(i, 1);
     for (const [tabId, last] of lastOwned) if (last.owner.client === client) lastOwned.delete(tabId);
     const mine = [...owners].filter(([, owner]) => owner.client === client);
-    for (const [, owner] of mine) owner.releasing = true;
+    for (const [tabId, owner] of mine) {
+      owner.releasing = true;
+      forgetInput(tabId);
+    }
     await Promise.allSettled([persist(), ...mine.map(([tabId, owner]) => serialize(tabId, () => cleanUp(tabId, owner)))]);
   }
 
@@ -435,7 +442,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
       await Promise.all(ids.map((id) => serialize(id, async () => {
         const owner = requireOwner(client, id);
         if (owner.parked && !usersTab) throw new Error(`Tab ${id} is the user's for now (parked), so it was not closed`);
-        if (owner.origin === 'agent') await closeAgentTab(id);
+        if (owner.origin === 'agent') await closeAgentTab(id, owner);
         else await chrome.tabs.remove(id);
       })));
     },
@@ -473,6 +480,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
         const owner = requireOwner(client, tabId);
         const tab = await chrome.tabs.get(tabId).catch(() => ({ windowId: -1 }));
         owner.releasing = true;
+        forgetInput(tabId);
         owner.kept = true; // released agent tabs are handed over, never closed
         const done = await cleanUp(tabId, owner);
         emitBack('chrome.tabs.onRemoved', [tabId, { windowId: tab.windowId, isWindowClosing: false }]);
@@ -500,9 +508,14 @@ export function createCore({ chrome, send, timers = globalThis }) {
     // front; tabs.create doesn't. An opener that closed itself right after asking (window.open, then window.close)
     // still gets it, in its last window (also when it closes while the tab is being created). The child is this
     // client's only if the opener's ownership (record, keep, handover, parking) is what it asked with once the tab
-    // exists and nobody else has the tab; otherwise it closes again, unless someone else has it.
+    // exists and nobody else has the tab; otherwise it closes again, unless someone else has it. During the user's turn
+    // of the opener (their own click asked for it) it opens for them instead (openForUser).
     async 'tabs.openChild'({ tabId, url }, { client, live }) {
       if (!/^https?:\/\//i.test(String(url))) throw new Error(`Not an http(s) URL: ${url}`);
+      const current = owners.get(tabId);
+      if (current?.client === client && !current.releasing && usersTurn(tabId)) return tracked(() => openForUser(tabId, url));
+      const last = current ? null : closedOwner(tabId); // the user's click opened it, then the page closed itself
+      if (last?.owner.client === client && turnOf(last.userAt, last.agentAt)) return tracked(() => openForUser(tabId, url, last.windowId));
       const ownership = () => {
         const owner = owners.get(tabId) ?? closedOwner(tabId)?.owner;
         return owner ? [owner, !!owner.kept, !!owner.handedOver, owner.parked, owner.origin, !!owner.releasing] : [];
@@ -605,6 +618,24 @@ export function createCore({ chrome, send, timers = globalThis }) {
       return { shown, focused: shown && !!window.focused };
     },
 
+    // The client saw the user's own input in the tab at `at` (ms since epoch, from the page): see usersTurn.
+    async 'tabs.userInput'({ tabId, at }, { client }) {
+      requireOwner(client, tabId);
+      const time = Math.min(Number(at) || Date.now(), Date.now());
+      userInputAt.set(tabId, Math.max(userInputAt.get(tabId) ?? -Infinity, time));
+      // A tab Chrome opened for that input before this report came (a key press opens at once) went to the agent: it is
+      // the user's after all. Judged against the latest input, so a report that comes after a newer one gives nothing
+      // back that the agent opened in between.
+      if (usersTurn(tabId)) {
+        const latest = userInputAt.get(tabId);
+        for (const [childId, child] of adoptedFrom) {
+          const owner = owners.get(childId);
+          if (child.from === tabId && child.at > latest && owner?.client === client && !owner.releasing) giveBack(childId, owner);
+        }
+      }
+      return { ok: true };
+    },
+
     async 'tabs.setMuted'({ tabId, muted }, { client }) {
       const owner = requireOwner(client, tabId);
       if (owner.agentMuted) { // the agent's own choice now; release leaves it as set
@@ -654,6 +685,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
         || (CHILD_ONLY_CDP.test(method) && (params?.flatten !== true || !children?.has(params?.targetId)))) {
         throw new Error(`${method} is blocked: it reaches beyond the tab (other tabs, the browser, the whole profile or the user's focus)`);
       }
+      if (String(method).startsWith('Input.')) agentInputAt.set(target.tabId, Date.now()); // the agent's input (usersTurn)
       let timer;
       const timeout = new Promise((_, reject) => {
         timer = timers.setTimeout(() => reject(new Error(`${method} timed out after 30 s`)), COMMAND_TIMEOUT_MS);
@@ -862,7 +894,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
       downloadSignal(owner.client, opener ?? source.tabId, params?.url, params?.guid);
       if (opener !== undefined) {
         openedFor.delete(source.tabId);
-        closeAgentTab(source.tabId).catch(() => {});
+        closeAgentTab(source.tabId, owner).catch(() => {});
       }
     } else if (method === 'Page.windowOpen' && adopter(source.tabId)) {
       armPopup(source.tabId, params?.url ?? '');
@@ -997,14 +1029,10 @@ export function createCore({ chrome, send, timers = globalThis }) {
     emitToOwner(owner, 'chrome.debugger.onDetach', [source, reason]);
   }
 
-  // A main-frame commit of an owned tab, for the owner to tell the user's navigations (address bar, bookmark, back,
-  // reload) from its own. Not for parked tabs (the user has them) or ones being released.
-  async function onNavigationCommitted({ tabId, frameId, url, transitionType, transitionQualifiers }) {
+  // A tabs.openChild child's first page other than about:blank: its downloads are its own from now on (openedFor).
+  async function onNavigationCommitted({ tabId, frameId, url }) {
     await ready;
-    const owner = owners.get(tabId);
     if (frameId === 0 && url !== 'about:blank') openedFor.delete(tabId);
-    if (frameId !== 0 || !owner || owner.parked) return;
-    emitToOwner(owner, 'tabs.committed', { tabId, url, transitionType, transitionQualifiers });
   }
 
   async function onTabRemoved(tabId, removeInfo) {
@@ -1014,10 +1042,13 @@ export function createCore({ chrome, send, timers = globalThis }) {
     windowOf.delete(tabId);
     folded.delete(tabId);
     openedFor.delete(tabId);
+    const [userAt, agentAt] = [userInputAt.get(tabId), agentInputAt.get(tabId)];
+    forgetInput(tabId);
+    adoptedFrom.delete(tabId);
     const owner = owners.get(tabId);
     if (!owner) return;
     owners.delete(tabId);
-    lastOwned.set(tabId, { owner, windowId: removeInfo?.windowId, at: Date.now(), gen: generation });
+    lastOwned.set(tabId, { owner, windowId: removeInfo?.windowId, at: Date.now(), gen: generation, userAt, agentAt });
     await persist();
     emitToOwner(owner, 'chrome.tabs.onRemoved', [tabId, removeInfo]);
   }
@@ -1027,6 +1058,12 @@ export function createCore({ chrome, send, timers = globalThis }) {
   async function onTabReplaced(addedTabId, removedTabId) {
     await ready;
     folded.delete(removedTabId);
+    forgetInput(removedTabId);
+    if (adoptedFrom.has(removedTabId)) {
+      adoptedFrom.set(addedTabId, adoptedFrom.get(removedTabId));
+      adoptedFrom.delete(removedTabId);
+      timers.setTimeout(() => adoptedFrom.delete(addedTabId), EXPECT_CHILD_MAX_MS);
+    }
     const owner = owners.get(removedTabId);
     if (!owner) return;
     owners.delete(removedTabId);
@@ -1054,7 +1091,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
 
   function switchBackFromPopup(tab) {
     const arm = armedWindows.get(tab.windowId);
-    if (!arm || !tab.active || Date.now() > arm.until) return;
+    if (!arm || !tab.active || Date.now() > arm.until || usersTurn(arm.source)) return; // the user's input came in meanwhile
     const url = tab.pendingUrl || tab.url || '';
     if (url && url !== 'about:blank' && url !== arm.url) return;
     const record = activeByWindow.get(tab.windowId);
@@ -1086,7 +1123,9 @@ export function createCore({ chrome, send, timers = globalThis }) {
 
   async function onNavigationTarget({ sourceTabId, tabId }) {
     await ready;
-    if (!owners.has(tabId)) return adoptChild(tabId, sourceTabId);
+    if (owners.has(tabId)) return;
+    if (usersTurn(sourceTabId)) return leaveAgentGroup(tabId, sourceTabId); // the user's own: theirs, see passesOn
+    return adoptChild(tabId, sourceTabId);
   }
 
   // Agent tabs pass their children on. A tab opened from a claimed tab is the user's own (Cmd-click, their new tab)
@@ -1098,12 +1137,67 @@ export function createCore({ chrome, send, timers = globalThis }) {
   }
 
   function passesOn(opener, openerTabId) {
-    // A parked tab is the user's for now: what opens from it is theirs, even inside an expectChild window.
-    if (!opener || opener.releasing || opener.parked) return false;
+    // A parked tab is the user's for now: what opens from it is theirs, even inside an expectChild window. So is what
+    // the user's own input opens during their turn (their click on a link or a button), in any tab.
+    if (!opener || opener.releasing || opener.parked || usersTurn(openerTabId)) return false;
     // A tab already handed to the user (for_user, tab_keep) is theirs like a claimed one: its children are theirs too.
     if (opener.origin === 'agent' && !opener.handedOver) return true;
     const expected = expectations.get(openerTabId);
     return expected?.client === opener.client && Date.now() <= expected.until;
+  }
+
+  // The user's turn of an owned tab: the latest input in it was theirs (tabs.userInput, later than every Input.* its
+  // client sent), within a page's transient activation. A tab opened from it then is theirs, as Chrome would have it.
+  function usersTurn(tabId) {
+    return turnOf(userInputAt.get(tabId), agentInputAt.get(tabId));
+  }
+
+  function turnOf(userAt, agentAt) {
+    return userAt !== undefined && Date.now() - userAt <= EXPECT_CHILD_MAX_MS && userAt > (agentAt ?? -Infinity);
+  }
+
+  // A child adopted before the user's input that opened it was heard of: handed to them as tabs.release leaves a tab,
+  // and back in front if Chrome had opened it there. The client hears it is gone.
+  function giveBack(tabId, owner) {
+    owner.releasing = true;
+    owner.kept = true;
+    owner.givenBack = true;
+    log('popup: the user\'s after all', { tab: tabId });
+    return serialize(tabId, async () => {
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      const { from, wasActive } = adoptedFrom.get(tabId) ?? {};
+      adoptedFrom.delete(tabId);
+      await cleanUp(tabId, owner);
+      emit(owner.client, 'chrome.tabs.onRemoved', [tabId, { windowId: tab?.windowId ?? -1, isWindowClosing: false, usersPopup: true }]);
+      // Only while the user is still on the tab it was switched back to: never away from a tab they picked since.
+      if (tab && wasActive && activeByWindow.get(tab.windowId)?.current === from) await chrome.tabs.update(tabId, { active: true }).catch(() => {});
+    }).catch((e) => log('give back failed', tabId, e.message));
+  }
+
+  function forgetInput(tabId) {
+    userInputAt.delete(tabId);
+    agentInputAt.delete(tabId);
+  }
+
+  // A popup the user's own click asked for (tabs.openChild during their turn): opened as Chrome opens it for them, in
+  // front, right after its opener, and nobody's (not grouped, muted or closed with the session).
+  async function openForUser(tabId, url, closedWindowId) {
+    const source = closedWindowId === undefined ? await chrome.tabs.get(tabId) : null;
+    const tab = await chrome.tabs.create(source ? { windowId: source.windowId, index: source.index + 1, url, active: true, openerTabId: tabId }
+      : { windowId: closedWindowId, url, active: true });
+    await leaveAgentGroup(tab.id, tabId);
+    log('popup: opened for the user', { tab: tab.id, opener: tabId });
+    return { tabId: tab.id, user: true };
+  }
+
+  // A tab of the user's opened from an agent tab joins that tab's group (Chrome groups a tab opened from a grouped tab,
+  // before webNavigation names it): it goes out again, since nothing of the user's may keep an agent's group alive. A
+  // claimed or handed-over tab's group is the user's own and stays.
+  async function leaveAgentGroup(tabId, openerTabId) {
+    const opener = owners.get(openerTabId);
+    if (opener?.origin !== 'agent' || opener.handedOver) return;
+    const [tab, source] = await Promise.all([tabId, openerTabId].map((id) => chrome.tabs.get(id).catch(() => null)));
+    if (tab && source && tab.groupId !== -1 && tab.groupId === source.groupId) await chrome.tabs.ungroup(tabId).catch(() => {});
   }
 
   // A closed owned tab's record and window, for 5 s, while its client is still served on the same port.
@@ -1129,6 +1223,8 @@ export function createCore({ chrome, send, timers = globalThis }) {
     const owner = { client, origin: 'agent', group: opener.group ?? labelFor(client),
       kept: opener.origin === 'user' || !!opener.kept || !!opener.handedOver };
     owners.set(tabId, owner);
+    adoptedFrom.set(tabId, { from: openerTabId, at: Date.now(), wasActive: false });
+    timers.setTimeout(() => adoptedFrom.delete(tabId), EXPECT_CHILD_MAX_MS);
     log('adopt: owned', { tab: tabId, opener: openerTabId, client, kept: owner.kept });
     return serialize(tabId, () => settleChild(tabId, owner, openerTabId)).catch((e) => log('adopt failed', tabId, e.message));
   }
@@ -1138,6 +1234,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
     await persist();
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     const wasActive = openedActive.delete(tabId) || !!tab?.active;
+    if (adoptedFrom.has(tabId)) adoptedFrom.get(tabId).wasActive = wasActive;
     if (!tab) {
       if (owners.get(tabId) === owner) owners.delete(tabId);
       return persist();
@@ -1229,5 +1326,7 @@ export function createCore({ chrome, send, timers = globalThis }) {
     onDownloadChanged,
     // for tests
     owners,
+    userInputAt,
+    agentInputAt,
   };
 }

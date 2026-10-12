@@ -23,19 +23,18 @@ like, and a cursor shows exactly what it is doing.
 
 ## How it compares
 
-We gave the same agent (Claude Code with Claude Opus 5.5) the same 14 everyday tasks, twice each: once through
+We gave the same agent (Claude Code with Claude Opus 5.5) the same 13 everyday tasks, twice each: once through
 FowlBrowser and once through Codex's Chrome extension, in the same browsers, graded the same way.
 
 | | FowlBrowser | Codex browser extension |
 | --- | --- | --- |
-| Tasks done right | **28 / 28** | 23 / 28 |
+| Tasks done right | **26 / 26** | 23 / 26 |
 | Tricky forms (custom dropdowns, card field in an iframe, closed shadow DOM, drag to reorder) | **8 / 8** | 5 / 8 |
-| Noticed when you took a tab back, stopped and said so | **yes** | no |
 | Pop-ups that opened in front of the page you were on | **none** | in all 6 pop-up runs |
-| Total time | **16 min** | 19 min |
-| Total cost | **$8.79** | $13.35 |
+| Total time | **15 min** | 18 min |
+| Total cost | **$8.34** | $12.78 |
 
-Codex was faster on 2 of the 14 tasks; every task and the fine print are in [docs/benchmarks.md](docs/benchmarks.md).
+Codex was faster on 4 of the 13 tasks; every task and the fine print are in [docs/benchmarks.md](docs/benchmarks.md).
 
 FowlBrowser's performance tools against Chrome DevTools MCP, on the same pages:
 
@@ -98,8 +97,9 @@ To update, run `git pull` and `sh install.sh` again. To remove it, run `sh unins
   stay in the background too.
 - **Shows its work.** In the tab you're looking at, a cursor with the agent's name moves to each click and says what
   it's doing.
-- **Lets you step in.** Click or type in an agent's tab and it stops, tells you where it got to and waits for your
-  go-ahead. When a step needs you, like a login, a code or a payment, it hands you the tab and waits.
+- **Works alongside you.** Watch an agent's tab or click around in it and the agent keeps going, like Codex's
+  extension, and tabs you open from it are yours. To stop it, stop the agent, close its tab or press Cancel on the
+  browser's debugging bar. When a step needs you, like a login, a code or a payment, it hands you the tab and waits.
 - **Asks before acting for you.** Agents are told to check with you before they send, post, buy, delete or change
   account settings, and to treat text on web pages as information, never as instructions.
 - **Runs many agents at once.** Every agent session works in its own tabs.

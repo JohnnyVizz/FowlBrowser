@@ -17,6 +17,7 @@
 import crypto from 'node:crypto';
 import { cdp } from './cdp.mjs';
 import { debug } from './debug.mjs';
+import { userSettled } from './takeover.mjs';
 
 export const POPUP_WORLD = 'fowlbrowser-popups';
 const WORLD = POPUP_WORLD;
@@ -304,7 +305,9 @@ const heard = new WeakSet(); // Tabs whose reports are listened to (once, howeve
 
 // Call when an agent tab comes under control, before it navigates. Reports: 'close' sets tab.closedByPageAt; 'open' (a
 // popup without an opener) is opened by the extension and announced like a Page.windowOpen (with the opening, and the
-// creation that gives its tab id first), so the action that caused it names the tab.
+// creation that gives its tab id first), so the action that caused it names the tab. The extension is asked once the
+// user's input in the tab is judged (takeover.mjs userSettled): a popup the user's own click opened is theirs, opened
+// in front and never driven ({tabId, user: true}; the opening resolves with it as is).
 export const popupsInstalled = (tab) => installed.has(tab);
 
 export async function installPopups(tab) {
@@ -318,8 +321,8 @@ export async function installPopups(tab) {
       try { data = JSON.parse(payload); } catch { return; }
       if (data?.type === 'close') tab.closedByPageAt = Date.now();
       else if (data?.type === 'open' && typeof data.url === 'string') {
-        const created = tab.browser.host.request('tabs.openChild', { tabId: tab.tabId, url: data.url });
-        const opening = created.then(({ tabId }) => navigateChild(tab, tabId, data.url));
+        const created = userSettled(tab).then(() => tab.browser.host.request('tabs.openChild', { tabId: tab.tabId, url: data.url }));
+        const opening = created.then((child) => (child.user ? { ...child, url: data.url } : navigateChild(tab, child.tabId, data.url)));
         opening.catch((e) => debug('popups: openChild failed', e.message));
         tab.emit('windowopen', data.url, opening, created);
       }
@@ -347,11 +350,11 @@ async function navigateChild(tab, tabId, url) {
 }
 
 // What became of the opens an action had the extension make ([{ url, opening }]), at most `ms` after it: an error line
-// for each that failed and one for each still under way (the rest went through).
+// for each that failed, one for each still under way, and how many went to the user (the rest went through).
 export async function openingLines(openings, ms) {
   const states = openings.map(({ url, opening }) => {
     const state = { url };
-    state.done = opening.then(() => { state.line = null; },
+    state.done = opening.then((opened) => { state.line = null; state.user = !!opened?.user; },
       (error) => { state.line = `The page opened ${url} in a new tab, which failed: ${error.message}`; });
     return state;
   });
@@ -361,10 +364,11 @@ export async function openingLines(openings, ms) {
   return {
     failed: states.filter((s) => s.line).map((s) => s.line),
     pending: states.filter((s) => s.line === undefined).map((s) => `The page opened ${s.url} in a new tab, which is still loading.`),
+    users: states.filter((s) => s.user).length,
   };
 }
 
-// Before a tab goes back to the user (release, keep, turn end, handoff, takeover while attached; at session end every
+// Before a tab goes back to the user (release, keep, turn end, handoff; at session end every
 // tab that still has them closes): new documents get nothing, and window.open is native again in the current ones.
 // Best effort and capped, so it never holds up the release (after a detach every command fails).
 export async function uninstallPopups(tab) {

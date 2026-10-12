@@ -25,7 +25,7 @@ export async function setViewport(tab, { width, height, mobile = false, deviceSc
 export async function clearViewport(tab, reason = 'tool') {
   const was = tab.viewport;
   if (!was) return false;
-  if (was.clearing) return true; // another clear is at it (a takeover's while a release runs)
+  if (was.clearing) return true; // another clear is at it
   // Forgotten only once Chrome cleared all of it, so a failed reset can be retried (clearing the metrics twice is harmless).
   was.clearing = true;
   try {

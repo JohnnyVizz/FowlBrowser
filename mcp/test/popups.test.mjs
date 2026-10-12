@@ -8,6 +8,7 @@ import vm from 'node:vm';
 const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 import { Browser, Tab } from '../src/browsers.mjs';
 import { BACKGROUND_CLICK_FN, backgroundClick, installPopups, openingLines, pageScripts, uninstallPopups } from '../src/popups.mjs';
+import { USER_BINDING, watchUserInput } from '../src/takeover.mjs';
 import { registerTools } from '../src/tools.mjs';
 
 // A window with a native-looking open/close, and an isolated world that takes every open it is handed (unless
@@ -649,18 +650,57 @@ test('a popup without an opener: the extension opens a blank child, which goes t
   await assert.rejects(opens.at(-1), /no longer this client/);
 });
 
-test('an action reports every opening that failed by its deadline, and names the ones still under way', async () => {
+test('a popup is asked for only once the user\'s input in its tab is judged; one the user opened is theirs: never attached or navigated', async () => {
+  const { tab, browser, commands } = fakeTab();
+  let judge;
+  const judged = new Promise((resolve) => { judge = resolve; });
+  const request = browser.host.request;
+  let user = true;
+  browser.host.request = async (method, params) => {
+    if (method === 'tabs.isShown') { commands.push([method, params]); await judged; return { shown: true, focused: true }; }
+    if (method === 'tabs.openChild') { commands.push([method, params]); return { tabId: user ? 9 : 10, ...(user && { user: true }) }; }
+    if (method === 'chrome.debugger.sendCommand' && params[0].tabId !== 7) { commands.push(['child', params[0].tabId, params[1]]); return {}; }
+    return request(method, params);
+  };
+  const attached = [];
+  browser.waitForTab = async (tabId) => { attached.push(tabId); return { tabId, browser }; };
+  await watchUserInput(tab);
+  await installPopups(tab);
+  const opens = [];
+  tab.on('windowopen', (url, opening) => opens.push(opening));
+  tab.emit('binding', USER_BINDING, JSON.stringify({ type: 'pointerdown', at: Date.now() }));
+  tab.emit('binding', '__fowlbrowserPopup', '{"type":"open","url":"https://site.example/terms"}');
+  await sleepMs(20);
+  assert.ok(!commands.some(([m]) => m === 'tabs.openChild'), 'not while the user\'s input is being judged');
+  judge();
+  assert.deepEqual(await opens[0], { tabId: 9, user: true, url: 'https://site.example/terms' });
+  const asked = commands.map(([m]) => m).filter((m) => /^tabs\./.test(m));
+  assert.deepEqual(asked, ['tabs.isShown', 'tabs.userInput', 'tabs.openChild']);
+  assert.deepEqual(attached, [], 'never attached');
+  assert.ok(!commands.some(([m]) => m === 'child'), 'never navigated');
+
+  // The agent's own (no user: true): attached and navigated as before.
+  user = false;
+  tab.emit('binding', '__fowlbrowserPopup', '{"type":"open","url":"https://site.example/next"}');
+  assert.deepEqual(await opens[1], { tabId: 10, url: 'https://site.example/next' });
+  assert.deepEqual(attached, [10]);
+  assert.deepEqual(commands.filter(([m]) => m === 'child'), [['child', 10, 'Page.navigate']]);
+});
+
+test('an action reports every opening that failed by its deadline, names the ones still under way, and counts the user\'s', async () => {
   const never = new Promise(() => {});
   const started = Date.now();
-  const { failed, pending } = await openingLines([
+  const { failed, pending, users } = await openingLines([
     { url: 'https://a.example/', opening: Promise.reject(new Error('net::ERR_NAME_NOT_RESOLVED')) },
     { url: 'https://b.example/', opening: never },
-    { url: 'https://c.example/', opening: Promise.resolve() },
+    { url: 'https://c.example/', opening: Promise.resolve({ tabId: 8, url: 'https://c.example/' }) },
+    { url: 'https://d.example/', opening: Promise.resolve({ tabId: 9, user: true, url: 'https://d.example/' }) },
   ], 50);
   assert.ok(Date.now() - started < 1000);
   assert.deepEqual(failed, ['The page opened https://a.example/ in a new tab, which failed: net::ERR_NAME_NOT_RESOLVED']);
   assert.deepEqual(pending, ['The page opened https://b.example/ in a new tab, which is still loading.']);
-  assert.deepEqual(await openingLines([], 50), { failed: [], pending: [] });
+  assert.equal(users, 1, 'the user\'s own popup is no tab of the action\'s');
+  assert.deepEqual(await openingLines([], 50), { failed: [], pending: [], users: 0 });
 });
 
 test('an unanswered uninstall (debugger gone, page hung) never holds up the release', async () => {

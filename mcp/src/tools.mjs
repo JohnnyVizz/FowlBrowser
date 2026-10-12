@@ -402,7 +402,8 @@ async function openedTabs(tab, popupIds, mapping, knownBefore, opens, urls) {
   while (found().size < opens && Date.now() < deadline) await sleep(100);
   await Promise.all(mapping);
   const info = new Map(children().map((t) => [t.id, t]));
-  return [...found()].map((tabId) => {
+  // A popup given back to the user meanwhile is theirs: their own input opened it (takeover.mjs).
+  return [...found()].filter((tabId) => !takeover.wasGivenBack(`${browser.key}:${tabId}`)).map((tabId) => {
     const id = `${browser.key}:${tabId}`;
     const mapped = browser.tabs.get(tabId);
     // A popup the extension opened for the page starts blank (popups.mjs openChild).
@@ -459,9 +460,10 @@ async function act(tab, args, fn, { snapshot = args.snapshot !== false, mayOpenT
     // Returning early for a dialog: the action goes on once it is resolved, so later calls on this tab
     // wait for it (the dialog tool itself skips the queue).
     if (tab.dialog) tab.keepBusy(work.catch(() => {}));
-    const { failed, pending } = await openingLines(openings, POPUP_WAIT_MS);
+    // A tab the user's own click opened meanwhile is theirs, not one of this action's.
+    const { failed, pending, users } = await openingLines(openings, POPUP_WAIT_MS);
     lines = [...(lines ?? []), ...failed, ...pending];
-    newTabs = await openedTabs(tab, popupIds, mapping, knownBefore, opens.length - failed.length, urls);
+    newTabs = await openedTabs(tab, popupIds, mapping, knownBefore, opens.length - failed.length - users, urls);
     // kept: the extension hands it back at session end, never closes it (a child of a claimed, kept or for_user tab:
     // it may be the user's own Cmd-click).
     for (const t of record.recording ? newTabs : []) {
@@ -1124,7 +1126,7 @@ export function registerTools(server, manager) {
   tool('navigate',
     'Load a URL in a tab, or go back, forward or reload. Returns the new snapshot.',
     { tab: tabArg, url: z.string().optional(), action: z.enum(['back', 'forward', 'reload']).optional(), snapshot: snapshotArg, timeout_ms: timeoutArg },
-    withTab(manager, (tab, args) => act(tab, args, () => cued(tab, 'navigate', () => takeover.navigating(tab, async () => {
+    withTab(manager, (tab, args) => act(tab, args, () => cued(tab, 'navigate', async () => {
       const options = { waitUntil: 'domcontentloaded', timeout: args.timeout_ms ?? NAVIGATION_TIMEOUT_MS };
       let response;
       if (args.url) response = await tab.page.goto(refuseLocalFile(args.url), options);
@@ -1142,7 +1144,7 @@ export function registerTools(server, manager) {
       await loaded(tab.page);
       if (response === null && args.action && args.action !== 'reload') return `No ${args.action} history entry.`;
       return response && !response.ok() ? `HTTP ${response.status()} ${response.statusText()}` : null;
-    }), { after: true }), { waited: true })));
+    }, { after: true }), { waited: true })));
 
   tool('snapshot',
     'Read the page as an accessibility snapshot (YAML). Elements carry refs like [ref=e12] that click, type and other tools take. ' +

@@ -1,10 +1,12 @@
-// Takeover and handoff (src/takeover.mjs and the tools around it) against doubles: the classifiers as pure functions,
-// the signals a browser sends, the notices agents get, tab_handoff, tab_claim with resume, tab_list and turn end.
+// Takeover and handoff (src/takeover.mjs and the tools around it) against doubles: the user's input told from the
+// agent's (it only goes to the extension; the tab stays the agent's), the signals that still take a tab over (detach,
+// close), the notices agents get, tab_handoff, tab_claim with resume, tab_list and turn end.
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 import { Browser, Tab } from '../src/browsers.mjs';
-import { Activity, agentActed, agentInput, inputHow, markEnding, navigating, navigationHow, USER_BINDING, watchTakeovers, watchUserInput } from '../src/takeover.mjs';
+import { installPopups, POPUP_BINDING } from '../src/popups.mjs';
+import { Activity, agentInput, markEnding, USER_BINDING, userSettled, wasGivenBack, watchTakeovers, watchUserInput } from '../src/takeover.mjs';
 import { registerTools } from '../src/tools.mjs';
 import { endTurn } from '../src/turns.mjs';
 
@@ -21,14 +23,15 @@ function fakePage(url = 'https://shop.example/checkout') {
 
 let browsers = 0;
 // A browser (its own key per test: takeover state is per "<browser>:<id>") with mapped tabs `ids`, whose extension
-// answers isShown with `seen` and tabs.listAll with `listed`.
+// answers isShown with `seen` and tabs.listAll with `listed`, and other methods with `answers` (method -> fn(params)).
 // `hold`: requests (by method, or CDP method for sendCommand) wait on these promises before they are answered.
-async function fakeBrowser({ ids = [1], seen = { shown: true, focused: true }, listed = () => [], hold = {} } = {}) {
+async function fakeBrowser({ ids = [1], seen = { shown: true, focused: true }, listed = () => [], hold = {}, answers = {} } = {}) {
   const requests = [];
   const host = Object.assign(new EventEmitter(), {
     async request(method, params) {
       requests.push([method, params]);
       await hold[method === 'chrome.debugger.sendCommand' ? params[1] : method];
+      if (answers[method]) return answers[method](params);
       if (method === 'tabs.isShown') return seen;
       if (method === 'tabs.listAll') return listed();
       if (method === 'tabs.info') return listed().find((t) => t.id === params.tabId) ?? null;
@@ -42,7 +45,7 @@ async function fakeBrowser({ ids = [1], seen = { shown: true, focused: true }, l
   const known = new Set(ids);
   const browser = {
     key: `chrome-t${++browsers}`, name: 'Chrome', host, tabs: new Map(), adopting: new Map(), requests,
-    relay: { viewports: new Map(), model: { hasTab: (id) => known.has(id), isAttached: () => true, onTabCreated() {}, tabIdForTarget: (target) => (/^MAIN-(\d+)$/.exec(target) ? Number(target.slice(5)) : undefined) } },
+    relay: { viewports: new Map(), model: { hasTab: (id) => known.has(id), isAttached: () => true, onTabCreated() {}, _knownTabs: new Map() } },
     async playwright() {}, async waitForTab(id) { return this.tabs.get(id); }, forget(id) { known.delete(id); this.tabs.delete(id); },
   };
   watchTakeovers(browser);
@@ -65,9 +68,11 @@ function toolsFor(browser) {
 }
 
 const parks = (browser) => browser.requests.filter(([m]) => m === 'tabs.park').map(([, p]) => p);
-const report = (tab, type, at, what = '') => tab.emit('binding', USER_BINDING, JSON.stringify({ type, at, what }));
+const userInputs = (browser) => browser.requests.filter(([m]) => m === 'tabs.userInput').map(([, p]) => p);
+const report = (tab, type, at) => tab.emit('binding', USER_BINDING, JSON.stringify({ type, at }));
+const detach = (browser, tabId, reason = 'canceled_by_user') => browser.host.emit('event', 'chrome.debugger.onDetach', [{ tabId }, reason]);
 
-test('agent windows: relayed input covers [sent - 50, replied + 250] ms; the agent\'s navigations count for commits only', async () => {
+test('agent windows: relayed input covers [sent - 50, replied + 250] ms', async () => {
   const activity = new Activity();
   const done = activity.begin();
   const start = Date.now();
@@ -77,82 +82,47 @@ test('agent windows: relayed input covers [sent - 50, replied + 250] ms; the age
   done();
   const end = activity.windows[0][1];
   assert.ok(activity.covers(end + 240) && !activity.covers(end + 270));
-  assert.ok(activity.covers(end + 1700, 1750), 'navigation margin');
 
   const browser = await fakeBrowser({ ids: [4] });
   const input = browser.relay.onInput(4, 'Input.dispatchKeyEvent', { type: 'keyDown' });
-  assert.ok(agentInput(browser, 4, Date.now()) && agentActed(browser, 4, Date.now()));
+  assert.ok(agentInput(browser, 4, Date.now()));
   input();
-  assert.ok(!agentInput(browser, 4, Date.now() + 400) && !agentActed(browser, 4, Date.now() + 400));
+  assert.ok(!agentInput(browser, 4, Date.now() + 400));
   assert.ok(!agentInput(browser, 5, Date.now()), 'other tabs are not covered');
-
-  const tab = browser.tabs.get(4);
-  let finish;
-  const running = tab.run(() => navigating(tab, () => new Promise((resolve) => { finish = resolve; })));
-  await sleep(5);
-  assert.ok(agentActed(browser, 4, Date.now()), 'a navigation of the agent covers a commit');
-  assert.ok(!agentInput(browser, 4, Date.now() + 400), 'but not input in the page');
-  finish();
-  await running;
 });
 
-test('what the user did, in words', () => {
-  assert.equal(inputHow({ type: 'pointerdown', what: 'Add to cart' }), 'clicked "Add to cart"');
-  assert.equal(inputHow({ type: 'pointerdown', what: '' }), 'clicked in the page');
-  assert.equal(inputHow({ type: 'keydown', what: 'Search' }), 'typed in "Search"');
-  assert.equal(inputHow({ type: 'beforeinput', what: 'Search' }), 'typed in "Search"');
-  assert.equal(inputHow({ type: 'wheel' }), 'scrolled the page');
-  assert.equal(inputHow({ type: 'frame' }), 'clicked inside a frame');
-  assert.equal(inputHow({ type: 'navigate' }), null);
-});
-
-test('navigation rules: address bar and bookmarks always; reload and back/forward only outside agent windows, when the page did not ask', () => {
-  const free = { agentActed: false, selfNavigated: false, focused: true };
-  const how = (type, qualifiers, context = {}) => navigationHow({ transitionType: type, transitionQualifiers: qualifiers }, { ...free, ...context });
-  assert.equal(how('typed', ['from_address_bar'], { agentActed: true }), 'typed an address in the address bar');
-  assert.equal(how('generated', ['from_address_bar']), 'typed an address in the address bar');
-  assert.equal(how('keyword', []), 'typed an address in the address bar');
-  assert.equal(how('auto_bookmark', []), 'opened a bookmark');
-  assert.equal(how('typed', []), null, 'the agent\'s Page.navigate');
-  assert.equal(how('link', []), null);
-  assert.equal(how('link', ['client_redirect']), null, 'location.reload() by the page');
-  assert.equal(how('reload', []), 'reloaded the page');
-  assert.equal(how('reload', [], { agentActed: true }), null);
-  assert.equal(how('reload', [], { selfNavigated: true }), null);
-  assert.equal(how('typed', ['forward_back'], { direction: 'went back' }), 'went back');
-  assert.equal(how('typed', ['forward_back']), 'went back or forward');
-  assert.equal(how('typed', ['forward_back'], { focused: false }), null, 'the Back button needs the window');
-  assert.equal(how('typed', ['forward_back'], { selfNavigated: true }), null, 'history.back() by the page');
-  assert.equal(how('typed', ['forward_back'], { agentActed: true }), null);
-});
-
-test('input in the page is the user\'s outside the input the agent sends, in the shown tab of the focused window', async () => {
+test('the user\'s input in the page goes to the extension outside the input the agent sends, in the shown tab of the focused window; the tab stays the agent\'s', async () => {
   const browser = await fakeBrowser({ ids: [1] });
   const tab = browser.tabs.get(1);
   const input = browser.relay.onInput(1, 'Input.dispatchMouseEvent', { type: 'mousePressed' });
-  report(tab, 'pointerdown', Date.now(), 'Pay now');
+  report(tab, 'pointerdown', Date.now());
   await sleep(10);
-  assert.deepEqual(parks(browser), [], 'during the agent\'s input');
+  assert.deepEqual(userInputs(browser), [], 'during the agent\'s input');
   input();
-  report(tab, 'pointerdown', Date.now() + 100, 'Pay now');
+  report(tab, 'pointerdown', Date.now() + 100);
   await sleep(10);
-  assert.deepEqual(parks(browser), [], 'right after it');
+  assert.deepEqual(userInputs(browser), [], 'right after it');
 
   const unfocused = await fakeBrowser({ ids: [1], seen: { shown: true, focused: false } });
-  report(unfocused.tabs.get(1), 'keydown', Date.now() - 5000, 'Search');
+  report(unfocused.tabs.get(1), 'keydown', Date.now() - 5000);
+  const background = await fakeBrowser({ ids: [1], seen: { shown: false, focused: false } });
+  report(background.tabs.get(1), 'pointerdown', Date.now() - 5000);
   await sleep(10);
-  assert.deepEqual(parks(unfocused), [], 'window not focused');
+  assert.deepEqual(userInputs(unfocused), [], 'window not focused');
+  assert.deepEqual(userInputs(background), [], 'a background tab');
 
-  report(tab, 'keydown', Date.now() + 1000, 'Search');
+  const at = Date.now() + 1000;
+  for (const type of ['keydown', 'frame']) report(tab, type, at);
   await sleep(10);
-  assert.deepEqual(parks(browser), [{ tabId: 1, kind: 'takeover' }]);
-  const call = toolsFor(browser);
-  const result = await call('console', { tab: `${browser.key}:1` });
-  assert.equal(result.error, true);
-  assert.match(result.text, new RegExp(`The user took over ${browser.key}:1 at \\d\\d:\\d\\d \\(typed in "Search"\\)\\. Stop working in that tab, tell the user where you got to, and ask before going on\\. If they say to carry on there, call tab_claim on it with resume: true\\.`));
+  assert.deepEqual(userInputs(browser), [{ tabId: 1, at }, { tabId: 1, at }]);
+  assert.deepEqual(parks(browser), [], 'no takeover');
+  const result = await toolsFor(browser)('console', { tab: `${browser.key}:1` });
+  assert.equal(result.error, false, result.text);
+  assert.doesNotMatch(result.text, /took over/);
+  assert.ok(!browser.requests.some(([m, p]) => m === 'chrome.debugger.sendCommand' && p[1] === 'Emulation.clearDeviceMetricsOverride'), 'the viewport stays');
 });
 
-test('a read or wait running on the tab, or calls queued behind it, do not mask the user\'s input; the queued call gets the notice', async () => {
+test('a read or wait running on the tab, or calls queued behind it, do not make the user\'s input the agent\'s; nothing fails', async () => {
   const browser = await fakeBrowser({ ids: [1] });
   const tab = browser.tabs.get(1);
   const call = toolsFor(browser);
@@ -160,14 +130,44 @@ test('a read or wait running on the tab, or calls queued behind it, do not mask 
   const waiting = tab.run(() => new Promise((resolve) => { finish = resolve; })); // e.g. wait_for seconds: 120
   const queued = call('console', { tab: `${browser.key}:1` });
   await sleep(10);
-  report(tab, 'pointerdown', Date.now(), 'Pay now');
+  const at = Date.now();
+  report(tab, 'pointerdown', at);
   await sleep(10);
-  assert.deepEqual(parks(browser), [{ tabId: 1, kind: 'takeover' }], 'taken over while the call ran');
+  assert.deepEqual(userInputs(browser), [{ tabId: 1, at }], 'the user\'s while the call ran');
   finish();
   await waiting;
   const result = await queued;
-  assert.equal(result.error, true);
-  assert.match(result.text, /took over .*:1 at .* \(clicked "Pay now"\)/);
+  assert.equal(result.error, false, result.text);
+  assert.deepEqual(parks(browser), []);
+});
+
+test('an older extension without tabs.userInput changes nothing; userSettled waits for input still being judged, at most 500 ms', async () => {
+  const old = await fakeBrowser({ ids: [1], answers: { 'tabs.userInput': () => { throw new Error('Unknown method: tabs.userInput'); } } });
+  report(old.tabs.get(1), 'pointerdown', Date.now());
+  await userSettled(old.tabs.get(1));
+  assert.equal(userInputs(old).length, 1);
+  assert.equal((await toolsFor(old)('console', { tab: `${old.key}:1` })).error, false);
+
+  const [judged, judge] = gate();
+  const browser = await fakeBrowser({ ids: [1, 2], hold: { 'tabs.isShown': judged } });
+  const tab = browser.tabs.get(1);
+  await userSettled(tab); // nothing to wait for
+  report(tab, 'pointerdown', Date.now());
+  let settled = false;
+  const settling = userSettled(tab).then(() => { settled = true; });
+  await sleep(20);
+  assert.equal(settled, false, 'its report is still being judged');
+  await userSettled(browser.tabs.get(2)); // other tabs have nothing to wait for
+  judge();
+  await settling;
+  assert.equal(userInputs(browser).length, 1, 'the extension heard of it first');
+
+  const stuck = await fakeBrowser({ ids: [1], hold: { 'tabs.isShown': new Promise(() => {}) } });
+  report(stuck.tabs.get(1), 'pointerdown', Date.now());
+  const started = Date.now();
+  await userSettled(stuck.tabs.get(1));
+  const waited = Date.now() - started;
+  assert.ok(waited >= 450 && waited < 1000, `capped: ${waited} ms`);
 });
 
 test('notices: once at the start of the next result of any other tool, and on every call of the taken-over tab', async () => {
@@ -187,10 +187,11 @@ test('notices: once at the start of the next result of any other tool, and on ev
     assert.equal(again.error, true);
     assert.equal(again.text.split('took over').length, 2, 'the notice once per result');
   }
-  // The parked tab's own detach and events change nothing.
+  // The parked tab's own detach and input change nothing.
   browser.host.emit('event', 'chrome.debugger.onDetach', [{ tabId: 1 }, 'parked']);
-  browser.host.emit('event', 'tabs.committed', { tabId: 1, url: 'https://x.example/', transitionType: 'typed', transitionQualifiers: ['from_address_bar'] });
+  report(browser.tabs.get(1), 'pointerdown', Date.now() + 1000);
   await sleep(10);
+  assert.deepEqual(userInputs(browser), []);
   assert.equal(parks(browser).length, 1);
 });
 
@@ -202,13 +203,13 @@ test('a call running on the tab when the user takes it over returns the notice i
   const blocker = tab.run(() => new Promise((resolve) => { finish = resolve; }));
   const running = call('console', { tab: `${browser.key}:3` });
   await sleep(10);
-  browser.host.emit('event', 'tabs.committed', { tabId: 3, url: 'https://elsewhere.example/', transitionType: 'typed', transitionQualifiers: ['from_address_bar'] });
+  detach(browser, 3);
   await sleep(10);
   finish();
   await blocker;
   const result = await running;
   assert.equal(result.error, true);
-  assert.match(result.text, /took over .*:3 at .* \(typed an address in the address bar\)/);
+  assert.match(result.text, /took over .*:3 at .* \(pressed Cancel on the browser's debugging bar\)/);
 });
 
 test('detaches: Cancel and a browser page are takeovers; a crash and a closing tab are not', async () => {
@@ -225,8 +226,8 @@ test('detaches: Cancel and a browser page are takeovers; a crash and a closing t
   assert.match(text, /\(opened a browser page \(chrome:\/\/settings\/\)\)/);
 });
 
-test('closing: the user closing a tab is a takeover with no resume; our own closes, the page closing itself and swaps are not', async () => {
-  const browser = await fakeBrowser({ ids: [1, 2, 3, 4] });
+test('closing: the user closing a tab is a takeover with no resume; our own closes, the page closing itself, swaps and popups given back to the user are not', async () => {
+  const browser = await fakeBrowser({ ids: [1, 2, 3, 4, 5] });
   const removed = (tabId, info = {}) => browser.host.emit('event', 'chrome.tabs.onRemoved', [tabId, { windowId: 1, isWindowClosing: false, ...info }]);
   markEnding(`${browser.key}:2`);
   browser.tabs.get(3).closedByPageAt = Date.now();
@@ -234,6 +235,7 @@ test('closing: the user closing a tab is a takeover with no resume; our own clos
   removed(2);
   removed(3);
   removed(4, { replacedBy: 9 });
+  removed(5, { usersPopup: true }); // still open, the user's (extension giveBack)
   removed(77); // never ours
   await sleep(10);
   assert.deepEqual(parks(browser), [], 'a closed tab is not parked');
@@ -241,24 +243,24 @@ test('closing: the user closing a tab is a takeover with no resume; our own clos
   const text = (await call('console', { tab: `${browser.key}:1` })).text;
   assert.match(text, /The user took over .*:1 at .* \(closed the tab\)\. Stop working in that tab, tell the user where you got to, and ask before going on\.$/);
   assert.match((await call('tab_claim', { tab: `${browser.key}:1`, resume: true })).text, /closed the tab/);
-  for (const id of [2, 3, 4]) assert.ok(!(await call('console', { tab: `${browser.key}:${id}` })).text.includes(`took over ${browser.key}:${id} `));
+  for (const id of [2, 3, 4, 5]) assert.ok(!(await call('console', { tab: `${browser.key}:${id}` })).text.includes(`took over ${browser.key}:${id} `));
+  assert.ok(wasGivenBack(`${browser.key}:5`) && !wasGivenBack(`${browser.key}:4`), 'the given-back popup is left out of the running action\'s new tabs');
 });
 
-test('user navigation: the address bar at once; back only when the page did not go back itself', async () => {
-  const browser = await fakeBrowser({ ids: [1, 2] });
-  const commit = (tabId, url, transitionType, transitionQualifiers = []) => browser.host.emit('event', 'tabs.committed', { tabId, url, transitionType, transitionQualifiers });
-  commit(1, 'https://a.example/', 'typed');
-  commit(1, 'https://b.example/', 'link');
-  commit(2, 'https://a.example/', 'typed');
-  commit(2, 'https://b.example/', 'link');
-  await sleep(10);
-  // The page's own history.back(): its navigate event comes in, then the commit.
-  report(browser.tabs.get(1), 'navigate', Date.now());
-  commit(1, 'https://a.example/', 'typed', ['forward_back']);
-  commit(2, 'https://a.example/', 'typed', ['forward_back']);
+test('the user\'s navigations take nothing over: the address bar, a bookmark, Back, Forward and Reload (also from an older extension that still reports commits)', async () => {
+  const browser = await fakeBrowser({ ids: [1] });
+  const commit = (url, transitionType, transitionQualifiers = []) => browser.host.emit('event', 'tabs.committed', { tabId: 1, url, transitionType, transitionQualifiers });
+  commit('https://a.example/', 'typed', ['from_address_bar']);
+  commit('https://b.example/', 'auto_bookmark');
+  commit('https://a.example/', 'typed', ['forward_back']);
+  commit('https://b.example/', 'typed', ['forward_back']);
+  commit('https://b.example/', 'reload');
+  browser.host.emit('event', 'chrome.debugger.onEvent', [{ tabId: 1 }, 'Page.frameRequestedNavigation', { frameId: 'MAIN-1', url: 'https://a.example/' }]);
   await sleep(400);
-  assert.deepEqual(parks(browser), [{ tabId: 2, kind: 'takeover' }]);
-  assert.match((await toolsFor(browser)('console', { tab: `${browser.key}:2` })).text, /\(went back\)/);
+  assert.deepEqual(parks(browser), []);
+  const result = await toolsFor(browser)('console', { tab: `${browser.key}:1` });
+  assert.equal(result.error, false);
+  assert.doesNotMatch(result.text, /took over/);
 });
 
 test('tab_handoff parks the tab and returns the line for the user; calls on it get the handoff notice; resume brings it back', async () => {
@@ -361,54 +363,39 @@ test('calls queued before a handoff fail with its notice when their turn comes; 
   assert.equal((await release).error, false);
 });
 
-test('a resume waits for the takeover\'s parking; a takeover whose tab was let go meanwhile does not park it', async () => {
-  const [clearing, clear] = gate();
-  const browser = await fakeBrowser({ ids: [1, 2], hold: { 'Emulation.clearDeviceMetricsOverride': clearing } });
+test('a resume waits for the takeover\'s parking', async () => {
+  const [parking, park] = gate();
+  const browser = await fakeBrowser({ ids: [1], hold: { 'tabs.park': parking } });
   const call = toolsFor(browser);
-  for (const id of [1, 2]) browser.tabs.get(id).viewport = { width: 390, height: 844, mobile: false };
-  report(browser.tabs.get(1), 'pointerdown', Date.now() + 1000, 'Pay now');
+  detach(browser, 1);
   await sleep(10);
   const resumed = call('tab_claim', { tab: `${browser.key}:1`, resume: true });
   await sleep(10);
   assert.ok(!browser.requests.some(([m]) => m === 'tabs.claim'), 'not before the park');
-  clear();
+  park();
   assert.equal((await resumed).error, false);
   const order = browser.requests.map(([m]) => m).filter((m) => m === 'tabs.park' || m === 'tabs.claim');
   assert.deepEqual(order, ['tabs.park', 'tabs.claim']);
-
-  const [clearing2, clear2] = gate();
-  const other = await fakeBrowser({ ids: [2], hold: { 'Emulation.clearDeviceMetricsOverride': clearing2 } });
-  other.tabs.get(2).viewport = { width: 390, height: 844, mobile: false };
-  report(other.tabs.get(2), 'pointerdown', Date.now() + 1000, 'Pay now');
-  await sleep(10);
-  assert.equal((await toolsFor(other)('tab_release', { tab: `${other.key}:2` })).error, false);
-  clear2();
-  await sleep(10);
-  assert.deepEqual(parks(other), []);
 });
 
-test('only the main frame asking for a navigation makes a Back the page\'s own', async () => {
-  const browser = await fakeBrowser({ ids: [1, 2] });
-  const commit = (tabId, url, transitionType, transitionQualifiers = []) => browser.host.emit('event', 'tabs.committed', { tabId, url, transitionType, transitionQualifiers });
-  for (const tabId of [1, 2]) { commit(tabId, 'https://a.example/', 'typed'); commit(tabId, 'https://b.example/', 'link'); }
-  await sleep(10);
-  browser.host.emit('event', 'chrome.debugger.onEvent', [{ tabId: 1 }, 'Page.frameRequestedNavigation', { frameId: 'CHILD-7', url: 'https://ads.example/' }]);
-  browser.host.emit('event', 'chrome.debugger.onEvent', [{ tabId: 2 }, 'Page.frameRequestedNavigation', { frameId: 'MAIN-2', url: 'https://a.example/' }]);
-  for (const tabId of [1, 2]) commit(tabId, 'https://a.example/', 'typed', ['forward_back']);
-  await sleep(400);
-  assert.deepEqual(parks(browser), [{ tabId: 1, kind: 'takeover' }]);
-});
-
-test('the page listener reports its own navigations from the top frame only', async () => {
+test('the page listener reports input only: no navigations, nothing about the target', async () => {
   const vm = await import('node:vm');
   const { USER_SCRIPT } = await import('../src/takeover.mjs');
   for (const top of [true, false]) {
+    const types = [];
     const navigations = [];
-    const context = { addEventListener() {}, performance, navigation: { addEventListener: (type) => navigations.push(type) } };
+    const reports = [];
+    const listeners = {};
+    const context = { addEventListener: (type, fn) => { types.push(type); listeners[type] = fn; }, performance,
+      navigation: { addEventListener: (type) => navigations.push(type) }, [USER_BINDING]: (payload) => reports.push(JSON.parse(payload)) };
     context.window = context.globalThis = context;
     context.top = top ? context : {};
     vm.runInNewContext(USER_SCRIPT, context);
-    assert.deepEqual(navigations, top ? ['navigate'] : [], `top: ${top}`);
+    // Only input that can open a tab (a page's transient activation): no wheel, no beforeinput (its keydown came first).
+    assert.deepEqual(types, ['pointerdown', 'keydown', ...(top ? ['blur'] : [])], `top: ${top}`);
+    assert.deepEqual(navigations, []);
+    listeners.pointerdown({ isTrusted: true, timeStamp: 10, target: { closest: () => { throw new Error('read the target'); } } });
+    assert.deepEqual(Object.keys(reports[0]), ['type', 'at']);
   }
 });
 
@@ -438,7 +425,7 @@ test('the page listener dates an event with timeStamp 0 (some synthesized OS cli
   vm.runInNewContext(USER_SCRIPT, context);
   const before = Date.now();
   listeners.pointerdown({ isTrusted: true, timeStamp: 0, target: null });
-  listeners.wheel({ isTrusted: true, timeStamp: 250 });
+  listeners.keydown({ isTrusted: true, timeStamp: 250, key: 'Enter', metaKey: true }); // Cmd+Enter opens a link in a new tab
   assert.ok(reports[0].at >= before, 'timeStamp 0: the handler time');
   assert.equal(reports[1].at, 1250, 'otherwise the event time');
 });
@@ -451,7 +438,7 @@ test('a tab_close queued before a takeover or a handoff needs the user\'s confir
   const blocker = browser.tabs.get(1).run(() => new Promise((resolve) => { finish = resolve; }));
   const close = call('tab_close', { tab: `${browser.key}:1` });
   await sleep(10);
-  browser.host.emit('event', 'tabs.committed', { tabId: 1, url: 'https://elsewhere.example/', transitionType: 'typed', transitionQualifiers: ['from_address_bar'] });
+  detach(browser, 1);
   await sleep(10);
   finish();
   await blocker;
@@ -473,29 +460,28 @@ test('a tab_close queued before a takeover or a handoff needs the user\'s confir
   assert.deepEqual(browser.requests.filter(([m]) => m === 'chrome.tabs.remove').map(([, p]) => p), [[2, { usersTab: true }]]);
 });
 
-test('a tab replaced while its takeover is still parking is parked under its new id', async () => {
+test('a tab replaced while its handoff is still parking is parked under its new id', async () => {
   const [clearing, clear] = gate();
   const browser = await fakeBrowser({ ids: [1], hold: { 'Emulation.clearDeviceMetricsOverride': clearing } });
   browser.tabs.get(1).viewport = { width: 390, height: 844, mobile: false };
-  report(browser.tabs.get(1), 'pointerdown', Date.now() + 1000, 'Pay now');
+  const handoff = toolsFor(browser)('tab_handoff', { tab: `${browser.key}:1`, reason: 'log in' });
   await sleep(10);
   browser.host.emit('event', 'chrome.tabs.onRemoved', [1, { windowId: 1, isWindowClosing: false, replacedBy: 11 }]);
   await sleep(10);
   clear();
-  await sleep(10);
-  assert.deepEqual(parks(browser), [{ tabId: 11, kind: 'takeover' }]);
-  assert.match((await toolsFor(browser)('console', { tab: `${browser.key}:11` })).text, /The user took over/);
+  assert.equal((await handoff).error, false);
+  assert.deepEqual(parks(browser), [{ tabId: 11, kind: 'handoff' }]);
+  assert.match((await toolsFor(browser)('console', { tab: `${browser.key}:11` })).text, /You handed .*:11 to the user/);
 });
 
 test('the replacement of a tab still parking is not announced for attaching meanwhile', async () => {
-  const [clearing, clear] = gate();
+  const [parking, park] = gate();
   const requests = [];
   const host = Object.assign(new EventEmitter(), {
     hello: { extension: { userAgent: 'Chrome/150.0.0.0' } },
     async request(method, params) {
       requests.push([method, params]);
-      if (method === 'chrome.debugger.sendCommand' && params[1] === 'Emulation.clearDeviceMetricsOverride') await clearing;
-      if (method === 'tabs.isShown') return { shown: true, focused: true };
+      if (method === 'tabs.park') await parking;
       return {};
     },
   });
@@ -505,16 +491,15 @@ test('the replacement of a tab still parking is not announced for attaching mean
   browser.relay.model.hasTab = () => true;
   const tab = new Tab(browser, 1, fakePage());
   browser.tabs.set(1, tab);
-  tab.viewport = { width: 390, height: 844, mobile: false };
   await watchUserInput(tab);
-  report(tab, 'pointerdown', Date.now() + 1000, 'Pay now');
+  host.emit('event', 'chrome.debugger.onDetach', [{ tabId: 1 }, 'canceled_by_user']);
   await sleep(10);
   host.emit('event', 'chrome.tabs.onRemoved', [1, { windowId: 1, isWindowClosing: false, replacedBy: 11 }]);
   host.emit('event', 'chrome.tabs.onCreated', [{ id: 11, windowId: 1 }]);
-  clear();
+  park();
   await sleep(10);
   assert.deepEqual(announced, []);
-  assert.deepEqual(requests.filter(([m]) => m === 'tabs.park').map(([, p]) => p), [{ tabId: 11, kind: 'takeover' }]);
+  assert.deepEqual(requests.filter(([m]) => m === 'tabs.park').map(([, p]) => p), [{ tabId: 1, kind: 'takeover' }]);
 });
 
 test('a plain tab_claim never resumes a tab taken over while it set up; only resume asks the extension to', async () => {
@@ -559,10 +544,32 @@ test('focus moving into an iframe is the agent\'s while one of its calls runs (P
   const running = tab.run(() => new Promise((resolve) => { finish = resolve; }));
   report(tab, 'frame', Date.now());
   await sleep(10);
-  assert.deepEqual(parks(browser), [], 'during an agent call');
+  assert.deepEqual(userInputs(browser), [], 'during an agent call');
   finish();
   await running;
-  report(tab, 'frame', Date.now() + 1000);
+  const at = Date.now() + 1000;
+  report(tab, 'frame', at);
   await sleep(10);
-  assert.deepEqual(parks(browser), [{ tabId: 1, kind: 'takeover' }], 'no call running: the user clicked into the frame');
+  assert.deepEqual(userInputs(browser), [{ tabId: 1, at }], 'no call running: the user clicked into the frame');
+  assert.deepEqual(parks(browser), []);
+});
+
+test('a popup the user\'s own click opens while an agent call runs is theirs: never attached, navigated, or named in the agent\'s result', async () => {
+  const browser = await fakeBrowser({ ids: [1], answers: { 'tabs.openChild': () => ({ tabId: 9, user: true }) } });
+  browser.waitForTab = async (id) => { if (id === 9) throw new Error('attached'); return browser.tabs.get(id); };
+  const tab = browser.tabs.get(1);
+  tab.page.waitForTimeout = sleep;
+  await installPopups(tab);
+  const waiting = toolsFor(browser)('wait_for', { tab: `${browser.key}:1`, seconds: 0.3, snapshot: false });
+  await sleep(50);
+  report(tab, 'pointerdown', Date.now());
+  tab.emit('binding', POPUP_BINDING, JSON.stringify({ type: 'open', url: 'https://shop.example/terms' }));
+  const started = Date.now();
+  const result = await waiting;
+  assert.equal(result.error, false, result.text);
+  assert.doesNotMatch(result.text, /New tab|new tab/);
+  assert.ok(Date.now() - started < 1500, 'it did not wait for a tab of its own');
+  const methods = browser.requests.map(([m]) => m);
+  assert.ok(methods.indexOf('tabs.userInput') >= 0 && methods.indexOf('tabs.userInput') < methods.indexOf('tabs.openChild'), methods.join());
+  assert.ok(!browser.requests.some(([m, p]) => m === 'chrome.debugger.sendCommand' && p[0].tabId === 9));
 });

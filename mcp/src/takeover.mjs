@@ -1,8 +1,9 @@
 // Taking a tab back and handing a tab over (SPEC "Taking a tab back, handing a tab over, viewport (session 5)").
-// The server decides takeovers, since only it knows when the agent acted: every Input.* command the relay forwards for
-// a tab is an agent window, and so are the agent's own navigations (navigate, Lighthouse's reload) for commits. A read,
-// a wait or a queued call is none: the user's input then is theirs. Signals: trusted input in the page (an isolated-world
-// listener), the user's navigations (the extension's tabs.committed), the debugger taken away, and the tab closed.
+// Only what ends control takes a tab over: the debugger taken away (the debugging bar's Cancel, a browser page) and the
+// tab closed. The user's clicks, typing, scrolling and navigations in a tab the agent controls don't: the agent keeps
+// working, as in Codex's own extension. Their input is still told from the agent's, since only the server knows when
+// the agent acted (every Input.* command the relay forwards for a tab is an agent window; a read, a wait or a queued
+// call is none): the extension hears of the user's (tabs.userInput), so a popup their click opens is theirs.
 // A taken-over or handed-off tab is parked (extension tabs.park): still this session's, but the user's until the
 // agent resumes it with tab_claim {resume: true}. Notices for the agent live here too.
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -16,9 +17,8 @@ import { clearViewport } from './viewport.mjs';
 
 const BEFORE_MS = 50; // an agent window starts this much before its command was sent (clock skew)
 const AFTER_MS = 250; // and ends this much after its reply (the page's own handlers, timers)
-const NAV_AFTER_MS = 1500; // the agent's own navigations commit well after the command that started them
-const SELF_NAV_MS = 1000; // a navigation the page asked for this recently is the page's, not the user's
-const SETTLE_MS = 300; // the page's own report of a navigation can trail the commit a little
+const SETTLE_MS = 300; // a target_closed detach is judged this much later (a closing tab's removal comes first)
+const USER_SETTLED_MS = 500; // a popup waits at most this long for the user's input to be judged (userSettled)
 const KEEP_MS = 5000; // finished agent windows kept this long
 const CLOSED_BY_PAGE_MS = 3000;
 const CRASH_MS = 5000;
@@ -30,39 +30,26 @@ export const USER_BINDING = '__fowlbrowserUserInput';
 
 // Runs in an isolated world of every same-process frame of a controlled tab, from document start (page listeners can't
 // hide events from a capture listener on window registered first). Reports trusted input, at most one per type per
-// 250 ms, as {type, at, what}: `at` on the page's wall clock, `what` a short name of the target, never field values.
-// Cross-origin frames are other processes: a click into one shows up as the top window's blur with an iframe focused.
-// Navigations the page starts itself (history.back() from a script) report as "navigate".
+// 250 ms, as {type, at}: `at` on the page's wall clock. Cross-origin frames are other processes: a click into one shows
+// up as the top window's blur with an iframe focused.
 export const USER_SCRIPT = `(() => {
   if (globalThis.__fowlbrowserUser) return;
   globalThis.__fowlbrowserUser = true;
   const last = {};
-  const clip = (s) => String(s ?? '').replace(/\\s+/g, ' ').trim().slice(0, 40);
-  const name = (target) => {
-    const el = target?.closest?.('a, button, input, textarea, select, summary, label, [role], [contenteditable]');
-    if (!el) return '';
-    const texty = /^(A|BUTTON|SUMMARY|LABEL)$/.test(el.tagName) || /^(button|link|tab|menuitem|option|checkbox|radio|switch)$/.test(el.getAttribute('role'));
-    return clip(el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.labels?.[0]?.innerText
-      || (texty ? el.innerText : '') || el.getAttribute('title') || el.getAttribute('role'));
-  };
-  const report = (type, event, what = '') => {
+  const report = (type, event) => {
     if (!event.isTrusted || performance.now() - (last[type] ?? -1e9) < ${THROTTLE_MS}) return;
     last[type] = performance.now();
     // Some synthesized OS events arrive with timeStamp 0 (the page's start): then the handler's own time is the event's.
     const at = event.timeStamp > 0 ? performance.timeOrigin + event.timeStamp : Date.now();
-    globalThis.${USER_BINDING}?.(JSON.stringify({ type, at, what }));
+    globalThis.${USER_BINDING}?.(JSON.stringify({ type, at }));
   };
   const modifiers = new Set(['Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'Fn', 'OS']);
   const options = { capture: true, passive: true };
-  addEventListener('pointerdown', (e) => report('pointerdown', e, name(e.target)), options);
-  // Cmd shortcuts belong to the browser (address bar, close, reload): its own signals cover them.
-  addEventListener('keydown', (e) => { if (!e.metaKey && !modifiers.has(e.key)) report('keydown', e, name(e.target)); }, options);
-  addEventListener('beforeinput', (e) => report('beforeinput', e, name(e.target)), options);
-  addEventListener('wheel', (e) => report('wheel', e), options);
+  addEventListener('pointerdown', (e) => report('pointerdown', e), options);
+  // With Cmd too: Cmd+Enter on a link opens it in a new tab.
+  addEventListener('keydown', (e) => { if (!modifiers.has(e.key)) report('keydown', e); }, options);
   if (window !== top) return;
   addEventListener('blur', (e) => setTimeout(() => { if (document.activeElement?.tagName === 'IFRAME') report('frame', e); }), options);
-  // Only the top frame's: a frame navigating itself says nothing about the tab's Back or Reload.
-  window.navigation?.addEventListener('navigate', (e) => { if (!e.userInitiated) report('navigate', e); });
 })();`;
 
 // Times the agent acted on a tab: [start, end] per window, end Infinity while it runs.
@@ -78,8 +65,8 @@ export class Activity {
     };
   }
 
-  covers(at, after = AFTER_MS) {
-    return this.windows.some(([start, end]) => at >= start - BEFORE_MS && at <= end + after);
+  covers(at) {
+    return this.windows.some(([start, end]) => at >= start - BEFORE_MS && at <= end + AFTER_MS);
   }
 }
 
@@ -87,11 +74,11 @@ const inputs = new Map(); // "chrome:52" -> Activity of the relay's Input.* comm
 const records = new Map(); // "chrome:52" -> { kind: 'takeover'|'handoff', at, tabId, how?, reason?, gone? } of parked tabs
 const unseen = new Set(); // takeovers no result has told the agent about yet
 const ending = new Map(); // "chrome:52" -> when this session started closing or releasing it
-const selfNavigated = new Map(); // "chrome:52" -> when the page last asked for a navigation itself
 const crashed = new Map(); // "chrome:52" -> when its renderer died
-const histories = new Map(); // "chrome:52" -> { urls, index }: the tab's committed documents, for back vs forward
 const lastTabs = new Map(); // "chrome:52" -> the Tab it was when its debugger went (its page may close first)
-const parking = new Map(); // "chrome:52" -> its takeover's or handoff's cleanup and park, until done
+const parking = new Map(); // "chrome:52" -> its takeover's park, or its handoff's cleanup and park, until done
+const judging = new WeakMap(); // Tab -> reports of input in it still being judged (onReport), for userSettled
+const givenBack = new Set(); // "chrome:52" popups the extension gave back to the user who opened them, for KEEP_MS
 const calls = new AsyncLocalStorage(); // the tool call code runs for: { tabKey, onParked } (see inCall)
 
 const keyOf = (browser, tabId) => `${browser.key}:${tabId}`;
@@ -104,59 +91,17 @@ export function agentInput(browser, tabId, at) {
   return !!inputs.get(keyOf(browser, tabId))?.covers(at);
 }
 
-// Whether a navigation committing around `at` may be the agent's: its input (a link, a key), or one of its own
-// navigations (Tab.navigations, see navigating).
-export function agentActed(browser, tabId, at, after = AFTER_MS) {
-  return [browser.tabs.get(tabId)?.navigations, inputs.get(keyOf(browser, tabId))].some((a) => a?.covers(at, after));
-}
+// Whether the extension just gave this tab back to the user who opened it (no action of the agent's opened it).
+export const wasGivenBack = (key) => givenBack.has(key);
 
-// Runs one of the agent's own navigations on the tab (back, forward, reload: they commit like the user's).
-export async function navigating(tab, fn) {
-  const done = tab.navigations.begin();
-  try {
-    return await fn();
-  } finally {
-    done();
-  }
-}
-
-const INPUT_HOW = {
-  pointerdown: (what) => (what ? `clicked "${what}"` : 'clicked in the page'),
-  keydown: (what) => (what ? `typed in "${what}"` : 'typed in the page'),
-  beforeinput: (what) => (what ? `typed in "${what}"` : 'typed in the page'),
-  wheel: () => 'scrolled the page',
-  frame: () => 'clicked inside a frame',
-};
-export const inputHow = ({ type, what }) => INPUT_HOW[type]?.(what) ?? null;
-
-// How the user navigated, from a main-frame commit, or null when it was the agent or the page itself.
-// agentActed: an agent window covers the commit (plus NAV_AFTER_MS); selfNavigated: the page asked for a navigation
-// within SELF_NAV_MS; focused: the tab is the active tab of the focused window (a page's own history.back() looks like
-// the Back button, but the user can only press that in a window they are in); direction: 'went back'/'went forward'.
-export function navigationHow({ transitionType, transitionQualifiers = [] }, { agentActed, selfNavigated, focused, direction }) {
-  if (transitionType === 'auto_bookmark') return 'opened a bookmark';
-  if (transitionQualifiers.includes('from_address_bar') || ['keyword', 'keyword_generated', 'generated'].includes(transitionType)) {
-    return 'typed an address in the address bar';
-  }
-  const back = transitionQualifiers.includes('forward_back');
-  // A page reloading itself commits as a link with client_redirect; only the browser's reload is "reload".
-  if ((!back && transitionType !== 'reload') || agentActed || selfNavigated) return null;
-  if (back) return focused ? direction ?? 'went back or forward' : null;
-  return 'reloaded the page';
-}
-
-// Back or forward, by the commit's URL against the documents the tab committed before; also records the commit.
-function direction(key, { url, transitionType, transitionQualifiers = [] }) {
-  const history = histories.get(key) ?? { urls: [], index: -1 };
-  histories.set(key, history);
-  if (transitionQualifiers.includes('forward_back')) {
-    if (history.urls[history.index - 1] === url) { history.index--; return 'went back'; }
-    if (history.urls[history.index + 1] === url) { history.index++; return 'went forward'; }
-    return null;
-  }
-  if (history.index >= 0 && (transitionType === 'reload' || transitionQualifiers.includes('client_redirect'))) history.urls[history.index] = url;
-  else history.urls.splice(++history.index, Infinity, url);
-  return null;
+// Resolves once every report of input in the tab still being judged is done (the extension has heard of the user's
+// by then), at most USER_SETTLED_MS later: a popup asks the extension whose it is only after that (popups.mjs).
+export async function userSettled(tab) {
+  const pending = judging.get(tab);
+  if (!pending?.size) return;
+  let timer;
+  await Promise.race([Promise.allSettled(pending), new Promise((resolve) => { timer = setTimeout(resolve, USER_SETTLED_MS); })])
+    .finally(() => clearTimeout(timer));
 }
 
 // --- Notices ---
@@ -208,8 +153,8 @@ export function refuseParked(tab, call = currentCall()) {
   if (parked) throw new Error(parked);
 }
 
-// Chrome swapped the tab for another id (prerender, back/forward cache): a parked one stays parked under it, and a
-// park still under way parks the new id (record.tabId), which nothing attaches meanwhile (heldBack).
+// Chrome swapped the tab for another id (prerender, back/forward cache): a parked one stays parked under it, a handoff
+// still under way parks the new id (record.tabId), and nothing attaches the new id while a park is under way (heldBack).
 function moveRecord(from, to, toId) {
   const record = records.get(from);
   if (!record) return;
@@ -239,27 +184,19 @@ export function markEnding(key) {
 
 // --- Parking ---
 
-// The user took the tab over: noted at once (so every later signal and call sees it), cursor gone (its exit fade
-// while the debugger is still there; without it the overlay fades on its own idle timer), parked, journaled.
-export async function takeOver(browser, tabId, how, { tab = browser.tabs.get(tabId), detached = false, gone = false } = {}) {
+// The user took the tab over (its debugger went, or it closed): noted at once (so every later signal and call sees it),
+// parked, journaled. Nothing is cleaned up in the page: without the debugger nothing reaches it (the cursor overlay
+// fades on its own idle timer, the popup scripts switch themselves off).
+export async function takeOver(browser, tabId, how, { tab = browser.tabs.get(tabId), gone = false } = {}) {
   const key = keyOf(browser, tabId);
   if (records.has(key)) return;
-  const record = { kind: 'takeover', at: Date.now(), tabId, how, gone };
-  records.set(key, record);
+  records.set(key, { kind: 'takeover', at: Date.now(), tabId, how, gone });
   unseen.add(key);
   debug('takeover', key, how);
   const url = tab?.page.url();
   if (!gone) {
-    await park(key, async () => {
-      if (tab && !detached) {
-        await cursor.remove(tab, { wait: true });
-        await uninstallPopups(tab); // the user's own popups open natively again (after a detach they do from the next page on)
-        await clearViewport(tab, 'takeover').catch(() => {});
-      }
-      // Released or closed meanwhile: no longer ours to park. Swapped meanwhile: the new id is parked.
-      if (records.get(keyOf(browser, record.tabId)) !== record) return;
-      await browser.host.request('tabs.park', { tabId: record.tabId, kind: 'takeover' });
-    }).catch((error) => debug('park failed', key, error.message));
+    await park(key, () => browser.host.request('tabs.park', { tabId, kind: 'takeover' }))
+      .catch((error) => debug('park failed', key, error.message));
   }
   tabEvent('takeover', key, url, { how });
 }
@@ -296,25 +233,33 @@ function park(key, work) {
 
 // Installs the page listener in a tab that came under control (Browser._adopt).
 export async function watchUserInput(tab) {
-  tab.on('binding', (name, payload) => { if (name === USER_BINDING) onReport(tab, payload); });
+  tab.on('binding', (name, payload) => {
+    if (name !== USER_BINDING) return;
+    if (!judging.has(tab)) judging.set(tab, new Set());
+    const pending = judging.get(tab);
+    const judged = onReport(tab, payload).catch((e) => debug('user input', e.message)).finally(() => pending.delete(judged));
+    pending.add(judged);
+  });
   await cdp(tab, 'Runtime.addBinding', { name: USER_BINDING, executionContextName: USER_WORLD });
   await cdp(tab, 'Page.addScriptToEvaluateOnNewDocument', { source: USER_SCRIPT, worldName: USER_WORLD, runImmediately: true });
 }
 
+// Input the user made in the tab goes to the extension (tabs.userInput), which then knows that a popup it opens is
+// theirs. The tab stays the agent's.
 async function onReport(tab, payload) {
   let report;
   try { report = JSON.parse(payload); } catch { return; }
   const { browser, tabId } = tab;
-  if (report.type === 'navigate') return void selfNavigated.set(tab.id, Date.now());
-  const how = inputHow(report);
-  if (!how || records.has(tab.id) || agentInput(browser, tabId, report.at)) return;
+  if (records.has(tab.id) || agentInput(browser, tabId, report.at)) return;
   // Focus moving into an iframe has no Input.* command behind it when the agent's fill or focus moves it (through the DOM):
   // while a call runs on the tab, that one signal is the agent's. Clicks, keys and wheel are judged by input alone.
   if (report.type === 'frame' && tab.busy) return;
   // Agent input is trusted too; only input in the tab the user is looking at, in the window they are in, can be theirs.
   const seen = await browser.host.request('tabs.isShown', { tabId }).catch(() => null);
   if (!seen?.shown || !seen.focused || agentInput(browser, tabId, report.at)) return;
-  await takeOver(browser, tabId, how, { tab });
+  await browser.host.request('tabs.userInput', { tabId, at: report.at }).catch((error) => {
+    if (!/unknown method/i.test(error.message)) debug('tabs.userInput failed', error.message); // an older extension
+  });
 }
 
 // Extension events of a browser. Registered before the relay's handler, so the tab is still known to the model when
@@ -330,15 +275,9 @@ export function watchTakeovers(browser) {
   browser.host.on('event', (method, params) => {
     if (method === 'chrome.debugger.onDetach') onDetach(browser, params?.[0]?.tabId, params?.[1]).catch((e) => debug('takeover: detach', e.message));
     else if (method === 'chrome.tabs.onRemoved') onRemoved(browser, params?.[0], params?.[1]).catch((e) => debug('takeover: removed', e.message));
-    else if (method === 'tabs.committed') onCommitted(browser, params ?? {}).catch((e) => debug('takeover: committed', e.message));
     else if (method === 'chrome.debugger.onEvent') {
       const [source, cdpMethod] = params ?? [];
-      if (source?.sessionId) return;
-      // Only the main frame's (its frame id is the tab's target id): an iframe navigating says nothing about the tab.
-      if (cdpMethod === 'Page.frameRequestedNavigation') {
-        if (browser.relay.model.tabIdForTarget(params[2]?.frameId) === source?.tabId) selfNavigated.set(keyOf(browser, source.tabId), Date.now());
-      }
-      else if (cdpMethod === 'Inspector.targetCrashed') crashed.set(keyOf(browser, source?.tabId), Date.now());
+      if (!source?.sessionId && cdpMethod === 'Inspector.targetCrashed') crashed.set(keyOf(browser, source?.tabId), Date.now());
     }
   });
 }
@@ -351,7 +290,7 @@ async function onDetach(browser, tabId, reason) {
   const tab = browser.tabs.get(tabId);
   lastTabs.set(key, tab);
   setTimeout(() => lastTabs.delete(key), CLOSED_BY_PAGE_MS).unref();
-  if (reason === 'canceled_by_user') return takeOver(browser, tabId, 'pressed Cancel on the browser\'s debugging bar', { tab, detached: true });
+  if (reason === 'canceled_by_user') return takeOver(browser, tabId, 'pressed Cancel on the browser\'s debugging bar', { tab });
   // target_closed: the tab closed (onRemoved follows), its renderer died, or it went to a page the debugger may not stay on.
   if (reason !== 'target_closed' || recently(crashed, key, CRASH_MS)) return;
   await sleep(SETTLE_MS);
@@ -359,7 +298,7 @@ async function onDetach(browser, tabId, reason) {
   const info = await tabInfo(browser, tabId).catch(() => null);
   if (info?.owner !== 'you' || info.parked) return;
   const how = BROWSER_PAGE.test(info.url) && info.url !== 'about:blank' ? `opened a browser page (${info.url.slice(0, 60)})` : 'took the tab out of the agent\'s control';
-  await takeOver(browser, tabId, how, { tab, detached: true });
+  await takeOver(browser, tabId, how, { tab });
 }
 
 async function onRemoved(browser, tabId, removeInfo) {
@@ -367,29 +306,15 @@ async function onRemoved(browser, tabId, removeInfo) {
   const tab = browser.tabs.get(tabId) ?? lastTabs.get(key);
   const known = !!tab || browser.relay.model.hasTab(tabId);
   const ours = recently(ending, key, ENDING_MS);
-  for (const map of [histories, inputs, ending, selfNavigated, crashed]) map.delete(key);
+  for (const map of [inputs, ending, crashed]) map.delete(key);
+  if (removeInfo?.usersPopup) { // still open: a popup the extension gave back to the user who opened it
+    givenBack.add(key);
+    setTimeout(() => givenBack.delete(key), KEEP_MS).unref();
+    return;
+  }
   if (removeInfo?.replacedBy !== undefined) return moveRecord(key, keyOf(browser, removeInfo.replacedBy), removeInfo.replacedBy);
   if (records.get(key)?.kind === 'handoff') return forget(key); // the user closed what they were handed
   if (!known || records.has(key) || ours) return;
   if (Date.now() - (tab?.closedByPageAt ?? -Infinity) <= CLOSED_BY_PAGE_MS) return; // the page closed itself
   await takeOver(browser, tabId, 'closed the tab', { tab, gone: true });
-}
-
-async function onCommitted(browser, commit) {
-  const { tabId, transitionType, transitionQualifiers = [] } = commit;
-  const key = keyOf(browser, tabId);
-  if (records.has(key)) return;
-  const at = Date.now();
-  const way = direction(key, commit);
-  const back = transitionQualifiers.includes('forward_back');
-  // Back, forward and reload can be the agent's or the page's own: judged once the page's report had time to come.
-  if (back || transitionType === 'reload') await sleep(SETTLE_MS);
-  const seen = back ? await browser.host.request('tabs.isShown', { tabId }).catch(() => null) : null;
-  const how = navigationHow(commit, {
-    agentActed: agentActed(browser, tabId, at, AFTER_MS + NAV_AFTER_MS),
-    selfNavigated: at - (selfNavigated.get(key) ?? -Infinity) <= SELF_NAV_MS,
-    focused: !!(seen?.shown && seen.focused),
-    direction: way,
-  });
-  if (how && !records.has(key)) await takeOver(browser, tabId, how);
 }

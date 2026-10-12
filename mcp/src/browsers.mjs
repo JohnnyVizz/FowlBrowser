@@ -9,7 +9,7 @@ import { debug } from './debug.mjs';
 import { HostClient, listSockets } from './hostClient.mjs';
 import { installPopups } from './popups.mjs';
 import { downloadDone, record } from './record.mjs';
-import { Activity, currentCall, heldBack, refuseParked, watchTakeovers, watchUserInput } from './takeover.mjs';
+import { currentCall, heldBack, refuseParked, watchTakeovers, watchUserInput } from './takeover.mjs';
 import { tabInfo } from './util.mjs';
 import { CDPRelay } from './vendor/cdpRelay.mjs';
 
@@ -50,7 +50,6 @@ export class Tab extends EventEmitter {
     this.frameGeneration = 0; // bumped when any iframe navigates (its refs from before are void; snapshots.mjs numberRefs)
     this._queue = Promise.resolve();
     this._calls = 0; // run() calls not yet settled
-    this.navigations = new Activity(); // the agent's own navigations: a back, forward or reload then is no takeover (takeover.mjs)
     this._busy = null;
     // Set by other modules:
     this.refs = null; // ref numbering across snapshots (snapshots.mjs newRefState)
@@ -86,7 +85,7 @@ export class Tab extends EventEmitter {
   // The next call starts once this one, and any work it left running (keepBusy), has finished. The check runs
   // right before each call starts, so work that resumes after its dialog is answered still holds the tab.
   // A tool call queued before the tab was parked (taken over, handed off) fails with the notice when its turn comes.
-  // Neither a running nor a queued call masks the user's input (only the input the agent sends does, takeover.mjs).
+  // Neither a running nor a queued call makes input in the page the agent's (only the input the agent sends does, takeover.mjs).
   run(fn) {
     this._calls++;
     const call = currentCall();
